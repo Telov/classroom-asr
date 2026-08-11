@@ -146,5 +146,6 @@ class Wav2Vec2CTC(AcousticModel):
 
         del self.model
         gc.collect()
-        if self.device == "cuda":
+        if str(self.device).startswith("cuda"):
+            self._torch.cuda.synchronize()
             self._torch.cuda.empty_cache()

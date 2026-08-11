@@ -113,10 +113,10 @@ class VoxtralASR(AcousticModel):
             )
         return results
 
-    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000, chunk_min: float = 25.0) -> str:
-        """Whole-recording transcript. Voxtral tops out at ~30 min of audio, so
-        long interviews are split into <=chunk_min windows and concatenated."""
-        win = int(chunk_min * 60 * sampling_rate)
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000, chunk_s: float = 120.0) -> str:
+        """Whole-recording transcript, chunked into ~chunk_s windows. (Voxtral's
+        docs allow 30 min, but that OOMs a T4 — activations scale with length.)"""
+        win = int(chunk_s * sampling_rate)
         parts = []
         for start in range(0, len(waveform), win):
             chunk = waveform[start:start + win]
@@ -132,5 +132,6 @@ class VoxtralASR(AcousticModel):
 
         del self.model
         gc.collect()
-        if self.device == "cuda":
+        if str(self.device).startswith("cuda"):
+            self._torch.cuda.synchronize()
             self._torch.cuda.empty_cache()
