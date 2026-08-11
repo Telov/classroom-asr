@@ -35,8 +35,8 @@ transcribed, verbatim conversation (CORAAL), with **real ASR models** behind our
 `AcousticModel` interface. Branches (each a *different architecture*, so their
 errors are complementary — §8):
 
-* **A** Whisper large-v3-turbo via **faster-whisper / CTranslate2 int8** — 1-best,
-  several times faster than HF Whisper
+* **A** Whisper large-v3-turbo via **faster-whisper** — **whole-interview** transcription
+  with word timestamps, re-segmented by time (§6.1: context, no short-clip hallucination)
 * **B** wav2vec2 CTC (acoustic CTC, no LM)
 * **Z** Qwen3-ASR-1.7B — the design's real backbone (multilingual LLM-ASR), **batched**
 * **C** Voxtral Mini 3B (audio-LLM) — **batched**, capped to a time subset
@@ -92,6 +92,11 @@ FW_MODEL      = "deepdml/faster-whisper-large-v3-turbo-ct2"
 PRIMARY_MODEL = "openai/whisper-large-v3-turbo"   # HF fallback if USE_FASTER_WHISPER=False
 N_BEST_A      = 1          # 1 = fast (Whisper beams add ~no oracle diversity)
 BATCH_SIZE    = 16
+# Long-context branch A (§6.1): transcribe each whole interview once with word
+# timestamps and re-segment by time, instead of feeding isolated slices. Removes
+# short-clip hallucination ("Thank you") and boundary misalignment.
+WHOLE_AUDIO_WHISPER = True
+WHISPER_VAD   = True       # skip silence in whole-audio mode (less hallucination)
 
 USE_CTC       = True
 CTC_MODEL     = "facebook/wav2vec2-large-960h-lv60-self"
@@ -269,11 +274,37 @@ def report(tag, spans, rf):
           f"oracle={o.oracle.wer:.3f}  headroom={o.headroom:+.3f}")
     return o
 """),
-    md("""## 6. Branch A — Whisper (1-best, multi-GPU) → oracle printed here
-Uses **faster-whisper** (CTranslate2 int8) by default — several times faster than HF
-Whisper because it avoids the slow 30 s-padded encoder passes on tiny clips."""),
+    md("""## 6. Branch A — Whisper (multi-GPU) → oracle printed here
+**Whole-audio mode (default, §6.1):** transcribe each whole interview once with word
+timestamps and re-segment by time — real context, no short-clip hallucination, no
+boundary misalignment. Set `WHOLE_AUDIO_WHISPER=False` for the old per-slice path."""),
     code(r"""
-if USE_FASTER_WHISPER:
+from classroom_asr.datamodel import TextCandidate
+import threading
+from collections import defaultdict
+
+if USE_FASTER_WHISPER and WHOLE_AUDIO_WHISPER:
+    from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
+    # group segments by interview; transcribe the full audio once, bucket words by time
+    byiv = defaultdict(list)
+    for _i, (w, s) in enumerate(flat): byiv[w].append((_i, s))
+    ivs = list(byiv.keys())
+    branch_A = [[] for _ in flat]
+    models = [FasterWhisperASR(FW_MODEL, id_prefix="q", source=CandidateSource.QWEN,
+                               language="en", device=_dev(g)) for g in GPUS]
+    shards = [ivs[i::len(GPUS)] for i in range(len(GPUS))]
+    def _whole(model, sh, pos):
+        for w in tqdm(sh, desc=f"whisper-whole:{pos}", position=pos, leave=False):
+            words = model.transcribe_words(load_16k(w), vad_filter=WHISPER_VAD)
+            for idx, s in byiv[w]:
+                toks = [t for (ws, we, t) in words if s.start <= (ws + we) / 2.0 < s.end]
+                txt = " ".join(toks).strip()
+                branch_A[idx] = [TextCandidate("q1", txt, CandidateSource.QWEN, 1.0, 0)] if txt else []
+    ts = [threading.Thread(target=_whole, args=(models[i], shards[i], i)) for i in range(len(GPUS))]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    for m in models: m.unload()
+elif USE_FASTER_WHISPER:
     from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
     branch_A = sharded_seq(
         lambda dev: FasterWhisperASR(FW_MODEL, id_prefix="q", source=CandidateSource.QWEN,

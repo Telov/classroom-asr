@@ -101,6 +101,41 @@ class Wav2Vec2CTC(AcousticModel):
             )
         return results
 
+    def transcribe_words(self, waveform, *, sampling_rate: int = 16_000, chunk_s: float = 24.0):
+        """Whole-recording CTC transcription with word timestamps (§6.1).
+
+        wav2vec2 can't hold a 30–60 min interview in one forward pass, so we run
+        non-overlapping chunks and use HF's built-in ``output_word_offsets`` to
+        get per-word frame offsets, converted to absolute time. Returns
+        ``(start, end, word)`` so the model never sees reference boundaries.
+        """
+        torch = self._torch
+        n = len(waveform)
+        win = int(chunk_s * sampling_rate)
+        # seconds per logit frame (e.g. 320 samples / 16 kHz = 0.02 s)
+        spf = float(self.model.config.inputs_to_logits_ratio) / sampling_rate
+        out: list[tuple[float, float, str]] = []
+        for start in range(0, n, win):
+            chunk = waveform[start:start + win]
+            if len(chunk) < 400:
+                continue
+            iv = self.processor(chunk, sampling_rate=sampling_rate,
+                                return_tensors="pt").input_values.to(self.device, self.dtype)
+            with torch.no_grad():
+                logits = self.model(iv).logits
+            dec = self.processor.batch_decode(
+                logits.argmax(dim=-1), output_word_offsets=True,
+                clean_up_tokenization_spaces=False,
+            )
+            offsets = dec.word_offsets[0] if hasattr(dec, "word_offsets") else dec["word_offsets"][0]
+            base = start / sampling_rate
+            for wo in offsets:
+                w = (wo["word"] or "").strip().lower()
+                if w:
+                    out.append((base + wo["start_offset"] * spf,
+                                base + wo["end_offset"] * spf, w))
+        return out
+
     def unload(self) -> None:
         import gc
 

@@ -92,6 +92,35 @@ class Qwen3ASR(AcousticModel):
             )
         return out
 
+    def transcribe_words(self, waveform, *, sampling_rate: int = 16_000):
+        """Whole-recording transcription with native timestamps (§6.1).
+
+        Qwen3-ASR supports long audio + ``return_time_stamps``; returns a list of
+        ``(start, end, text)`` so the interview can be transcribed once (no
+        reference-boundary leakage) and re-segmented by time for scoring.
+        """
+        import logging
+
+        kwargs = {"language": [self.language]} if self.language else {}
+        gen_log = logging.getLogger("transformers.generation.utils")
+        prev = gen_log.level
+        gen_log.setLevel(logging.ERROR)
+        try:
+            results = self.model.transcribe(
+                audio=[(waveform, sampling_rate)], return_time_stamps=True, **kwargs
+            )
+        finally:
+            gen_log.setLevel(prev)
+        if not results:
+            return []
+        stamps = getattr(results[0], "time_stamps", None) or []
+        out: list[tuple[float, float, str]] = []
+        for st in stamps:
+            text = (getattr(st, "text", "") or "").strip()
+            if text:
+                out.append((float(st.start_time), float(st.end_time), text))
+        return out
+
     def unload(self) -> None:
         import gc
 

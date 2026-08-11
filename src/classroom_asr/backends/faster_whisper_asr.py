@@ -37,6 +37,7 @@ class FasterWhisperASR(AcousticModel):
         device: str | None = None,
         compute_type: str | None = None,
         beam_size: int = 1,
+        vad_filter: bool = True,
     ) -> None:
         from faster_whisper import WhisperModel
 
@@ -46,6 +47,7 @@ class FasterWhisperASR(AcousticModel):
         self.source_name = source.value
         self.language = language
         self.beam_size = beam_size
+        self.vad_filter = vad_filter
 
         dev, index = _split_device(device or "cuda:0")
         # int8 kernels: int8_float16 on GPU, int8 on CPU.
@@ -68,7 +70,7 @@ class FasterWhisperASR(AcousticModel):
         text = " ".join(s.text.strip() for s in segments).strip()
         return [TextCandidate(f"{self.id_prefix}1", text, self.source, score=1.0, beam_rank=0)] if text else []
 
-    def transcribe_words(self, waveform, *, sampling_rate: int = 16_000, vad_filter: bool = True):
+    def transcribe_words(self, waveform, *, sampling_rate: int = 16_000, vad_filter: bool | None = None):
         """Transcribe a *whole recording* and return word-level timestamps.
 
         This is the long-context path the design prefers (§6.1): feed the full
@@ -76,10 +78,13 @@ class FasterWhisperASR(AcousticModel):
         short clips), then re-segment by timestamp for scoring. Returns a list of
         ``(start, end, word)`` in recording time.
 
-        ``vad_filter=True`` skips silence — it removes the "Thank you"-on-silence
+        ``vad_filter`` skips silence — it removes the "Thank you"-on-silence
         hallucination at the cost of possibly dropping very quiet words; flip it
-        off if quiet-word recall matters more than hallucination for your slice.
+        off if quiet-word recall matters more than hallucination. Defaults to the
+        instance's ``vad_filter``.
         """
+        if vad_filter is None:
+            vad_filter = self.vad_filter
         segments, _ = self.model.transcribe(
             waveform, language=self.language, beam_size=self.beam_size,
             word_timestamps=True, vad_filter=vad_filter, condition_on_previous_text=True,
