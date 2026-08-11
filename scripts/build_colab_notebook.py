@@ -57,9 +57,13 @@ CORAAL keeps). The gap is what generalizes to the design decision.
     md("## 1. Install (from GitHub — nothing to upload)"),
     code(f"""
 import torch
-# Pin transformers to what qwen-asr requires (==4.57.6); it also satisfies
-# Whisper-turbo and Voxtral (>=4.54), so every branch shares one compatible stack.
+# Install EVERYTHING up front: mid-notebook pip installs don't reliably become
+# importable in Kaggle's running kernel (that's why Voxtral/phone were skipping).
+# Pin transformers to what qwen-asr needs (==4.57.6); it also satisfies Whisper &
+# Voxtral (>=4.54), so all branches share one compatible stack.
+!apt-get -qq install -y espeak-ng > /dev/null 2>&1          # phonemizer runtime (phone branch)
 !pip -q install "transformers==4.57.6" "accelerate==1.12.0" soundfile
+!pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr
 !pip -q install "git+https://github.com/{GITHUB_REPO}.git"
 import classroom_asr
 
@@ -270,7 +274,6 @@ Uses **faster-whisper** (CTranslate2 int8) by default — several times faster t
 Whisper because it avoids the slow 30 s-padded encoder passes on tiny clips."""),
     code(r"""
 if USE_FASTER_WHISPER:
-    !pip -q install faster-whisper
     from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
     branch_A = sharded_seq(
         lambda dev: FasterWhisperASR(FW_MODEL, id_prefix="q", source=CandidateSource.QWEN,
@@ -307,7 +310,6 @@ if USE_CTC:
 branch_Z = None
 if USE_QWEN3ASR:
   try:
-    !pip -q install qwen-asr 2>/dev/null          # pins transformers==4.57.6 (already installed)
     from classroom_asr.backends.qwen3_asr import Qwen3ASR
     # qwen-asr batches natively -> use the batched sharded runner (full coverage, fast)
     branch_Z = sharded_batched(
@@ -324,7 +326,6 @@ if USE_QWEN3ASR:
 branch_C = None
 if USE_VOXTRAL:
   try:
-    !pip -q install "mistral-common[audio]"
     from classroom_asr.backends.voxtral_asr import VoxtralASR
     vox_idx = time_limited_subset(VOXTRAL_MINUTES * 60)   # ungated; just a time cap
     print(f"Voxtral on {len(vox_idx)}/{len(_valid)} spans (first {VOXTRAL_MINUTES} min), batched")
@@ -343,9 +344,6 @@ if USE_VOXTRAL:
 phones = p2g = None
 if USE_PHONE:
   try:
-    # the phoneme tokenizer needs phonemizer + the espeak-ng system binary
-    !apt-get -qq install -y espeak-ng > /dev/null 2>&1
-    !pip -q install phonemizer
     from classroom_asr.backends.wav2vec2_phone import Wav2Vec2Phone
     from classroom_asr.pipeline.stubs import StubP2G
     phones = sharded_batched(

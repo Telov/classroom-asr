@@ -68,6 +68,35 @@ class FasterWhisperASR(AcousticModel):
         text = " ".join(s.text.strip() for s in segments).strip()
         return [TextCandidate(f"{self.id_prefix}1", text, self.source, score=1.0, beam_rank=0)] if text else []
 
+    def transcribe_words(self, waveform, *, sampling_rate: int = 16_000, vad_filter: bool = True):
+        """Transcribe a *whole recording* and return word-level timestamps.
+
+        This is the long-context path the design prefers (§6.1): feed the full
+        audio (so Whisper has real context and doesn't hallucinate on isolated
+        short clips), then re-segment by timestamp for scoring. Returns a list of
+        ``(start, end, word)`` in recording time.
+
+        ``vad_filter=True`` skips silence — it removes the "Thank you"-on-silence
+        hallucination at the cost of possibly dropping very quiet words; flip it
+        off if quiet-word recall matters more than hallucination for your slice.
+        """
+        segments, _ = self.model.transcribe(
+            waveform, language=self.language, beam_size=self.beam_size,
+            word_timestamps=True, vad_filter=vad_filter, condition_on_previous_text=True,
+        )
+        words: list[tuple[float, float, str]] = []
+        for seg in segments:
+            if getattr(seg, "words", None):
+                for wd in seg.words:
+                    t = (wd.word or "").strip()
+                    if t:
+                        words.append((wd.start, wd.end, t))
+            else:
+                t = (seg.text or "").strip()
+                if t:
+                    words.append((seg.start, seg.end, t))
+        return words
+
     def unload(self) -> None:
         import gc
 
