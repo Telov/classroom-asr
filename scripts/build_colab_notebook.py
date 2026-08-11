@@ -83,6 +83,12 @@ USE_QWEN3ASR   = True;  QWEN3ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 USE_VOXTRAL    = True;  VOXTRAL_MODEL  = "mistralai/Voxtral-Mini-3B-2507"
 USE_PHONE      = True;  PHONE_MODEL    = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 
+# Window (seconds) for the audio-LLM branches (Qwen3, Voxtral). These emit a BOUNDED
+# number of output tokens per call, so an over-long window truncates the transcript
+# (600 s gave Qwen3 WER 0.87 — near-total deletion). Keep it near the utterance scale,
+# like Whisper's internal 30 s window; this is capped by output budget, not GPU memory.
+LLM_CHUNK_S    = 30
+
 BASE = f"http://lingtools.uoregon.edu/coraal/{COMPONENT}/{VERSION}"
 COMP = COMPONENT.upper()
 """),
@@ -164,8 +170,14 @@ def whole_rec(make_model, get_text, desc):
     for t in ts: t.start()
     for t in ts: t.join()
     for m in models:
-        if hasattr(m, "unload"): m.unload()
-    del models; _free()   # release GPU memory before the next branch loads
+        if hasattr(m, "unload"):
+            try: m.unload()
+            except Exception as e: print(desc, "unload failed:", repr(e)[:100])
+    models = None; del models; _free()   # release GPU memory before the next branch loads
+    if torch.cuda.is_available():        # empty each device's cache, not just current
+        for g in GPUS:
+            if g is not None:
+                with torch.cuda.device(g): torch.cuda.empty_cache()
     return out
 
 _reftok = [SCORE.tokens(r) for r in refs]
@@ -194,11 +206,14 @@ def add_branch(tag, hyps):
     print(f"[{tag:14s}] branch WER={wer_of(hyps):.3f}   oracle(pool)={oracle_wer(pool):.3f}"
           f"   ({got}/{len(hyps)} interviews)")
 
-def run_branch(tag, make_model):
+def run_branch(tag, make_model, get_text=None):
+    get_text = get_text or (lambda m, a: m.transcribe_full(a))
     try:
-        return whole_rec(make_model, lambda m, a: m.transcribe_full(a), tag)
+        return whole_rec(make_model, get_text, tag)
     except Exception as e:
-        print(f"[{tag:14s}] FAILED to run: {repr(e)[:160]}"); _free(); return None
+        # return empties (not None) so add_branch just skips this branch instead of crashing
+        print(f"[{tag:14s}] FAILED to run: {repr(e)[:160]}"); _free()
+        return [""] * len(interviews)
 """),
     md("## 6. Branch A — Whisper (whole recording) → baseline"),
     code(r"""
@@ -223,7 +238,8 @@ hyp_Z = None
 if USE_QWEN3ASR:
     from classroom_asr.backends.qwen3_asr import Qwen3ASR
     hyp_Z = run_branch("A+B+Qwen3", lambda dev: Qwen3ASR(
-        QWEN3ASR_MODEL, language="English", device=dev))
+        QWEN3ASR_MODEL, language="English", device=dev),
+        get_text=lambda m, a: m.transcribe_full(a, chunk_s=LLM_CHUNK_S))
     add_branch("A+B+Qwen3", hyp_Z)
 """),
     md("## 9. Branch C — Voxtral Mini 3B (audio-LLM)"),
@@ -231,7 +247,8 @@ if USE_QWEN3ASR:
 hyp_C = None
 if USE_VOXTRAL:
     from classroom_asr.backends.voxtral_asr import VoxtralASR
-    hyp_C = run_branch("+Voxtral", lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev))
+    hyp_C = run_branch("+Voxtral", lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev),
+                       get_text=lambda m, a: m.transcribe_full(a, chunk_s=LLM_CHUNK_S))
     add_branch("+Voxtral", hyp_C)
 """),
     md("""## 10. Phone branch — realized IPA (the pronunciation path)

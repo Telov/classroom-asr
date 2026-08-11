@@ -76,14 +76,14 @@ class VoxtralASR(AcousticModel):
             paths.append(tmp.name)
         return paths
 
-    def _generate(self, audio):
+    def _generate(self, audio, *, max_new_tokens=None):
         torch = self._torch
         inputs = self.processor.apply_transcription_request(
             language=self.language if isinstance(audio, str) else [self.language] * len(audio),
             audio=audio, model_id=self.model_id,
         ).to(self.device, dtype=self.dtype)
         with torch.no_grad():
-            out = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens)
+            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens or self.max_new_tokens)
         return self.processor.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
 
     def nbest_batch(self, waveforms, *, n_best: int = 1,
@@ -114,14 +114,27 @@ class VoxtralASR(AcousticModel):
         return results
 
     def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
-                        chunk_s: float = 600.0, min_chunk_s: float = 30.0) -> str:
-        """Whole-recording transcript using the largest window that fits (starts at
-        ``chunk_s``, backs off on OOM). Voxtral's docs allow 30 min, but that OOMs a T4."""
+                        chunk_s: float = 30.0, min_chunk_s: float = 10.0) -> str:
+        """Whole-recording transcript, transcribed in short windows.
+
+        Voxtral is an audio-LLM whose ``generate`` emits a bounded number of output
+        tokens, so an over-long window truncates (the segment-tuned ``max_new_tokens``
+        of 64 clips anything past ~15 s). The window is kept near the utterance scale
+        and the token budget is scaled to it (~8 tok/s + headroom) so nothing is
+        dropped; ``chunked_transcribe`` still backs off on OOM as a safety net."""
         from . import chunked_transcribe
 
+        # scale the output-token budget to the window so long chunks aren't clipped
+        budget = max(self.max_new_tokens, int(chunk_s * 8) + 32)
+
         def one(chunk):
-            r = self.nbest(chunk, sampling_rate=sampling_rate)
-            return r[0].text if r else ""
+            paths = self._write_wavs([chunk], sampling_rate)
+            try:
+                texts = self._generate(paths, max_new_tokens=budget)
+            finally:
+                for p in paths:
+                    os.unlink(p)
+            return (texts[0] or "").strip() if texts else ""
 
         return chunked_transcribe(waveform, sampling_rate, one,
                                   chunk_s=chunk_s, min_chunk_s=min_chunk_s, torch_mod=self._torch)
@@ -129,6 +142,7 @@ class VoxtralASR(AcousticModel):
     def unload(self) -> None:
         import gc
 
+        self.model = None
         del self.model
         gc.collect()
         if str(self.device).startswith("cuda"):

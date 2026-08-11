@@ -122,9 +122,14 @@ class Qwen3ASR(AcousticModel):
         return out
 
     def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
-                        chunk_s: float = 600.0, min_chunk_s: float = 30.0) -> str:
-        """Whole-recording transcript. Uses the largest window that fits (starts at
-        ``chunk_s``, backs off on OOM) — a 30–60 min interview in one pass OOMs a T4."""
+                        chunk_s: float = 30.0, min_chunk_s: float = 10.0) -> str:
+        """Whole-recording transcript, transcribed in short windows.
+
+        Qwen3-ASR is an audio-*LLM*: one ``transcribe`` call emits a bounded number
+        of output tokens, so an over-long window has its transcript **truncated**
+        (most words never emitted → massive deletions). The window is therefore kept
+        near the utterance scale (~30 s, like Whisper's internal window), NOT sized to
+        GPU memory. ``chunked_transcribe`` still backs off on OOM as a safety net."""
         from . import chunked_transcribe
 
         def one(chunk):
@@ -137,7 +142,9 @@ class Qwen3ASR(AcousticModel):
     def unload(self) -> None:
         import gc
 
+        self.model = None
         del self.model
         gc.collect()
-        if self.device.startswith("cuda"):
+        if str(self.device).startswith("cuda"):
+            self._torch.cuda.synchronize()
             self._torch.cuda.empty_cache()
