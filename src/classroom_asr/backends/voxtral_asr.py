@@ -113,6 +113,20 @@ class VoxtralASR(AcousticModel):
             )
         return results
 
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000, chunk_min: float = 25.0) -> str:
+        """Whole-recording transcript. Voxtral tops out at ~30 min of audio, so
+        long interviews are split into <=chunk_min windows and concatenated."""
+        win = int(chunk_min * 60 * sampling_rate)
+        parts = []
+        for start in range(0, len(waveform), win):
+            chunk = waveform[start:start + win]
+            if len(chunk) < 400:
+                continue
+            r = self.nbest(chunk, sampling_rate=sampling_rate)
+            if r:
+                parts.append(r[0].text)
+        return " ".join(parts).strip()
+
     def unload(self) -> None:
         import gc
 

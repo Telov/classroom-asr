@@ -121,6 +121,11 @@ class Qwen3ASR(AcousticModel):
                 out.append((float(st.start_time), float(st.end_time), text))
         return out
 
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000) -> str:
+        """Whole-recording transcript (Qwen3-ASR handles long audio natively)."""
+        c = self.nbest(waveform, sampling_rate=sampling_rate)
+        return c[0].text if c else ""
+
     def unload(self) -> None:
         import gc
 

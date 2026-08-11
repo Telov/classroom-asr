@@ -102,6 +102,11 @@ class FasterWhisperASR(AcousticModel):
                     words.append((seg.start, seg.end, t))
         return words
 
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000) -> str:
+        """Whole-recording transcript as one string (no segmentation)."""
+        return " ".join(t for _, _, t in self.transcribe_words(
+            waveform, sampling_rate=sampling_rate)).strip()
+
     def unload(self) -> None:
         import gc
 

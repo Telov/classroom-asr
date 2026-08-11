@@ -136,6 +136,11 @@ class Wav2Vec2CTC(AcousticModel):
                                 base + wo["end_offset"] * spf, w))
         return out
 
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000) -> str:
+        """Whole-recording transcript (chunked internally)."""
+        return " ".join(t for _, _, t in self.transcribe_words(
+            waveform, sampling_rate=sampling_rate)).strip()
+
     def unload(self) -> None:
         import gc
 

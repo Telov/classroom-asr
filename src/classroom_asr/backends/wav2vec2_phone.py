@@ -80,6 +80,22 @@ class Wav2Vec2Phone(PhoneEncoder):
             results.append([PhonePath("p1", ipa, float(conf[i]))] if ipa else [])
         return results
 
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000, chunk_s: float = 24.0) -> str:
+        """Whole-recording **realized IPA** (chunked). This is the phone branch's
+        actual product — a pronunciation transcript — not a word transcript. Its
+        value (OOV/nonce recovery, pronunciation/PER metrics — §10, §18.1) needs a
+        phonetic reference to score; CORAAL has none, so it's reported as-is."""
+        win = int(chunk_s * sampling_rate)
+        parts = []
+        for start in range(0, len(waveform), win):
+            chunk = waveform[start:start + win]
+            if len(chunk) < 400:
+                continue
+            r = self.recognize_batch([chunk], top_k=1, sampling_rate=sampling_rate)[0]
+            if r:
+                parts.append(r[0].ipa)
+        return " ".join(parts).strip()
+
     def unload(self) -> None:
         import gc
 

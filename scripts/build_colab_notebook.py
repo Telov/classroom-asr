@@ -35,20 +35,23 @@ transcribed, verbatim conversation (CORAAL), with **real ASR models** behind our
 `AcousticModel` interface. Branches (each a *different architecture*, so their
 errors are complementary — §8):
 
-* **A** Whisper large-v3-turbo via **faster-whisper** — **whole-interview** transcription
-  with word timestamps, re-segmented by time (§6.1: context, no short-clip hallucination)
-* **B** wav2vec2 CTC (acoustic CTC, no LM)
-* **Z** Qwen3-ASR-1.7B — the design's real backbone (multilingual LLM-ASR), **batched**
-* **C** Voxtral Mini 3B (audio-LLM) — **batched**, capped to a time subset
-* **phone** wav2vec2 phoneme CTC → IPA lattice + naive P2G (the phonetic path)
+**Boundary-agnostic (§6.1):** no model is fed reference segment boundaries — each
+transcribes the whole interview and is re-segmented by timestamp for scoring.
+
+* **A** Whisper large-v3-turbo (faster-whisper) — whole-interview, word timestamps
+* **B** wav2vec2 CTC — whole-interview, frame-offset word timestamps
+* **Z** Qwen3-ASR-1.7B — whole-interview, native timestamps (the design's backbone)
+* **C** Voxtral Mini 3B — **off by default**: no word timestamps, so it can't be scored
+  per-segment without seeing reference boundaries (leakage)
+* **phone** wav2vec2 phoneme CTC → IPA lattice + P2G (auxiliary; still per-slice)
 
 **Kaggle:** Settings → Accelerator → **GPU T4 x2**, and turn **Internet ON**
 (needed for pip + CORAAL + model downloads). This notebook uses **both** T4s.
 
-**Speed:** every branch is batched/sharded across both GPUs. Whisper runs via
-faster-whisper (CTranslate2 int8), Qwen3-ASR batches natively, and Voxtral is batched
-and capped to `VOXTRAL_MINUTES` of audio. Toggle `USE_FASTER_WHISPER`, `USE_VOXTRAL`,
-`VOXTRAL_MINUTES`, `VOX_BATCH` to trade coverage for time.
+**Speed:** whole-interview transcription is sharded across both GPUs (one interview at a
+time per GPU). It's also *faster* than per-slice because each interview is encoded once
+instead of once per short segment. Toggle `BOUNDARY_AGNOSTIC=False` for the old per-slice
+path, or `USE_QWEN3ASR`/`USE_CTC`/`USE_PHONE` to drop branches.
 
 **We read the *gap* between baseline and oracle, not absolute WER** — CORAAL is
 spontaneous English, so WER is high and deletion-heavy (Whisper trims fillers
@@ -92,11 +95,12 @@ FW_MODEL      = "deepdml/faster-whisper-large-v3-turbo-ct2"
 PRIMARY_MODEL = "openai/whisper-large-v3-turbo"   # HF fallback if USE_FASTER_WHISPER=False
 N_BEST_A      = 1          # 1 = fast (Whisper beams add ~no oracle diversity)
 BATCH_SIZE    = 16
-# Long-context branch A (§6.1): transcribe each whole interview once with word
-# timestamps and re-segment by time, instead of feeding isolated slices. Removes
-# short-clip hallucination ("Thank you") and boundary misalignment.
-WHOLE_AUDIO_WHISPER = True
-WHISPER_VAD   = True       # skip silence in whole-audio mode (less hallucination)
+# Boundary-agnostic transcription (§6.1): NO model is fed reference segment
+# boundaries. Each word-ASR branch (Whisper, CTC, Qwen3) transcribes the whole
+# interview and is re-segmented by timestamp for scoring. Prevents the reference
+# segmentation from leaking into the models, and removes slice hallucination.
+BOUNDARY_AGNOSTIC = True
+WHISPER_VAD   = True       # whole-audio Whisper: skip silence (less hallucination)
 
 USE_CTC       = True
 CTC_MODEL     = "facebook/wav2vec2-large-960h-lv60-self"
@@ -104,10 +108,13 @@ CTC_MODEL     = "facebook/wav2vec2-large-960h-lv60-self"
 USE_QWEN3ASR  = True       # the design's real backbone (small, fast)
 QWEN3ASR_MODEL= "Qwen/Qwen3-ASR-1.7B"
 
-USE_VOXTRAL   = True       # heavy audio-LLM; batched + capped to a time subset
+# Voxtral has NO word timestamps, so it can't be scored per-segment without being
+# fed reference boundaries (leakage). Off by default under BOUNDARY_AGNOSTIC; turn
+# on only if you accept it sees reference slices (and it barely beat Qwen3 anyway).
+USE_VOXTRAL   = False
 VOXTRAL_MODEL = "mistralai/Voxtral-Mini-3B-2507"
-VOXTRAL_MINUTES = 20       # time cap (raise for full coverage)
-VOX_BATCH     = 4          # Voxtral batch size (3B LLM; smaller to fit VRAM)
+VOXTRAL_MINUTES = 20
+VOX_BATCH     = 4
 
 USE_PHONE     = True
 PHONE_MODEL   = "facebook/wav2vec2-lv-60-espeak-cv-ft"
@@ -174,9 +181,11 @@ from tqdm.auto import tqdm
 from classroom_asr.datamodel import Span
 from classroom_asr.timeline import Interval
 from classroom_asr.types import CandidateSource, Role, AudioSource
+from classroom_asr.datamodel import TextCandidate
 from classroom_asr.candidates import mbr_consensus, span_candidate_texts
 from classroom_asr.metrics import candidate_oracle_wer, corpus_wer, score
 from classroom_asr.normalize import Normalizer
+from collections import defaultdict
 
 # Scoring normalizer: fold numbers/ordinals/spelling (formatting noise) but KEEP
 # fillers/function words (their deletion is a real metric). See §18/§29.
@@ -216,6 +225,33 @@ def sharded_batched(make_model, infer_batch, desc, subset=None, bs=None):
     for t in ts: t.join()
     for m in models:
         if hasattr(m,'unload'): m.unload()
+    return out
+
+def whole_audio_branch(make_model, desc):
+    # §6.1 boundary-agnostic: transcribe each whole interview once (the model never
+    # sees reference boundaries), then bucket words into reference segments by time.
+    byiv = defaultdict(list)
+    for _i, (w, s) in enumerate(flat):
+        byiv[w].append((_i, s))
+    ivs = list(byiv.keys())
+    out = [[] for _ in flat]
+    models = [make_model(_dev(g)) for g in GPUS]
+    shards = [ivs[i::len(GPUS)] for i in range(len(GPUS))]
+    def worker(model, sh, pos):
+        for w in tqdm(sh, desc=f"{desc}:{pos}", position=pos, leave=False):
+            try:
+                words = model.transcribe_words(load_16k(w))
+            except Exception as e:
+                print(desc, "interview failed:", repr(e)[:120]); continue
+            for idx, s in byiv[w]:
+                toks = [t for (ws, we, t) in words if s.start <= (ws + we) / 2.0 < s.end]
+                txt = " ".join(toks).strip()
+                out[idx] = [TextCandidate(model.id_prefix + "1", txt, model.source, 1.0, 0)] if txt else []
+    ts = [threading.Thread(target=worker, args=(models[i], shards[i], i)) for i in range(len(GPUS))]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    for m in models:
+        if hasattr(m, 'unload'): m.unload()
     return out
 
 def uncertain_indices(bA, bB):
@@ -279,43 +315,13 @@ def report(tag, spans, rf):
 timestamps and re-segment by time — real context, no short-clip hallucination, no
 boundary misalignment. Set `WHOLE_AUDIO_WHISPER=False` for the old per-slice path."""),
     code(r"""
-from classroom_asr.datamodel import TextCandidate
-import threading
-from collections import defaultdict
-
-if USE_FASTER_WHISPER and WHOLE_AUDIO_WHISPER:
-    from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
-    # group segments by interview; transcribe the full audio once, bucket words by time
-    byiv = defaultdict(list)
-    for _i, (w, s) in enumerate(flat): byiv[w].append((_i, s))
-    ivs = list(byiv.keys())
-    branch_A = [[] for _ in flat]
-    models = [FasterWhisperASR(FW_MODEL, id_prefix="q", source=CandidateSource.QWEN,
-                               language="en", device=_dev(g)) for g in GPUS]
-    shards = [ivs[i::len(GPUS)] for i in range(len(GPUS))]
-    def _whole(model, sh, pos):
-        for w in tqdm(sh, desc=f"whisper-whole:{pos}", position=pos, leave=False):
-            words = model.transcribe_words(load_16k(w), vad_filter=WHISPER_VAD)
-            for idx, s in byiv[w]:
-                toks = [t for (ws, we, t) in words if s.start <= (ws + we) / 2.0 < s.end]
-                txt = " ".join(toks).strip()
-                branch_A[idx] = [TextCandidate("q1", txt, CandidateSource.QWEN, 1.0, 0)] if txt else []
-    ts = [threading.Thread(target=_whole, args=(models[i], shards[i], i)) for i in range(len(GPUS))]
-    for t in ts: t.start()
-    for t in ts: t.join()
-    for m in models: m.unload()
-elif USE_FASTER_WHISPER:
-    from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
-    branch_A = sharded_seq(
-        lambda dev: FasterWhisperASR(FW_MODEL, id_prefix="q", source=CandidateSource.QWEN,
-                                     language="en", device=dev),
-        lambda m, a: m.nbest(a), "fwhisperA")
+from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
+_mkA = lambda dev: FasterWhisperASR(FW_MODEL, id_prefix="q", source=CandidateSource.QWEN,
+                                    language="en", device=dev, vad_filter=WHISPER_VAD)
+if BOUNDARY_AGNOSTIC:
+    branch_A = whole_audio_branch(_mkA, "whisper-whole")
 else:
-    from classroom_asr.backends.whisper_asr import WhisperASR
-    branch_A = sharded_batched(
-        lambda dev: WhisperASR(PRIMARY_MODEL, id_prefix="q", source=CandidateSource.QWEN,
-                               language="en", device=dev),
-        lambda m, wavs: m.nbest_batch(wavs, n_best=N_BEST_A), "whisperA")
+    branch_A = sharded_seq(_mkA, lambda m, a: m.nbest(a), "fwhisperA")
 spans, rf = build_spans(branch_A)
 oracle_all = report("A", spans, rf)
 # raw (no folding) baseline for contrast — shows how much WER was pure formatting
@@ -328,9 +334,11 @@ branch_B = None
 if USE_CTC:
   try:
     from classroom_asr.backends.wav2vec2_ctc import Wav2Vec2CTC
-    branch_B = sharded_batched(
-        lambda dev: Wav2Vec2CTC(CTC_MODEL, id_prefix="c", source=CandidateSource.GIGAAM, device=dev),
-        lambda m, wavs: m.nbest_batch(wavs, n_best=1), "ctcB")
+    _mkB = lambda dev: Wav2Vec2CTC(CTC_MODEL, id_prefix="c", source=CandidateSource.GIGAAM, device=dev)
+    if BOUNDARY_AGNOSTIC:
+        branch_B = whole_audio_branch(_mkB, "ctc-whole")
+    else:
+        branch_B = sharded_batched(_mkB, lambda m, wavs: m.nbest_batch(wavs, n_best=1), "ctcB")
     spans, rf = build_spans(branch_A, branch_B)
     oracle_all = report("A+B", spans, rf)
   except Exception as e:
@@ -342,11 +350,12 @@ branch_Z = None
 if USE_QWEN3ASR:
   try:
     from classroom_asr.backends.qwen3_asr import Qwen3ASR
-    # qwen-asr batches natively -> use the batched sharded runner (full coverage, fast)
-    branch_Z = sharded_batched(
-        lambda dev: Qwen3ASR(QWEN3ASR_MODEL, id_prefix="z", source=CandidateSource.QWEN,
-                             language="English", device=dev, max_inference_batch_size=BATCH_SIZE),
-        lambda m, wavs: m.nbest_batch(wavs, n_best=1), "qwen3asr")
+    _mkZ = lambda dev: Qwen3ASR(QWEN3ASR_MODEL, id_prefix="z", source=CandidateSource.QWEN,
+                                language="English", device=dev, max_inference_batch_size=BATCH_SIZE)
+    if BOUNDARY_AGNOSTIC:   # whole-interview with native timestamps
+        branch_Z = whole_audio_branch(_mkZ, "qwen3-whole")
+    else:                   # per-slice (batched)
+        branch_Z = sharded_batched(_mkZ, lambda m, wavs: m.nbest_batch(wavs, n_best=1), "qwen3asr")
     spans, rf = build_spans(branch_A, branch_B, extras=[branch_Z])
     oracle_all = report("A+B+Qwen3", spans, rf)
   except Exception as e:
