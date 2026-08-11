@@ -121,20 +121,18 @@ class Qwen3ASR(AcousticModel):
                 out.append((float(st.start_time), float(st.end_time), text))
         return out
 
-    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000, chunk_s: float = 120.0) -> str:
-        """Whole-recording transcript, chunked. Feeding a 30–60 min interview in one
-        forward pass OOMs a T4 (activations scale with audio length), so we run
-        ~chunk_s windows and concatenate."""
-        win = int(chunk_s * sampling_rate)
-        parts = []
-        for start in range(0, len(waveform), win):
-            chunk = waveform[start:start + win]
-            if len(chunk) < 400:
-                continue
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
+                        chunk_s: float = 600.0, min_chunk_s: float = 30.0) -> str:
+        """Whole-recording transcript. Uses the largest window that fits (starts at
+        ``chunk_s``, backs off on OOM) — a 30–60 min interview in one pass OOMs a T4."""
+        from . import chunked_transcribe
+
+        def one(chunk):
             c = self.nbest(chunk, sampling_rate=sampling_rate)
-            if c and c[0].text:
-                parts.append(c[0].text)
-        return " ".join(parts).strip()
+            return c[0].text if c else ""
+
+        return chunked_transcribe(waveform, sampling_rate, one,
+                                  chunk_s=chunk_s, min_chunk_s=min_chunk_s, torch_mod=self._torch)
 
     def unload(self) -> None:
         import gc

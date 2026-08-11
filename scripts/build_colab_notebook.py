@@ -55,6 +55,8 @@ numbers/ordinals/spelling but keeps fillers (verbatim, §18/§29).
 """),
     md("## 1. Install (from GitHub — nothing to upload)"),
     code(f"""
+import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
 import torch
 # Everything up front (mid-notebook installs don't reliably import on Kaggle).
 # Pin transformers to what qwen-asr needs (==4.57.6); also satisfies Whisper/Voxtral.
@@ -139,11 +141,16 @@ print(f"{len(interviews)} interviews, {total/60:.1f} min, "
 full transcripts; `oracle_wer` is the candidate-oracle at the word level — the fraction
 of reference words that **no** branch recovers (a lower bound the pool can't beat)."""),
     code(r"""
-import threading
+import threading, gc
 from tqdm.auto import tqdm
 from rapidfuzz.distance import Levenshtein
 from classroom_asr.normalize import Normalizer
 SCORE = Normalizer(fold_numbers=True, fold_spelling=True)   # keep fillers; fold formatting
+
+def _free():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 def whole_rec(make_model, get_text, desc):
     out = [""] * len(interviews)
@@ -158,6 +165,7 @@ def whole_rec(make_model, get_text, desc):
     for t in ts: t.join()
     for m in models:
         if hasattr(m, "unload"): m.unload()
+    del models; _free()   # release GPU memory before the next branch loads
     return out
 
 _reftok = [SCORE.tokens(r) for r in refs]
@@ -177,41 +185,54 @@ def oracle_wer(pool):   # pool = list of branch hyp-lists; word-level recoverabi
         unrec += len(rt) - len(hit); R += len(rt)
     return unrec / R if R else 0.0
 
-def line(tag, wer, pool):
-    print(f"[{tag:14s}] branch WER={wer:.3f}   oracle(pool)={oracle_wer(pool):.3f}")
+def add_branch(tag, hyps):
+    # only count a branch if it actually produced text (a crashed branch is all "")
+    got = sum(1 for h in hyps if h)
+    if got == 0:
+        print(f"[{tag:14s}] produced nothing (skipped from pool)"); return
+    pool.append(hyps)
+    print(f"[{tag:14s}] branch WER={wer_of(hyps):.3f}   oracle(pool)={oracle_wer(pool):.3f}"
+          f"   ({got}/{len(hyps)} interviews)")
+
+def run_branch(tag, make_model):
+    try:
+        return whole_rec(make_model, lambda m, a: m.transcribe_full(a), tag)
+    except Exception as e:
+        print(f"[{tag:14s}] FAILED to run: {repr(e)[:160]}"); _free(); return None
 """),
     md("## 6. Branch A — Whisper (whole recording) → baseline"),
     code(r"""
 from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
-hyp_A = whole_rec(
-    lambda dev: FasterWhisperASR(FW_MODEL, language="en", device=dev, vad_filter=WHISPER_VAD),
-    lambda m, a: m.transcribe_full(a), "whisper")
-pool = [hyp_A]
-print(f"\n[A Whisper    ] WER={wer_of(hyp_A):.3f}   (this is the baseline)")
+hyp_A = run_branch("A whisper", lambda dev: FasterWhisperASR(
+    FW_MODEL, language="en", device=dev, vad_filter=WHISPER_VAD))
+pool = []
+add_branch("A", hyp_A)
+print("^ baseline WER = branch A")
 """),
     md("## 7. Branch B — wav2vec2 CTC"),
     code(r"""
+hyp_B = None
 if USE_CTC:
     from classroom_asr.backends.wav2vec2_ctc import Wav2Vec2CTC
-    hyp_B = whole_rec(lambda dev: Wav2Vec2CTC(CTC_MODEL, device=dev),
-                      lambda m, a: m.transcribe_full(a), "ctc")
-    pool.append(hyp_B); line("A+B", wer_of(hyp_B), pool)
+    hyp_B = run_branch("A+B", lambda dev: Wav2Vec2CTC(CTC_MODEL, device=dev))
+    add_branch("A+B", hyp_B)
 """),
     md("## 8. Branch Z — Qwen3-ASR-1.7B (the design's backbone)"),
     code(r"""
+hyp_Z = None
 if USE_QWEN3ASR:
     from classroom_asr.backends.qwen3_asr import Qwen3ASR
-    hyp_Z = whole_rec(lambda dev: Qwen3ASR(QWEN3ASR_MODEL, language="English", device=dev),
-                      lambda m, a: m.transcribe_full(a), "qwen3")
-    pool.append(hyp_Z); line("A+B+Qwen3", wer_of(hyp_Z), pool)
+    hyp_Z = run_branch("A+B+Qwen3", lambda dev: Qwen3ASR(
+        QWEN3ASR_MODEL, language="English", device=dev))
+    add_branch("A+B+Qwen3", hyp_Z)
 """),
     md("## 9. Branch C — Voxtral Mini 3B (audio-LLM)"),
     code(r"""
+hyp_C = None
 if USE_VOXTRAL:
     from classroom_asr.backends.voxtral_asr import VoxtralASR
-    hyp_C = whole_rec(lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev),
-                      lambda m, a: m.transcribe_full(a), "voxtral")
-    pool.append(hyp_C); line("+Voxtral", wer_of(hyp_C), pool)
+    hyp_C = run_branch("+Voxtral", lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev))
+    add_branch("+Voxtral", hyp_C)
 """),
     md("""## 10. Phone branch — realized IPA (the pronunciation path)
 Not a word transcript: the phone branch's product is *pronunciation*. Scoring it needs a
@@ -233,7 +254,7 @@ from collections import Counter
 # rapidfuzz opcodes so whole-interview alignment stays fast
 dels, subs, ins = Counter(), Counter(), Counter()
 S = D = I = R = 0
-for r, h in zip(refs, hyp_A):
+for r, h in zip(refs, hyp_A or []):
     rt, ht = SCORE.tokens(r), SCORE.tokens(h or ""); R += len(rt)
     for tag, i0, i1, j0, j1 in Levenshtein.opcodes(rt, ht).as_list():
         if tag == "replace":
@@ -243,6 +264,8 @@ for r, h in zip(refs, hyp_A):
         elif tag == "insert":
             for b in ht[j0:j1]: ins[b] += 1; I += 1
 E = S + D + I
+if not R or not E:
+    print("branch A produced nothing — nothing to analyse"); raise SystemExit
 print(f"branch-A WER {E/R:.3f}  |  S={S} ({100*S//E}%)  D={D} ({100*D//E}%)  I={I} ({100*I//E}%)")
 print("\nMost-deleted reference words (what Whisper drops):")
 for w, n in dels.most_common(15): print(f"   {w!r:18} x{n}")
@@ -254,14 +277,13 @@ for w, n in ins.most_common(15): print(f"   {w!r:18} x{n}")
     md("## 12. Save summary"),
     code(r"""
 import json
-res = {"A_whisper": wer_of(hyp_A)}
-if USE_CTC:      res["B_ctc"] = wer_of(hyp_B)
-if USE_QWEN3ASR: res["Z_qwen3"] = wer_of(hyp_Z)
-if USE_VOXTRAL:  res["C_voxtral"] = wer_of(hyp_C)
+res = {}
+for name, h in [("A_whisper", hyp_A), ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C)]:
+    if h and any(h): res[name] = round(wer_of(h), 4)
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",
-           "branch_wer": res, "oracle_wer": oracle_wer(pool),
-           "baseline_wer": wer_of(hyp_A)}
+           "branch_wer": res, "oracle_wer": round(oracle_wer(pool), 4),
+           "baseline_wer": res.get("A_whisper")}
 json.dump(summary, open("coraal_oracle_summary.json", "w"), indent=2)
 print(json.dumps(summary, indent=2))
 """),

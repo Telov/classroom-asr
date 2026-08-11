@@ -113,19 +113,18 @@ class VoxtralASR(AcousticModel):
             )
         return results
 
-    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000, chunk_s: float = 120.0) -> str:
-        """Whole-recording transcript, chunked into ~chunk_s windows. (Voxtral's
-        docs allow 30 min, but that OOMs a T4 — activations scale with length.)"""
-        win = int(chunk_s * sampling_rate)
-        parts = []
-        for start in range(0, len(waveform), win):
-            chunk = waveform[start:start + win]
-            if len(chunk) < 400:
-                continue
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
+                        chunk_s: float = 600.0, min_chunk_s: float = 30.0) -> str:
+        """Whole-recording transcript using the largest window that fits (starts at
+        ``chunk_s``, backs off on OOM). Voxtral's docs allow 30 min, but that OOMs a T4."""
+        from . import chunked_transcribe
+
+        def one(chunk):
             r = self.nbest(chunk, sampling_rate=sampling_rate)
-            if r:
-                parts.append(r[0].text)
-        return " ".join(parts).strip()
+            return r[0].text if r else ""
+
+        return chunked_transcribe(waveform, sampling_rate, one,
+                                  chunk_s=chunk_s, min_chunk_s=min_chunk_s, torch_mod=self._torch)
 
     def unload(self) -> None:
         import gc
