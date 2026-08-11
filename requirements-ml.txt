@@ -1,0 +1,10 @@
+# Heavy backends for the acoustic + LLM stack (§7, §14, §21).
+# Installed only when wiring real models; the core package needs none of these.
+# Pin exact versions/model revisions at integration time.
+torch>=2.2
+transformers>=4.44
+librosa>=0.10
+soundfile>=0.12
+numpy>=1.24
+pandas>=2.0
+pyarrow>=14

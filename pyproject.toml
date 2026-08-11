@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "classroom-asr"
+version = "0.1.0"
+description = "Offline RU<->EN classroom ASR pipeline (Design v1.0): complementary acoustic evidence, explicit phonetic/OOV recovery, calibrated candidates, whole-lesson role-aware selection."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "ASR project" }]
+
+# The core package is intentionally dependency-free (stdlib only) so the data
+# model, metrics, candidate graph, and orchestration run and test without any
+# ML stack installed. Heavy backends live behind interfaces and are opt-in.
+dependencies = []
+
+[project.optional-dependencies]
+# Numeric / IO helpers used by the columnar storage layer (§22) when available.
+data = ["numpy>=1.24", "pandas>=2.0", "pyarrow>=14", "soundfile>=0.12"]
+# Acoustic + LLM backends (§7, §14). Versions are placeholders; the design doc
+# names 2026-era models that are pinned at integration time.
+ml = ["torch>=2.2", "transformers>=4.44", "librosa>=0.10"]
+# Reference scoring parity (§29): cross-check our WER against jiwer.
+eval = ["jiwer>=3.0"]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+classroom-asr = "classroom_asr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

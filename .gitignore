@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Env / tooling
+.venv/
+venv/
+.claude/
+colab/_cells_dump.txt
+
+# Data / models / audio (never commit large binaries)
+coraal/
+*.wav
+*.flac
+*.tar.gz
+*.safetensors
+*.bin

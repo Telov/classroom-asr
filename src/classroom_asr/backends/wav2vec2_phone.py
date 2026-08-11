@@ -1,0 +1,89 @@
+"""A real phone-recognition branch (wav2vec2 phoneme CTC) → PhoneEncoder.
+
+This is the first backend on the **phone path** (§7.3, §10.2), the design's
+substitute for the named PhoneticXEUS: a wav2vec2 model fine-tuned to emit
+eSpeak/IPA phonemes (e.g. ``facebook/wav2vec2-lv-60-espeak-cv-ft``). It produces
+the realized-pronunciation lattice that feeds P2G and the phonetic RAG, and the
+IPA/phone-error metrics (§18.1).
+
+On ordinary in-vocabulary English words a naive P2G of these phones will rarely
+beat a word ASR model, so the phone branch's payoff is **OOV / nonce recovery**
+and **pronunciation analysis**, not word-oracle WER on clean speech — exactly the
+division of labor the design intends (§10.1, §10.5).
+
+Greedy CTC → a single phone path with a mean-posterior confidence. torch/
+transformers imported lazily.
+"""
+
+from __future__ import annotations
+
+from typing import Sequence
+
+from ..datamodel import PhonePath
+from ..pipeline.base import PhoneEncoder, SpeechSegment
+
+
+class Wav2Vec2Phone(PhoneEncoder):
+    def __init__(
+        self,
+        model_id: str = "facebook/wav2vec2-lv-60-espeak-cv-ft",
+        *,
+        device: str | None = None,
+        fp16: bool = True,
+    ) -> None:
+        import torch  # lazy
+        from transformers import AutoModelForCTC, AutoProcessor
+
+        from . import load_pretrained
+
+        self.model_id = model_id
+        self._torch = torch
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.dtype = torch.float16 if (fp16 and self.device == "cuda") else torch.float32
+
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = load_pretrained(
+            AutoModelForCTC, model_id, dtype=self.dtype
+        ).to(self.device).eval()
+
+    def recognize(self, segment: SpeechSegment, *, top_k: int) -> list[PhonePath]:
+        if segment.waveform is None:
+            raise ValueError("Wav2Vec2Phone needs SpeechSegment.waveform (16 kHz mono float32)")
+        return self.recognize_batch([segment.waveform], top_k=top_k)[0]
+
+    def recognize_batch(
+        self, waveforms, *, top_k: int = 1, sampling_rate: int = 16_000
+    ) -> list[list[PhonePath]]:
+        """Greedy phoneme CTC for a batch → one phone path per clip."""
+        torch = self._torch
+        wavs = list(waveforms)
+        if not wavs:
+            return []
+        inputs = self.processor(
+            wavs, sampling_rate=sampling_rate, return_tensors="pt", padding=True
+        )
+        input_values = inputs.input_values.to(self.device, self.dtype)
+        attn = getattr(inputs, "attention_mask", None)
+        kwargs = {"attention_mask": attn.to(self.device)} if attn is not None else {}
+
+        with torch.no_grad():
+            logits = self.model(input_values, **kwargs).logits
+        probs = logits.softmax(dim=-1)
+        pred_ids = probs.argmax(dim=-1)
+        # confidence: mean max-posterior over non-blank frames
+        conf = probs.max(dim=-1).values.mean(dim=-1).float().tolist()
+        ipas = self.processor.batch_decode(pred_ids, clean_up_tokenization_spaces=False)
+
+        results: list[list[PhonePath]] = []
+        for i, ipa in enumerate(ipas):
+            ipa = (ipa or "").strip()
+            results.append([PhonePath("p1", ipa, float(conf[i]))] if ipa else [])
+        return results
+
+    def unload(self) -> None:
+        import gc
+
+        del self.model
+        gc.collect()
+        if self.device == "cuda":
+            self._torch.cuda.empty_cache()
