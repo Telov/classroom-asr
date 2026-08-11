@@ -23,15 +23,57 @@ def load_pretrained(cls, model_id: str, *, dtype=None, **kwargs):
         return cls.from_pretrained(model_id, torch_dtype=dtype, **kwargs)
 
 
-def chunked_transcribe(waveform, sampling_rate, transcribe_chunk, *,
-                       chunk_s, min_chunk_s, torch_mod):
-    """Transcribe a long recording in the **largest window that fits**.
+def snap_to_silence(waveform, target, sampling_rate, *, search_s=1.5, frame_s=0.02):
+    """Return a cut index near ``target`` that falls in the quietest local frame.
 
-    Starts at ``chunk_s`` and, on a CUDA OOM, permanently ratchets the window
-    down (halving, to a ``min_chunk_s`` floor) and retries — so we use the
-    longest context each GPU can hold instead of a fixed tiny chunk, and only the
-    recording that actually OOMs pays the shrink. Windows are non-overlapping;
-    fewer/larger windows means fewer word-splitting boundaries.
+    Cutting a long recording at an arbitrary timestamp can slice through a word,
+    which either deletes it (both partials unrecognizable) or splits it into two
+    junk tokens — a pure chunking artifact that inflates WER. Instead we search a
+    ``±search_s`` region around the intended boundary and cut at the lowest-energy
+    (short-frame RMS) point, so boundaries land in the pause *between* words.
+    """
+    import numpy as np
+
+    n = len(waveform)
+    if target >= n:
+        return n
+    frame = max(1, int(frame_s * sampling_rate))
+    lo = max(0, target - int(search_s * sampling_rate))
+    hi = min(n, target + int(search_s * sampling_rate))
+    region = np.asarray(waveform[lo:hi], dtype=np.float64)
+    nf = len(region) // frame
+    if nf < 2:
+        return target
+    rms = np.sqrt((region[:nf * frame].reshape(nf, frame) ** 2).mean(axis=1))
+    cut = lo + int(np.argmin(rms)) * frame + frame // 2
+    return min(max(cut, lo + frame), hi)   # stay inside the region; always advance
+
+
+def iter_silence_chunks(waveform, sampling_rate, chunk_s, *, search_s=1.5):
+    """Yield ``(start_sample, chunk)`` covering the whole recording with
+    non-overlapping, silence-snapped boundaries (contiguous: no gaps, no overlap,
+    so no word is lost or duplicated). Windows are ~``chunk_s`` long."""
+    n = len(waveform)
+    ceil = int(chunk_s * sampling_rate)
+    i = 0
+    while i < n:
+        end = n if (n - i) <= ceil else snap_to_silence(
+            waveform, i + ceil, sampling_rate, search_s=search_s)
+        if end <= i:                       # snap couldn't advance -> hard cut
+            end = min(i + ceil, n)
+        yield i, waveform[i:end]
+        i = end
+
+
+def chunked_transcribe(waveform, sampling_rate, transcribe_chunk, *,
+                       chunk_s, min_chunk_s, torch_mod, search_s=1.5):
+    """Transcribe a long recording in silence-snapped windows (~``chunk_s``).
+
+    Boundaries are snapped to the quietest nearby frame (see
+    :func:`snap_to_silence`) so no word is split across a cut. On a CUDA OOM the
+    window ratchets down (halving, to a ``min_chunk_s`` floor) and retries, so a
+    memory-tight recording still completes. Windows are contiguous and
+    non-overlapping — every sample is covered exactly once.
     """
     parts = []
     n = len(waveform)
@@ -39,14 +81,18 @@ def chunked_transcribe(waveform, sampling_rate, transcribe_chunk, *,
     floor = int(min_chunk_s * sampling_rate)
     i = 0
     while i < n:
-        chunk = waveform[i:i + min(ceil, n - i)]
+        end = n if (n - i) <= ceil else snap_to_silence(
+            waveform, i + ceil, sampling_rate, search_s=search_s)
+        if end <= i:
+            end = min(i + ceil, n)
+        chunk = waveform[i:end]
         if len(chunk) < 400:
             break
         try:
             text = transcribe_chunk(chunk)
             if text:
                 parts.append(text)
-            i += len(chunk)
+            i = end
         except RuntimeError as e:
             if "out of memory" in str(e).lower() and ceil > floor:
                 if torch_mod.cuda.is_available():

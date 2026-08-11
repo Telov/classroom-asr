@@ -106,17 +106,18 @@ class Wav2Vec2CTC(AcousticModel):
 
         wav2vec2 can't hold a 30–60 min interview in one forward pass, so we run
         non-overlapping chunks and use HF's built-in ``output_word_offsets`` to
-        get per-word frame offsets, converted to absolute time. Returns
-        ``(start, end, word)`` so the model never sees reference boundaries.
+        get per-word frame offsets, converted to absolute time. Chunk boundaries
+        are snapped to silence (see :func:`snap_to_silence`) so a word is never
+        split across a cut. Returns ``(start, end, word)`` so the model never sees
+        reference boundaries.
         """
+        from . import iter_silence_chunks
+
         torch = self._torch
-        n = len(waveform)
-        win = int(chunk_s * sampling_rate)
         # seconds per logit frame (e.g. 320 samples / 16 kHz = 0.02 s)
         spf = float(self.model.config.inputs_to_logits_ratio) / sampling_rate
         out: list[tuple[float, float, str]] = []
-        for start in range(0, n, win):
-            chunk = waveform[start:start + win]
+        for start, chunk in iter_silence_chunks(waveform, sampling_rate, chunk_s):
             if len(chunk) < 400:
                 continue
             iv = self.processor(chunk, sampling_rate=sampling_rate,
