@@ -66,8 +66,10 @@ import torch
 # Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
 # loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
 # versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
-%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr "crisperwhisper[transformers]" soundfile rapidfuzz
+%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz
 %pip -q install "transformers==4.57.6" "accelerate==1.12.0" "git+https://github.com/{GITHUB_REPO}.git"
+# NOTE: CrisperWhisper is NOT installed here — its CT2 fork replaces the `ctranslate2`
+# module and would clobber faster-whisper (branch A). It runs in an isolated venv (§9a).
 import classroom_asr, os
 if os.environ.get("HF_TOKEN"):
     from huggingface_hub import login; login(os.environ["HF_TOKEN"])
@@ -290,19 +292,53 @@ if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
             if g is not None:
                 with torch.cuda.device(g): torch.cuda.empty_cache()
 """),
-    md("""## 9a. Branch CW — CrisperWhisper 2.0 (**verbatim** Whisper)
-The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts the
-clean branches delete — exactly the deletions that dominate the residual WER on a
-verbatim reference. Runs on the pure-PyTorch **transformers** backend (its CT2 runtime
-needs a forked ctranslate2 that can't coexist with faster-whisper/branch A), so it's
-slower than the baseline but the verbatim text is identical. Watch whether it drops
-`oracle(pool)` more than the clean LLM branches did."""),
+    md("""## 9a. Branch CW — CrisperWhisper 2.0 (**verbatim** Whisper, isolated CT2)
+The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts the clean
+branches delete. Its fast **CT2 runtime uses a forked `ctranslate2`** that can't share
+site-packages with faster-whisper (branch A) — so CrisperWhisper runs in a
+`--system-site-packages` **venv** (reuses the main torch/transformers, shadows only
+`ctranslate2` with the fork) driven by a subprocess. Branch A keeps stock CT2; the main
+kernel never imports the fork. First run pays a one-time venv install."""),
     code(r"""
 hyp_CW = None
 if USE_CRISPER:
-    from classroom_asr.backends.crisperwhisper_asr import CrisperWhisperV2
-    hyp_CW = run_branch("+CrisperWhisper",
-                        lambda dev: CrisperWhisperV2(CRISPER_SIZE, device=dev))
+    import os, sys, json, subprocess
+    WORK = os.path.abspath("cw_iso"); os.makedirs(WORK, exist_ok=True)
+    VENV = os.path.join(WORK, "venv"); VENV_PY = os.path.join(VENV, "bin", "python")
+    WORKER = os.path.join(WORK, "cw_worker.py")
+    try:
+        if not os.path.exists(VENV_PY):
+            subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", VENV], check=True)
+            subprocess.run([os.path.join(VENV, "bin", "pip"), "-q", "install",
+                            "crisperwhisper[ct2]"], check=True)
+        with open(WORKER, "w") as f:
+            f.write('''
+import sys, json
+from crisperwhisper import CrisperWhisperModel
+size, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
+paths = json.load(open(inp))
+try:
+    m = CrisperWhisperModel(size, backend="ct2")          # fast forked CT2
+except Exception as e:
+    print("ct2 unavailable, transformers backend:", repr(e)[:120], file=sys.stderr)
+    m = CrisperWhisperModel(size, backend="transformers")  # in-venv fallback
+out = {}
+for p in paths:
+    try:
+        r = m.transcribe(p, language="en"); out[p] = getattr(r, "text", "") or ""
+    except Exception as e:
+        out[p] = ""; print("fail", p, repr(e)[:120], file=sys.stderr)
+json.dump(out, open(outp, "w"))
+''')
+        paths = [os.path.abspath(str(interviews[k][0])) for k in range(len(interviews))]
+        json.dump(paths, open(os.path.join(WORK, "in.json"), "w"))
+        subprocess.run([VENV_PY, WORKER, CRISPER_SIZE,
+                        os.path.join(WORK, "in.json"), os.path.join(WORK, "out.json")], check=True)
+        res = json.load(open(os.path.join(WORK, "out.json")))
+        from classroom_asr.backends.crisperwhisper_asr import CrisperWhisperV2
+        hyp_CW = [CrisperWhisperV2._clean(res.get(p, "")) for p in paths]   # [um]->um, drop [laughter]
+    except Exception as e:
+        print("CrisperWhisper isolation failed:", repr(e)[:200]); hyp_CW = [""] * len(interviews)
     add_branch("+CrisperWhisper", hyp_CW)
 """),
     md("""## 10. Phone branch — realized IPA (the pronunciation path)

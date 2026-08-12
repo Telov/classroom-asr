@@ -167,7 +167,7 @@ class VoxtralASR(AcousticModel):
         return results
 
     def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
-                        chunk_s: float = 30.0, batch_size: int = 4) -> str:
+                        chunk_s: float = 30.0, batch_size: int = 6) -> str:
         """Whole-recording transcript: silence-snapped short windows, **batched**.
 
         Voxtral is an audio-LLM whose ``generate`` emits a bounded number of output

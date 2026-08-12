@@ -127,7 +127,7 @@ class Qwen3ASR(AcousticModel):
         return out
 
     def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
-                        chunk_s: float = 30.0, batch_size: int = 8) -> str:
+                        chunk_s: float = 30.0, batch_size: int = 16) -> str:
         """Whole-recording transcript: silence-snapped short windows, **batched**.
 
         Qwen3-ASR is an audio-*LLM*: one ``transcribe`` call emits a bounded number
