@@ -63,17 +63,17 @@ Run All). If it ever still stops here, just click Run All once more."""),
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"   # Rust parallel-chunk downloads (2-5x faster)
-# Persist heavy artifacts across Kaggle sessions when notebook Persistence is ON
-# (Settings -> Persistence -> "Files only"): /kaggle/working survives between sessions, but
-# /root/.cache (the default HF cache) does NOT. Point the HF cache + the CrisperWhisper venv
-# (built in 2a) at the persisted dir so weights download and the venv builds ONCE, then get
-# reused next session. Best-effort: /kaggle/working is size-capped (~20 GB) and the full model
-# set is ~26 GB, so whatever is evicted simply re-downloads. Harmless when persistence is off
-# (it's just a working dir that's wiped each session -> same as today).
+# Persist ONLY the small CrisperWhisper venv across Kaggle sessions (Settings -> Persistence
+# -> "Files only" keeps /kaggle/working). Model WEIGHTS are deliberately NOT persisted here:
+# the persisted dir is capped (~20 GB) but the full model set is ~26 GB, so redirecting the HF
+# cache into it fills the disk mid-run ("No space left on device"). Weights stay in the default
+# cache on Kaggle's roomy ephemeral disk (re-downloaded each session, overlapped with compute by
+# the §2a prefetch). Also delete any half-written weight cache an earlier version left in the
+# persisted dir, so it stops eating the ~20 GB quota.
 ASR_PERSIST = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.path.abspath("asr_persist")
 os.environ["ASR_PERSIST"] = ASR_PERSIST
-os.environ["HF_HOME"] = os.path.join(ASR_PERSIST, "hf_cache")   # snapshot_download + from_pretrained live here
-os.makedirs(os.environ["HF_HOME"], exist_ok=True)
+import shutil as _shutil
+_shutil.rmtree(os.path.join(ASR_PERSIST, "hf_cache"), ignore_errors=True)   # reclaim space from the bad run
 import torch
 # TF32 matmul: free speedup on Ampere+ (Colab A100/L4), no-op on T4/Turing; inference-safe.
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -138,11 +138,12 @@ Two serial blockers moved off the critical path: the isolated CrisperWhisper **v
 (§9a) and the **model downloads** (esp. Voxtral, ~9.5 GB). Both run in background threads
 now, so they finish *while* the A→Qwen branches compute. Pure overlap — no GPU used here.
 
-**One-time setup to reuse this work across runs:** in the Kaggle editor, open **Settings →
-Persistence → "Files only"**. Then the HF weight cache and the CrisperWhisper venv (both under
-`/kaggle/working`, §1) survive between sessions — weights download and the venv builds *once*,
-and later runs reuse them. `/kaggle/working` is ~20 GB and the full model set is ~26 GB, so
-whatever doesn't fit just re-downloads; transcription still runs fresh every time."""),
+**Reused across runs:** with Kaggle **Settings → Persistence → "Files only"**, the small
+CrisperWhisper **venv** (under `/kaggle/working`) survives between sessions, so it builds once
+and later runs just reuse it. Model **weights are NOT persisted** — the full set (~26 GB)
+exceeds the ~20 GB persisted-dir cap, so caching them there fills the disk mid-run; they live
+in the roomy default cache and re-download each session (overlapped with compute by the
+prefetch below). Transcription always runs fresh."""),
     code(r"""
 import os, sys, subprocess, threading
 # (a) CrisperWhisper CT2 venv — built in the background; §9a just joins this thread. Lives under
@@ -150,10 +151,14 @@ import os, sys, subprocess, threading
 CW_WORK = os.path.join(os.environ.get("ASR_PERSIST", os.path.abspath(".")), "cw_iso")
 os.makedirs(CW_WORK, exist_ok=True)
 CW_VENV = os.path.join(CW_WORK, "venv"); CW_VENV_PY = os.path.join(CW_VENV, "bin", "python")
+CW_READY = os.path.join(CW_WORK, ".venv_ready")   # sentinel: written only after pip install succeeds
 _cw = {"thread": None, "err": None}
 def _cw_prewarm():
     try:
-        if os.path.exists(CW_VENV_PY):
+        # Reuse only a FULLY-built venv. Checking the python binary alone is not enough: a run
+        # that ran out of disk mid-install leaves the venv dir but no crisperwhisper -> the
+        # sentinel guards against falsely "reusing" a broken build.
+        if os.path.exists(CW_READY) and os.path.exists(CW_VENV_PY):
             print("CrisperWhisper venv: reusing persisted build", flush=True); return
         # virtualenv (not venv): seeds pip from bundled wheels, so it avoids the
         # ensurepip failure `python -m venv` hits on Kaggle. Reuses system torch.
@@ -161,6 +166,7 @@ def _cw_prewarm():
                        check=True)
         subprocess.run([os.path.join(CW_VENV, "bin", "pip"), "-q", "install",
                         "crisperwhisper[ct2]", "hf_transfer"], check=True)  # fast venv downloads
+        open(CW_READY, "w").close()               # mark usable only now
     except Exception as e:
         _cw["err"] = e
 if USE_CRISPER:
