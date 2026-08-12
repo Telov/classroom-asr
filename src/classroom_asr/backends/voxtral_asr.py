@@ -73,6 +73,14 @@ class VoxtralASR(AcousticModel):
             VoxtralForConditionalGeneration, model_id, dtype=self.dtype, device_map=self.device
         ).eval()
 
+        # We decode greedily (do_sample=False); drop sampling-only flags the checkpoint's
+        # generation_config carries so generate() doesn't warn "flags not valid: temperature".
+        gcfg = getattr(self.model, "generation_config", None)
+        if gcfg is not None and not getattr(gcfg, "do_sample", False):
+            for k in ("temperature", "top_p", "top_k"):
+                if getattr(gcfg, k, None) is not None:
+                    setattr(gcfg, k, None)
+
     def recognize(self, segment: SpeechSegment, *, n_best: int) -> list[TextCandidate]:
         if segment.waveform is None:
             raise ValueError("VoxtralASR needs SpeechSegment.waveform (16 kHz mono float32)")
@@ -106,30 +114,31 @@ class VoxtralASR(AcousticModel):
         return self.processor.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
 
     def _generate_instruct(self, paths, max_new_tokens):
-        """Verbatim/instruct path: audio + a 'transcribe verbatim' instruction."""
+        """Verbatim/instruct path: audio + a 'transcribe verbatim' instruction.
+
+        Voxtral's ``apply_chat_template`` (MistralCommonTokenizer) already tokenizes and
+        returns a ready-to-generate batch — it rejects the usual HF kwargs
+        (``add_generation_prompt``/``tokenize``/``return_dict``), so we call it bare."""
         torch = self._torch
-        convs = [
-            [{"role": "user", "content": [
+
+        def conv(p):
+            return [{"role": "user", "content": [
                 {"type": "audio", "path": p},
                 {"type": "text", "text": self.instruction},
             ]}]
-            for p in paths
-        ]
 
-        def run(conv_list):
-            inputs = self.processor.apply_chat_template(
-                conv_list, add_generation_prompt=True, tokenize=True,
-                return_dict=True, return_tensors="pt",
-            ).to(self.device, dtype=self.dtype)
+        def run(conversation):
+            inputs = self.processor.apply_chat_template(conversation).to(
+                self.device, dtype=self.dtype)
             with torch.no_grad():
                 out = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
             return self.processor.batch_decode(
-                out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
 
         try:
-            return run(convs)                          # one batched chat call
+            return run([conv(p) for p in paths])       # one batched chat call
         except Exception:
-            return [run([c])[0] for c in convs]        # per-item fallback
+            return [run(conv(p))[0] for p in paths]    # per-item fallback
 
     def nbest_batch(self, waveforms, *, n_best: int = 1,
                     sampling_rate: int = 16_000) -> list[list[TextCandidate]]:

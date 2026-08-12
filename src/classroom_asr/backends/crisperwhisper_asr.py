@@ -8,11 +8,14 @@ every spoken word — fillers, stutters, false starts — and tops verbatim benc
 where Whisper-large-v3 loses. So it belongs in the candidate graph as the branch
 that *keeps* what the others drop (§1.2, §9.2).
 
-CrisperWhisper 2.0 ships its own CTranslate2 runtime (``pip install
-"crisperwhisper[ct2]"``) with speculative decoding + looping-hallucination
-mitigation, so it does its own long-form windowing internally — no manual chunking,
-and it is as fast as the CT2 Whisper baseline. Sizes: ``turbo`` / ``large`` /
-``medium`` / ``small`` (append ``_pro`` for the commercial-licensed tier).
+CrisperWhisper 2.0 backends: its ``ct2`` runtime needs a **forked** ctranslate2
+(``ctranslate2-crisperwhisper``) that cannot coexist with ``faster-whisper`` — they
+overwrite each other in site-packages — and we keep faster-whisper as baseline A. So
+this backend uses the pure-PyTorch ``transformers`` backend (``pip install
+"crisperwhisper[transformers]"``): slower than CT2 but no dependency conflict, and the
+verbatim output (the whole point) is identical. It still does its own long-form
+windowing internally — no manual chunking. Sizes: ``turbo`` / ``large`` / ``medium`` /
+``small`` (append ``_pro`` for the commercial-licensed tier).
 
 Fillers are emitted bracketed (``[um]``, ``[uh]``); non-lexical events (``[laughter]``,
 ``[noise]`` …) are dropped here so they aren't scored as word insertions, while the
@@ -42,7 +45,7 @@ class CrisperWhisperV2(AcousticModel):
         self,
         size: str = "large",                       # turbo | large | medium | small (+ _pro)
         *,
-        backend: str = "ct2",                      # CTranslate2 runtime (fast)
+        backend: str = "transformers",             # pure PyTorch; no ctranslate2 conflict
         id_prefix: str = "cw",
         source: CandidateSource = CandidateSource.QWEN,
         language: str | None = "en",

@@ -66,7 +66,7 @@ import torch
 # Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
 # loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
 # versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
-%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr "crisperwhisper[ct2]" soundfile rapidfuzz
+%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr "crisperwhisper[transformers]" soundfile rapidfuzz
 %pip -q install "transformers==4.57.6" "accelerate==1.12.0" "git+https://github.com/{GITHUB_REPO}.git"
 import classroom_asr, os
 if os.environ.get("HF_TOKEN"):
@@ -293,9 +293,10 @@ if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
     md("""## 9a. Branch CW — CrisperWhisper 2.0 (**verbatim** Whisper)
 The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts the
 clean branches delete — exactly the deletions that dominate the residual WER on a
-verbatim reference. Its CT2 runtime does its own long-form windowing, so it's as fast
-as the Whisper baseline. Watch whether it drops `oracle(pool)` more than the clean
-LLM branches did."""),
+verbatim reference. Runs on the pure-PyTorch **transformers** backend (its CT2 runtime
+needs a forked ctranslate2 that can't coexist with faster-whisper/branch A), so it's
+slower than the baseline but the verbatim text is identical. Watch whether it drops
+`oracle(pool)` more than the clean LLM branches did."""),
     code(r"""
 hyp_CW = None
 if USE_CRISPER:

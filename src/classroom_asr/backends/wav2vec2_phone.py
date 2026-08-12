@@ -41,10 +41,28 @@ class Wav2Vec2Phone(PhoneEncoder):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.float16 if (fp16 and self.device == "cuda") else torch.float32
 
-        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.processor = self._load_processor(model_id)
         self.model = load_pretrained(
             AutoModelForCTC, model_id, dtype=self.dtype
         ).to(self.device).eval()
+
+    @staticmethod
+    def _load_processor(model_id):
+        """Load the wav2vec2 phoneme processor robustly.
+
+        On some transformers builds ``AutoProcessor.from_pretrained`` mis-resolves this
+        model's phoneme tokenizer and raises "Received a bool for argument tokenizer".
+        Fall back to building the processor from its components explicitly."""
+        from transformers import AutoProcessor
+        try:
+            return AutoProcessor.from_pretrained(model_id)
+        except (TypeError, ValueError):
+            from transformers import (
+                Wav2Vec2FeatureExtractor, Wav2Vec2Processor, Wav2Vec2PhonemeCTCTokenizer,
+            )
+            fe = Wav2Vec2FeatureExtractor.from_pretrained(model_id)
+            tok = Wav2Vec2PhonemeCTCTokenizer.from_pretrained(model_id)
+            return Wav2Vec2Processor(feature_extractor=fe, tokenizer=tok)
 
     def recognize(self, segment: SpeechSegment, *, top_k: int) -> list[PhonePath]:
         if segment.waveform is None:

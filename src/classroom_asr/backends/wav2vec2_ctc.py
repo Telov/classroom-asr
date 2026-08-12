@@ -57,9 +57,19 @@ class Wav2Vec2CTC(AcousticModel):
         self.dtype = torch.float16 if (fp16 and self.device == "cuda") else torch.float32
 
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = load_pretrained(
-            AutoModelForCTC, model_id, dtype=self.dtype
-        ).to(self.device).eval()
+        # The 960h checkpoint has no `masked_spec_embed` (a SpecAugment/training-only
+        # param), so transformers warns it's "newly initialized … probably TRAIN". It is
+        # never used at inference — scope-suppress just that one modeling logger for the load.
+        import logging
+        mlog = logging.getLogger("transformers.modeling_utils")
+        prev = mlog.level
+        mlog.setLevel(logging.ERROR)
+        try:
+            self.model = load_pretrained(
+                AutoModelForCTC, model_id, dtype=self.dtype
+            ).to(self.device).eval()
+        finally:
+            mlog.setLevel(prev)
 
     def recognize(self, segment: SpeechSegment, *, n_best: int) -> list[TextCandidate]:
         if segment.waveform is None:
