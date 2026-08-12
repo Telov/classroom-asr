@@ -34,17 +34,19 @@ class Wav2Vec2Phone(PhoneEncoder):
         import torch  # lazy
         from transformers import AutoModelForCTC, AutoProcessor
 
-        from . import load_pretrained
+        from . import load_pretrained, quiet_load
 
         self.model_id = model_id
         self._torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = torch.float16 if (fp16 and self.device == "cuda") else torch.float32
+        # fp16 on any CUDA device ("cuda:0" included); old `== "cuda"` silently ran float32.
+        self.dtype = torch.float16 if (fp16 and str(self.device).startswith("cuda")) else torch.float32
 
         self.fe, self.tok = self._load_fe_tok(model_id)
-        self.model = load_pretrained(
-            AutoModelForCTC, model_id, dtype=self.dtype
-        ).to(self.device).eval()
+        with quiet_load():
+            self.model = load_pretrained(
+                AutoModelForCTC, model_id, dtype=self.dtype
+            ).to(self.device).eval()
 
     @staticmethod
     def _load_fe_tok(model_id):

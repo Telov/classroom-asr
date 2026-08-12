@@ -52,24 +52,21 @@ class Wav2Vec2CTC(AcousticModel):
         self.source = source
         self.source_name = source.value
 
+        from . import quiet_load
+
         self._torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = torch.float16 if (fp16 and self.device == "cuda") else torch.float32
+        # fp16 on any CUDA device ("cuda", "cuda:0", …); the old `== "cuda"` check missed
+        # indexed devices and silently ran float32 (slower, 2x memory).
+        self.dtype = torch.float16 if (fp16 and str(self.device).startswith("cuda")) else torch.float32
 
         self.processor = AutoProcessor.from_pretrained(model_id)
-        # The 960h checkpoint has no `masked_spec_embed` (a SpecAugment/training-only
-        # param), so transformers warns it's "newly initialized … probably TRAIN". It is
-        # never used at inference — scope-suppress just that one modeling logger for the load.
-        import logging
-        mlog = logging.getLogger("transformers.modeling_utils")
-        prev = mlog.level
-        mlog.setLevel(logging.ERROR)
-        try:
+        # Suppress benign load chatter (missing masked_spec_embed "probably TRAIN";
+        # "layers were not sharded") for this load only.
+        with quiet_load():
             self.model = load_pretrained(
                 AutoModelForCTC, model_id, dtype=self.dtype
             ).to(self.device).eval()
-        finally:
-            mlog.setLevel(prev)
 
     def recognize(self, segment: SpeechSegment, *, n_best: int) -> list[TextCandidate]:
         if segment.waveform is None:

@@ -9,6 +9,33 @@ concrete backend class is constructed.
 from __future__ import annotations
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def quiet_load():
+    """Scope-suppress benign transformers/accelerate **load-time** chatter for the
+    duration of a model load only (not a global filter): the "newly initialized …
+    probably TRAIN" note for params a checkpoint lacks, and the verbose "following
+    layers were not sharded" list emitted on multi-GPU hosts. Errors still raise."""
+    import logging
+
+    names = (
+        "transformers.modeling_utils",
+        "transformers.generation.utils",
+        "transformers.generation.configuration_utils",
+        "accelerate", "accelerate.big_modeling", "accelerate.utils.modeling",
+    )
+    saved = {n: logging.getLogger(n).level for n in names}
+    for n in names:
+        logging.getLogger(n).setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        for n, lvl in saved.items():
+            logging.getLogger(n).setLevel(lvl)
+
+
 def load_pretrained(cls, model_id: str, *, dtype=None, **kwargs):
     """``from_pretrained`` that tolerates the ``torch_dtype`` -> ``dtype`` rename.
 

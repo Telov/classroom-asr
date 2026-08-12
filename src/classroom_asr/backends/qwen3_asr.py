@@ -71,22 +71,18 @@ class Qwen3ASR(AcousticModel):
         This is the main Qwen3-ASR speedup: one batched ``transcribe`` instead of
         thousands of per-segment calls.
         """
-        import logging
+        from . import quiet_load
 
         wavs = list(waveforms)
         if not wavs:
             return []
         audio = [(w, sampling_rate) for w in wavs]
         kwargs = {"language": [self.language] * len(wavs)} if self.language else {}
-        # qwen-asr's internal HF generate logs "Setting pad_token_id ..." per call;
-        # scope-suppress just that logger for just this call (not a blanket filter).
-        gen_log = logging.getLogger("transformers.generation.utils")
-        prev = gen_log.level
-        gen_log.setLevel(logging.ERROR)
-        try:
+        # qwen-asr's internal HF generate logs "Setting pad_token_id ..." and
+        # "generation flags not valid: temperature" per call; scope-suppress those two
+        # generation loggers for just this call (not a blanket filter).
+        with quiet_load():
             results = self.model.transcribe(audio=audio, **kwargs)
-        finally:
-            gen_log.setLevel(prev)
 
         out: list[list[TextCandidate]] = []
         for r in results:
@@ -104,18 +100,13 @@ class Qwen3ASR(AcousticModel):
         ``(start, end, text)`` so the interview can be transcribed once (no
         reference-boundary leakage) and re-segmented by time for scoring.
         """
-        import logging
+        from . import quiet_load
 
         kwargs = {"language": [self.language]} if self.language else {}
-        gen_log = logging.getLogger("transformers.generation.utils")
-        prev = gen_log.level
-        gen_log.setLevel(logging.ERROR)
-        try:
+        with quiet_load():
             results = self.model.transcribe(
                 audio=[(waveform, sampling_rate)], return_time_stamps=True, **kwargs
             )
-        finally:
-            gen_log.setLevel(prev)
         if not results:
             return []
         stamps = getattr(results[0], "time_stamps", None) or []
