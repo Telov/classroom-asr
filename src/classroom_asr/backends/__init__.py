@@ -19,7 +19,10 @@ def tune_generation_config(model):
       (``do_sample=False``), so drop the sampling-only flags the checkpoint ships.
 
     Returns True if it found and adjusted at least one config. Best-effort and side-effect
-    free otherwise (some wrappers, e.g. qwen-asr, nest the HF model a level or two down)."""
+    free otherwise. Wrappers (e.g. qwen-asr) nest the real HF model under a package-specific
+    attribute, so besides the common names we also scan each object's ``__dict__`` for nested
+    modules that carry a ``generation_config`` — that ``__dict__`` walk stops naturally at the
+    nn.Module tree (``_modules`` is a plain dict, not an object with ``__dict__``)."""
     seen, found = set(), False
 
     def eos_scalar(gc):
@@ -28,22 +31,33 @@ def tune_generation_config(model):
 
     def visit(obj, depth=0):
         nonlocal found
-        if obj is None or depth > 3 or id(obj) in seen:
+        if obj is None or depth > 4 or id(obj) in seen:
             return
         seen.add(id(obj))
         gc = getattr(obj, "generation_config", None)
         if gc is not None:
-            if getattr(gc, "pad_token_id", None) is None:
-                eos = eos_scalar(gc)
-                if eos is not None:
-                    gc.pad_token_id = eos
+            eos = eos_scalar(gc)
+            if getattr(gc, "pad_token_id", None) is None and eos is not None:
+                gc.pad_token_id = eos
+            # Some wrappers rebuild the per-call GenerationConfig from model.config, so set
+            # pad there too (kills "Setting pad_token_id to eos_token_id" at generate time).
+            cfg = getattr(obj, "config", None)
+            if cfg is not None and getattr(cfg, "pad_token_id", None) is None and eos is not None:
+                cfg.pad_token_id = eos
             if not getattr(gc, "do_sample", False):
                 for k in ("temperature", "top_p", "top_k"):
                     if getattr(gc, k, None) is not None:
                         setattr(gc, k, None)
             found = True
-        for attr in ("model", "llm", "language_model", "thinker", "generation_model"):
+        for attr in ("model", "llm", "language_model", "thinker", "talker", "generation_model"):
             visit(getattr(obj, attr, None), depth + 1)
+        # generic fallback: recurse into nested objects held on this instance (bounded by
+        # depth + the seen-set), to reach a config parked under a non-standard attribute name.
+        d = getattr(obj, "__dict__", None)
+        if isinstance(d, dict):
+            for v in list(d.values()):
+                if hasattr(v, "__dict__") or hasattr(v, "generation_config"):
+                    visit(v, depth + 1)
 
     visit(model)
     return found

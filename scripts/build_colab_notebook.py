@@ -443,12 +443,19 @@ if USE_CRISPER:
             raise _cw["err"]
         with open(WORKER, "w") as f:
             f.write('''
-import sys, json, warnings
-# The crisperwhisper package still calls from_pretrained with the old `torch_dtype=` kwarg;
-# that is inside the dependency, so it can't be fixed at our source. Drop just that one
-# deprecation message (narrow match) rather than raising verbosity or muting broadly.
-warnings.filterwarnings("ignore", message=".*torch_dtype.*")
+import sys, json, warnings, logging
 from crisperwhisper import CrisperWhisperModel
+# The crisperwhisper package still calls from_pretrained with the old `torch_dtype=` kwarg;
+# that is inside the dependency, so it can't be fixed at our source. transformers emits it via
+# its LOGGER (warning_once), not warnings.warn, so drop just that one line with a targeted
+# logging filter on the transformers handler (not a verbosity/level change, not a broad mute).
+warnings.filterwarnings("ignore", message=".*torch_dtype.*")   # belt-and-suspenders
+class _DropTorchDtype(logging.Filter):
+    def filter(self, record): return "torch_dtype" not in record.getMessage()
+_flt = _DropTorchDtype()
+for _lg in (logging.getLogger("transformers"), logging.getLogger()):
+    _lg.addFilter(_flt)
+    for _h in _lg.handlers: _h.addFilter(_flt)
 size, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 paths = json.load(open(inp))
 try:
