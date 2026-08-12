@@ -526,6 +526,59 @@ for p, n in subs.most_common(15): print(f"   {p:30} x{n}")
 print("\nMost-inserted words (hyp words with no ref):")
 for w, n in ins.most_common(15): print(f"   {w!r:18} x{n}")
 """),
+    md("""## 11.5 Oracle-floor breakdown — what the *whole ensemble* still misses
+Section 11 is branch A alone. This is the **oracle floor**: the reference words that **no
+branch** recovered — the exact `oracle_wer` set (a ref word counts as recovered iff it lands
+in an `equal` span for at least one branch). It's the honest ceiling for *this* model set.
+
+Vernacular is deliberately **kept as errors** (CORAAL is regional AAL — `gonna`, `y'all`,
+g-dropping are the features of interest, not noise to fold away), so they surface here as
+genuine misses. The category split separates convention/vernacular from the model-limited
+deletions (backchannel overlap, reduced function words)."""),
+    code(r"""
+from collections import Counter
+# Same "recovered" rule as oracle_wer(): a ref index is recovered iff some branch aligns it
+# in an `equal` span. Everything else is the floor — tally those ref words by type/category.
+floor = Counter(); total_unrec = R = 0
+if not pool:
+    print("no branches in pool — nothing to break down")
+else:
+    for i, rt in enumerate(_reftok):
+        hit = set()
+        for hyps in pool:
+            for tag, i0, i1, j0, j1 in Levenshtein.opcodes(rt, SCORE.tokens(hyps[i] or "")).as_list():
+                if tag == "equal": hit.update(range(i0, i1))
+        for k, w in enumerate(rt):
+            if k not in hit: floor[w] += 1; total_unrec += 1
+        R += len(rt)
+
+    # buckets (mutually exclusive, first match wins). post-normalization forms: edge
+    # apostrophes are already stripped by SCORE.tokens (so 'cause -> cause), internal kept.
+    FILLER = {"um","uh","uhm","erm","er","mm","hmm","hm","mmhm","mhm","mm-hmm","uh-huh","huh",
+              "ah","oh","eh","yeah","yep","yup","nah","mkay","naw"}
+    VERNAC = {"gonna","wanna","gotta","finna","tryna","imma","gon","y'all","yall","ain't","aint",
+              "o'clock","cause","cuz","lemme","gimme","kinda","sorta","dunno","bout","em",
+              "goin","doin","nothin","somethin","talkin","gettin","comin","tryin"}
+    FUNC   = {"i","a","an","the","and","to","of","in","is","was","that","you","it","he","she","we",
+              "they","on","so","at","my","me","be","do","as","but","or","if","for","with","this",
+              "your","our","his","her","them","then","there","have","had","has","are","were","just"}
+    def cat(w):
+        if w in VERNAC: return "vernacular (kept as errors by design)"
+        if w in FILLER: return "filler/backchannel"
+        if w in FUNC or len(w) <= 2: return "short/function word"
+        return "content word"
+
+    bycat = Counter()
+    for w, n in floor.items(): bycat[cat(w)] += n
+    print(f"ORACLE FLOOR: {total_unrec} of {R} ref words recovered by NO branch"
+          f"   (oracle WER {total_unrec/R:.3f}; matches the pool oracle above)")
+    print("\nby category (share of the floor):")
+    for c, n in bycat.most_common():
+        print(f"   {n:5d}  {100*n/total_unrec:4.1f}%   {c}")
+    print("\nMost-common unrecovered reference words (what the whole ensemble misses):")
+    for w, n in floor.most_common(30):
+        print(f"   {w!r:16} x{n:<4} [{cat(w)}]")
+"""),
     md("""## 12. Timings + save summary
 Persistent per-stage wall-times (every stage `⏱`-printed as it finished; here they're
 collected into one table) and the WER/oracle summary."""),
@@ -545,6 +598,11 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
            "branch_wer": res, "oracle_wer": round(oracle_wer(pool), 4),
            "baseline_wer": res.get("A_whisper"),
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
+try:   # oracle-floor breakdown from §11.5 (defined only if the pool had branches)
+    summary["oracle_floor_by_category"] = dict(bycat.most_common())
+    summary["oracle_floor_top"] = [[w, n] for w, n in floor.most_common(30)]
+except NameError:
+    pass
 json.dump(summary, open("coraal_oracle_summary.json", "w"), indent=2)
 print(json.dumps(summary, indent=2))
 """),
