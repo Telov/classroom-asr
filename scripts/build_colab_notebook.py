@@ -140,7 +140,7 @@ def _cw_prewarm():
             subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", CW_VENV],
                            check=True)
             subprocess.run([os.path.join(CW_VENV, "bin", "pip"), "-q", "install",
-                            "crisperwhisper[ct2]"], check=True)
+                            "crisperwhisper[ct2]", "hf_transfer"], check=True)  # fast venv downloads
     except Exception as e:
         _cw["err"] = e
 if USE_CRISPER:
@@ -157,6 +157,7 @@ def _prefetch():
         return
     repos = [m for m, on in [
         (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM), (QWEN3ASR_MODEL, USE_QWEN3ASR),
+        (f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}", USE_CRISPER),   # venv reads same HF cache
         (FW_MODEL, True), (CTC_MODEL, USE_CTC), (PHONE_MODEL, USE_PHONE)] if on]
     for r in repos:                                   # biggest first (Voxtral) for max overlap
         try: snapshot_download(r)
@@ -234,10 +235,25 @@ def _free():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+# Construct one model per GPU in parallel (each is tens of seconds for the big checkpoints
+# and they're independent) instead of back-to-back. Re-raises the first construction error
+# so the per-branch guards still skip a failed branch.
+def load_models(make_model):
+    models = [None] * len(GPUS); errs = [None] * len(GPUS)
+    def build(i, g):
+        try: models[i] = make_model("cpu" if g is None else f"cuda:{g}")
+        except Exception as e: errs[i] = e
+    ts = [threading.Thread(target=build, args=(i, g)) for i, g in enumerate(GPUS)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    for e in errs:
+        if e is not None: raise e
+    return models
+
 def whole_rec(make_model, get_text, desc):
     out = [""] * len(interviews)
     t0 = time.time()
-    models = [make_model("cpu" if g is None else f"cuda:{g}") for g in GPUS]
+    models = load_models(make_model)               # parallel per-GPU load
     tload = time.time() - t0                       # includes first-time model download
     shards = [list(range(len(interviews)))[i::len(GPUS)] for i in range(len(GPUS))]
     def worker(model, sh, pos):
@@ -308,7 +324,7 @@ def window_pass(models, desc, *, chunk_s, batch_size):
 def run_windows(desc, make_model, *, chunk_s, batch_size):
     t0 = time.time()
     try:
-        models = [make_model("cpu" if g is None else f"cuda:{g}") for g in GPUS]
+        models = load_models(make_model)           # parallel per-GPU load
     except Exception as e:
         print(f"[{desc:14s}] load FAILED: {repr(e)[:160]}"); _free(); return [""] * len(interviews)
     tload = time.time() - t0
@@ -396,8 +412,7 @@ hyp_C = hyp_VV = None
 if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
     from classroom_asr.backends.voxtral_asr import VoxtralASR
     with stage("Voxtral load (shared)"):            # one 9.5 GB load reused by both passes
-        vmodels = [VoxtralASR(VOXTRAL_MODEL, language="en",
-                              device=("cpu" if g is None else f"cuda:{g}")) for g in GPUS]
+        vmodels = load_models(lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev))
     def _vox_pass(mode, tag):                       # windows balanced across GPUs, one mode
         for m in vmodels: m.mode = mode
         t0 = time.time(); out = window_pass(vmodels, tag, chunk_s=LLM_CHUNK_S, batch_size=6)
