@@ -62,6 +62,7 @@ Run All). If it ever still stops here, just click Run All once more."""),
     code(f"""
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"   # Rust parallel-chunk downloads (2-5x faster)
 import torch
 # TF32 matmul: free speedup on Ampere+ (Colab A100/L4), no-op on T4/Turing; inference-safe.
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -69,7 +70,7 @@ torch.backends.cudnn.allow_tf32 = True
 # Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
 # loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
 # versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
-%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz
+%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz hf_transfer
 %pip -q install "transformers==4.57.6" "accelerate==1.12.0" "git+https://github.com/{GITHUB_REPO}.git"
 # NOTE: CrisperWhisper is NOT installed here — its CT2 fork replaces the `ctranslate2`
 # module and would clobber faster-whisper (branch A). It runs in an isolated venv (§9a).
@@ -109,6 +110,45 @@ LLM_CHUNK_S    = 30
 
 BASE = f"http://lingtools.uoregon.edu/coraal/{COMPONENT}/{VERSION}"
 COMP = COMPONENT.upper()
+"""),
+    md("""## 2a. Prewarm in the background (overlap setup with compute)
+Two serial blockers moved off the critical path: the isolated CrisperWhisper **venv build**
+(§9a) and the **model downloads** (esp. Voxtral, ~9.5 GB). Both run in background threads
+now, so they finish *while* the A→Qwen branches compute. Pure overlap — no GPU used here."""),
+    code(r"""
+import os, sys, subprocess, threading
+# (a) CrisperWhisper CT2 venv — built in the background; §9a just joins this thread.
+CW_WORK = os.path.abspath("cw_iso"); os.makedirs(CW_WORK, exist_ok=True)
+CW_VENV = os.path.join(CW_WORK, "venv"); CW_VENV_PY = os.path.join(CW_VENV, "bin", "python")
+_cw = {"thread": None, "err": None}
+def _cw_prewarm():
+    try:
+        if not os.path.exists(CW_VENV_PY):
+            subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", CW_VENV], check=True)
+            subprocess.run([os.path.join(CW_VENV, "bin", "pip"), "-q", "install",
+                            "crisperwhisper[ct2]"], check=True)
+    except Exception as e:
+        _cw["err"] = e
+if USE_CRISPER:
+    _cw["thread"] = threading.Thread(target=_cw_prewarm, daemon=True); _cw["thread"].start()
+    print("CrisperWhisper venv prewarm: started")
+
+# (b) Prefetch model weights (hf_transfer-accelerated) so the heavy Voxtral/Qwen downloads
+# overlap earlier branches instead of blocking their cells. Best-effort; branches re-fetch
+# lazily if a prefetch fails.
+def _prefetch():
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception:
+        return
+    repos = [m for m, on in [
+        (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM), (QWEN3ASR_MODEL, USE_QWEN3ASR),
+        (FW_MODEL, True), (CTC_MODEL, USE_CTC), (PHONE_MODEL, USE_PHONE)] if on]
+    for r in repos:                                   # biggest first (Voxtral) for max overlap
+        try: snapshot_download(r)
+        except Exception as e: print("prefetch skip", r, repr(e)[:80])
+threading.Thread(target=_prefetch, daemon=True).start()
+print("model prefetch: started in background")
 """),
     md("## 3. Download + extract CORAAL"),
     code(r"""
@@ -341,20 +381,19 @@ The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts 
 branches delete. Its fast **CT2 runtime uses a forked `ctranslate2`** that can't share
 site-packages with faster-whisper (branch A) — so CrisperWhisper runs in a
 `--system-site-packages` **venv** (reuses the main torch/transformers, shadows only
-`ctranslate2` with the fork) driven by a subprocess. Branch A keeps stock CT2; the main
-kernel never imports the fork. First run pays a one-time venv install."""),
+`ctranslate2` with the fork) driven by a subprocess. The venv was built in the background
+back in §2a, so this cell usually just joins it and transcribes. Branch A keeps stock CT2;
+the main kernel never imports the fork."""),
     code(r"""
 hyp_CW = None
 if USE_CRISPER:
     import os, sys, json, subprocess
-    WORK = os.path.abspath("cw_iso"); os.makedirs(WORK, exist_ok=True)
-    VENV = os.path.join(WORK, "venv"); VENV_PY = os.path.join(VENV, "bin", "python")
-    WORKER = os.path.join(WORK, "cw_worker.py")
+    WORKER = os.path.join(CW_WORK, "cw_worker.py")
     try:
-        if not os.path.exists(VENV_PY):
-            subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", VENV], check=True)
-            subprocess.run([os.path.join(VENV, "bin", "pip"), "-q", "install",
-                            "crisperwhisper[ct2]"], check=True)
+        if _cw["thread"] is not None:
+            _cw["thread"].join()                 # wait for the background venv build (§2a)
+        if _cw["err"] is not None:
+            raise _cw["err"]
         with open(WORKER, "w") as f:
             f.write('''
 import sys, json
@@ -375,10 +414,10 @@ for p in paths:
 json.dump(out, open(outp, "w"))
 ''')
         paths = [os.path.abspath(str(interviews[k][0])) for k in range(len(interviews))]
-        json.dump(paths, open(os.path.join(WORK, "in.json"), "w"))
-        subprocess.run([VENV_PY, WORKER, CRISPER_SIZE,
-                        os.path.join(WORK, "in.json"), os.path.join(WORK, "out.json")], check=True)
-        res = json.load(open(os.path.join(WORK, "out.json")))
+        json.dump(paths, open(os.path.join(CW_WORK, "in.json"), "w"))
+        subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE,
+                        os.path.join(CW_WORK, "in.json"), os.path.join(CW_WORK, "out.json")], check=True)
+        res = json.load(open(os.path.join(CW_WORK, "out.json")))
         from classroom_asr.backends.crisperwhisper_asr import CrisperWhisperV2
         hyp_CW = [CrisperWhisperV2._clean(res.get(p, "")) for p in paths]   # [um]->um, drop [laughter]
     except Exception as e:
