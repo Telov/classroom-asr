@@ -449,9 +449,7 @@ if USE_CRISPER:
             raise _cw["err"]
         with open(WORKER, "w") as f:
             f.write('''
-import sys, json, os, warnings
-warnings.filterwarnings("ignore", message=".*torch_dtype.*")   # benign package deprecation
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+import sys, json
 from crisperwhisper import CrisperWhisperModel
 size, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 paths = json.load(open(inp))

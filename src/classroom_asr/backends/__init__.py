@@ -9,31 +9,44 @@ concrete backend class is constructed.
 from __future__ import annotations
 
 
-import contextlib
+def tune_generation_config(model):
+    """Fix at the source the two benign generate-time warnings, on whatever nested module
+    actually holds the ``generation_config``:
 
+    * "Setting pad_token_id to eos_token_id …" — set ``pad_token_id`` so generate doesn't
+      have to infer it every call.
+    * "generation flags are not valid: ['temperature'] …" — we decode greedily
+      (``do_sample=False``), so drop the sampling-only flags the checkpoint ships.
 
-@contextlib.contextmanager
-def quiet_load():
-    """Scope-suppress benign transformers/accelerate **load-time** chatter for the
-    duration of a model load only (not a global filter): the "newly initialized …
-    probably TRAIN" note for params a checkpoint lacks, and the verbose "following
-    layers were not sharded" list emitted on multi-GPU hosts. Errors still raise."""
-    import logging
+    Returns True if it found and adjusted at least one config. Best-effort and side-effect
+    free otherwise (some wrappers, e.g. qwen-asr, nest the HF model a level or two down)."""
+    seen, found = set(), False
 
-    names = (
-        "transformers.modeling_utils",
-        "transformers.generation.utils",
-        "transformers.generation.configuration_utils",
-        "accelerate", "accelerate.big_modeling", "accelerate.utils.modeling",
-    )
-    saved = {n: logging.getLogger(n).level for n in names}
-    for n in names:
-        logging.getLogger(n).setLevel(logging.ERROR)
-    try:
-        yield
-    finally:
-        for n, lvl in saved.items():
-            logging.getLogger(n).setLevel(lvl)
+    def eos_scalar(gc):
+        eos = getattr(gc, "eos_token_id", None)
+        return eos[0] if isinstance(eos, (list, tuple)) and eos else eos
+
+    def visit(obj, depth=0):
+        nonlocal found
+        if obj is None or depth > 3 or id(obj) in seen:
+            return
+        seen.add(id(obj))
+        gc = getattr(obj, "generation_config", None)
+        if gc is not None:
+            if getattr(gc, "pad_token_id", None) is None:
+                eos = eos_scalar(gc)
+                if eos is not None:
+                    gc.pad_token_id = eos
+            if not getattr(gc, "do_sample", False):
+                for k in ("temperature", "top_p", "top_k"):
+                    if getattr(gc, k, None) is not None:
+                        setattr(gc, k, None)
+            found = True
+        for attr in ("model", "llm", "language_model", "thinker", "generation_model"):
+            visit(getattr(obj, attr, None), depth + 1)
+
+    visit(model)
+    return found
 
 
 def load_pretrained(cls, model_id: str, *, dtype=None, **kwargs):

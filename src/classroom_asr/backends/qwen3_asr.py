@@ -55,6 +55,12 @@ class Qwen3ASR(AcousticModel):
                 model_id, dtype=self.dtype, device_map=self.device
             )
 
+        # Fix the generate-time warnings at the source: set pad_token_id (kills the
+        # per-call "Setting pad_token_id …") and drop sampling-only flags since we decode
+        # greedily (kills "generation flags not valid: temperature").
+        from . import tune_generation_config
+        tune_generation_config(self.model)
+
     def recognize(self, segment: SpeechSegment, *, n_best: int) -> list[TextCandidate]:
         if segment.waveform is None:
             raise ValueError("Qwen3ASR needs SpeechSegment.waveform (16 kHz mono float32)")
@@ -71,18 +77,12 @@ class Qwen3ASR(AcousticModel):
         This is the main Qwen3-ASR speedup: one batched ``transcribe`` instead of
         thousands of per-segment calls.
         """
-        from . import quiet_load
-
         wavs = list(waveforms)
         if not wavs:
             return []
         audio = [(w, sampling_rate) for w in wavs]
         kwargs = {"language": [self.language] * len(wavs)} if self.language else {}
-        # qwen-asr's internal HF generate logs "Setting pad_token_id ..." and
-        # "generation flags not valid: temperature" per call; scope-suppress those two
-        # generation loggers for just this call (not a blanket filter).
-        with quiet_load():
-            results = self.model.transcribe(audio=audio, **kwargs)
+        results = self.model.transcribe(audio=audio, **kwargs)
 
         out: list[list[TextCandidate]] = []
         for r in results:
@@ -100,13 +100,10 @@ class Qwen3ASR(AcousticModel):
         ``(start, end, text)`` so the interview can be transcribed once (no
         reference-boundary leakage) and re-segmented by time for scoring.
         """
-        from . import quiet_load
-
         kwargs = {"language": [self.language]} if self.language else {}
-        with quiet_load():
-            results = self.model.transcribe(
-                audio=[(waveform, sampling_rate)], return_time_stamps=True, **kwargs
-            )
+        results = self.model.transcribe(
+            audio=[(waveform, sampling_rate)], return_time_stamps=True, **kwargs
+        )
         if not results:
             return []
         stamps = getattr(results[0], "time_stamps", None) or []

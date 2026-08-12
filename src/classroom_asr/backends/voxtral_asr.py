@@ -52,7 +52,7 @@ class VoxtralASR(AcousticModel):
         import torch  # lazy
         from transformers import AutoProcessor, VoxtralForConditionalGeneration
 
-        from . import best_dtype, load_pretrained
+        from . import best_dtype, load_pretrained, tune_generation_config
 
         self.model_id = model_id
         self.id_prefix = id_prefix
@@ -73,13 +73,9 @@ class VoxtralASR(AcousticModel):
             VoxtralForConditionalGeneration, model_id, dtype=self.dtype, device_map=self.device
         ).eval()
 
-        # We decode greedily (do_sample=False); drop sampling-only flags the checkpoint's
-        # generation_config carries so generate() doesn't warn "flags not valid: temperature".
-        gcfg = getattr(self.model, "generation_config", None)
-        if gcfg is not None and not getattr(gcfg, "do_sample", False):
-            for k in ("temperature", "top_p", "top_k"):
-                if getattr(gcfg, k, None) is not None:
-                    setattr(gcfg, k, None)
+        # Fix generate-time warnings at the source: set pad_token_id and drop sampling-only
+        # flags (we decode greedily) so generate() doesn't warn about pad_token / temperature.
+        tune_generation_config(self.model)
 
     def recognize(self, segment: SpeechSegment, *, n_best: int) -> list[TextCandidate]:
         if segment.waveform is None:
