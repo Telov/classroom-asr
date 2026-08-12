@@ -377,8 +377,12 @@ def run_branch(tag, make_model, get_text=None):
     md("## 6. Branch A — Whisper (whole recording) → baseline"),
     code(r"""
 from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
-hyp_A = run_branch("A whisper", lambda dev: FasterWhisperASR(
-    FW_MODEL, language="en", device=dev, vad_filter=WHISPER_VAD))
+# window-balanced: each interview split into large (~15 min) silence-snapped slices spread
+# across both GPUs, so neither idles on the 2+1 interview split. Transcription is unchanged
+# per slice (faster-whisper VAD+conditioning run inside each), so WER stays put.
+hyp_A = run_windows("A whisper", lambda dev: FasterWhisperASR(
+    FW_MODEL, language="en", device=dev, vad_filter=WHISPER_VAD),
+    chunk_s=900, batch_size=1)
 pool = []
 add_branch("A", hyp_A)
 print("^ baseline WER = branch A")
@@ -388,7 +392,8 @@ print("^ baseline WER = branch A")
 hyp_B = None
 if USE_CTC:
     from classroom_asr.backends.wav2vec2_ctc import Wav2Vec2CTC
-    hyp_B = run_branch("A+B", lambda dev: Wav2Vec2CTC(CTC_MODEL, device=dev))
+    hyp_B = run_windows("A+B", lambda dev: Wav2Vec2CTC(CTC_MODEL, device=dev),
+                        chunk_s=900, batch_size=8)
     add_branch("A+B", hyp_B)
 """),
     md("## 8. Branch Z — Qwen3-ASR-1.7B (the design's backbone)"),
@@ -399,7 +404,7 @@ if USE_QWEN3ASR:
     # windows balanced across GPUs (no 2+1 idle), reassembled in order (same output)
     hyp_Z = run_windows("A+B+Qwen3",
                         lambda dev: Qwen3ASR(QWEN3ASR_MODEL, language="English", device=dev),
-                        chunk_s=LLM_CHUNK_S, batch_size=16)
+                        chunk_s=LLM_CHUNK_S, batch_size=32)   # 1.7B: room for a big batch
     add_branch("A+B+Qwen3", hyp_Z)
 """),
     md("""## 9. Branch C / VV — Voxtral Mini 3B, **both passes on one load**
@@ -415,7 +420,7 @@ if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
         vmodels = load_models(lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev))
     def _vox_pass(mode, tag):                       # windows balanced across GPUs, one mode
         for m in vmodels: m.mode = mode
-        t0 = time.time(); out = window_pass(vmodels, tag, chunk_s=LLM_CHUNK_S, batch_size=6)
+        t0 = time.time(); out = window_pass(vmodels, tag, chunk_s=LLM_CHUNK_S, batch_size=12)
         rec(tag, time.time() - t0); return out
     if USE_VOXTRAL:
         hyp_C = _vox_pass("transcription", "+Voxtral"); add_branch("+Voxtral", hyp_C)

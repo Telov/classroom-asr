@@ -134,6 +134,16 @@ class FasterWhisperASR(AcousticModel):
         return " ".join(t for _, _, t in self.transcribe_words(
             waveform, sampling_rate=sampling_rate)).strip()
 
+    def transcribe_chunk_list(self, chunks, *, sampling_rate: int = 16_000,
+                              batch_size: int = 1) -> list[str]:
+        """Transcribe pre-cut slices → one transcript per slice, for the window-balanced
+        runner. Lets a long interview be split into large (~15 min) silence-snapped pieces
+        and spread across GPUs so neither sits idle on the 2+1 interview split. Each slice
+        is still transcribed whole (faster-whisper's own VAD + conditioning run inside it),
+        so quality matches whole-interview aside from conditioning resetting at the few
+        silence cuts. ``batch_size`` is accepted for interface parity (CT2 decodes serially)."""
+        return [self.transcribe_full(c, sampling_rate=sampling_rate) for c in chunks]
+
     def unload(self) -> None:
         import gc
 

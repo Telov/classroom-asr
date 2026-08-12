@@ -160,6 +160,13 @@ class Wav2Vec2CTC(AcousticModel):
         return " ".join(t for _, _, t in self.transcribe_words(
             waveform, sampling_rate=sampling_rate)).strip()
 
+    def transcribe_chunk_list(self, chunks, *, sampling_rate: int = 16_000,
+                              batch_size: int = 8) -> list[str]:
+        """Transcribe pre-cut slices → one transcript per slice (for the window-balanced
+        runner, so the 2+1 interview split doesn't idle a GPU). Each slice is re-chunked
+        internally at 24 s; ``batch_size`` is accepted for interface parity."""
+        return [self.transcribe_full(c, sampling_rate=sampling_rate) for c in chunks]
+
     def unload(self) -> None:
         import gc
 
