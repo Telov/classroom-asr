@@ -70,7 +70,7 @@ torch.backends.cudnn.allow_tf32 = True
 # Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
 # loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
 # versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
-%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz hf_transfer
+%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz hf_transfer virtualenv
 %pip -q install "transformers==4.57.6" "accelerate==1.12.0" "git+https://github.com/{GITHUB_REPO}.git"
 # NOTE: CrisperWhisper is NOT installed here — its CT2 fork replaces the `ctranslate2`
 # module and would clobber faster-whisper (branch A). It runs in an isolated venv (§9a).
@@ -124,7 +124,10 @@ _cw = {"thread": None, "err": None}
 def _cw_prewarm():
     try:
         if not os.path.exists(CW_VENV_PY):
-            subprocess.run([sys.executable, "-m", "venv", "--system-site-packages", CW_VENV], check=True)
+            # virtualenv (not venv): seeds pip from bundled wheels, so it avoids the
+            # ensurepip failure `python -m venv` hits on Kaggle. Reuses system torch.
+            subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", CW_VENV],
+                           check=True)
             subprocess.run([os.path.join(CW_VENV, "bin", "pip"), "-q", "install",
                             "crisperwhisper[ct2]"], check=True)
     except Exception as e:

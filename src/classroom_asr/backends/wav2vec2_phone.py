@@ -41,28 +41,24 @@ class Wav2Vec2Phone(PhoneEncoder):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.float16 if (fp16 and self.device == "cuda") else torch.float32
 
-        self.processor = self._load_processor(model_id)
+        self.fe, self.tok = self._load_fe_tok(model_id)
         self.model = load_pretrained(
             AutoModelForCTC, model_id, dtype=self.dtype
         ).to(self.device).eval()
 
     @staticmethod
-    def _load_processor(model_id):
-        """Load the wav2vec2 phoneme processor robustly.
+    def _load_fe_tok(model_id):
+        """Load the feature extractor and phoneme tokenizer **separately**.
 
-        On some transformers builds ``AutoProcessor.from_pretrained`` mis-resolves this
-        model's phoneme tokenizer and raises "Received a bool for argument tokenizer".
-        Fall back to building the processor from its components explicitly."""
-        from transformers import AutoProcessor
-        try:
-            return AutoProcessor.from_pretrained(model_id)
-        except (TypeError, ValueError):
-            from transformers import (
-                Wav2Vec2FeatureExtractor, Wav2Vec2Processor, Wav2Vec2PhonemeCTCTokenizer,
-            )
-            fe = Wav2Vec2FeatureExtractor.from_pretrained(model_id)
-            tok = Wav2Vec2PhonemeCTCTokenizer.from_pretrained(model_id)
-            return Wav2Vec2Processor(feature_extractor=fe, tokenizer=tok)
+        On transformers 4.57.x ``Wav2Vec2Processor.__init__`` rejects this model's
+        ``Wav2Vec2PhonemeCTCTokenizer`` ("Received a bool for argument tokenizer") — the
+        combined Processor wrapper is broken, not its parts. So we skip the wrapper and
+        use the feature extractor (for input features) and tokenizer (for CTC decode)
+        directly — equivalent, and it dodges the wrapper bug entirely."""
+        from transformers import AutoFeatureExtractor, AutoTokenizer
+        fe = AutoFeatureExtractor.from_pretrained(model_id)
+        tok = AutoTokenizer.from_pretrained(model_id)
+        return fe, tok
 
     def recognize(self, segment: SpeechSegment, *, top_k: int) -> list[PhonePath]:
         if segment.waveform is None:
@@ -77,7 +73,7 @@ class Wav2Vec2Phone(PhoneEncoder):
         wavs = list(waveforms)
         if not wavs:
             return []
-        inputs = self.processor(
+        inputs = self.fe(
             wavs, sampling_rate=sampling_rate, return_tensors="pt", padding=True
         )
         input_values = inputs.input_values.to(self.device, self.dtype)
@@ -90,7 +86,7 @@ class Wav2Vec2Phone(PhoneEncoder):
         pred_ids = probs.argmax(dim=-1)
         # confidence: mean max-posterior over non-blank frames
         conf = probs.max(dim=-1).values.mean(dim=-1).float().tolist()
-        ipas = self.processor.batch_decode(pred_ids, clean_up_tokenization_spaces=False)
+        ipas = self.tok.batch_decode(pred_ids, clean_up_tokenization_spaces=False)
 
         results: list[list[PhonePath]] = []
         for i, ipa in enumerate(ipas):

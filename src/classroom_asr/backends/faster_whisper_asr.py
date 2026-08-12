@@ -38,8 +38,8 @@ class FasterWhisperASR(AcousticModel):
         compute_type: str | None = None,
         beam_size: int = 1,
         vad_filter: bool = True,
-        batched: bool = True,
-        batch_size: int = 16,
+        batched: bool = False,   # BatchedInferencePipeline is faster but its VAD drops
+        batch_size: int = 16,    # quiet words → measurably higher WER on CORAAL; off by default
     ) -> None:
         from faster_whisper import WhisperModel
 
