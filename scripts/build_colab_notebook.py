@@ -235,20 +235,14 @@ def _free():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-# Construct one model per GPU in parallel (each is tens of seconds for the big checkpoints
-# and they're independent) instead of back-to-back. Re-raises the first construction error
-# so the per-branch guards still skip a failed branch.
+# Construct one model per GPU. This is SERIAL on purpose: transformers' from_pretrained
+# mutates torch's *global* default dtype while materializing weights and restores it in a
+# `finally`. Two loads in parallel threads race — one thread's restore fires mid-way through
+# the other's materialization, leaving weights on the meta device ("Cannot copy out of meta
+# tensor; no data!"). It's a race, so it only bit some runs. The heavy downloads are already
+# prefetched in §2a, so a serial load is just the local disk->GPU copy (tens of seconds).
 def load_models(make_model):
-    models = [None] * len(GPUS); errs = [None] * len(GPUS)
-    def build(i, g):
-        try: models[i] = make_model("cpu" if g is None else f"cuda:{g}")
-        except Exception as e: errs[i] = e
-    ts = [threading.Thread(target=build, args=(i, g)) for i, g in enumerate(GPUS)]
-    for t in ts: t.start()
-    for t in ts: t.join()
-    for e in errs:
-        if e is not None: raise e
-    return models
+    return [make_model("cpu" if g is None else f"cuda:{g}") for g in GPUS]
 
 def whole_rec(make_model, get_text, desc):
     out = [""] * len(interviews)
@@ -449,7 +443,11 @@ if USE_CRISPER:
             raise _cw["err"]
         with open(WORKER, "w") as f:
             f.write('''
-import sys, json
+import sys, json, warnings
+# The crisperwhisper package still calls from_pretrained with the old `torch_dtype=` kwarg;
+# that is inside the dependency, so it can't be fixed at our source. Drop just that one
+# deprecation message (narrow match) rather than raising verbosity or muting broadly.
+warnings.filterwarnings("ignore", message=".*torch_dtype.*")
 from crisperwhisper import CrisperWhisperModel
 size, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 paths = json.load(open(inp))

@@ -59,12 +59,15 @@ class Wav2Vec2CTC(AcousticModel):
         self.dtype = torch.float16 if (fp16 and str(self.device).startswith("cuda")) else torch.float32
 
         self.processor = AutoProcessor.from_pretrained(model_id)
-        # apply_spec_augment=False: SpecAugment is training-only (a no-op at eval anyway),
-        # and turning it off means `masked_spec_embed` isn't created — so the "newly
-        # initialized … probably TRAIN" note for that missing key never fires. Correct for
-        # inference, and fixes the warning at its source rather than muting the logger.
+        # mask_time_prob=mask_feature_prob=0: SpecAugment masking is training-only (a no-op
+        # at eval). The checkpoint ships mask_time_prob>0, which is what makes the model
+        # allocate the `masked_spec_embed` parameter that isn't in the weights — the source
+        # of the "newly initialized … probably TRAIN" note. Zeroing both (inference-correct)
+        # means the parameter is never created, so the warning never fires — fixed at source,
+        # not muted. (apply_spec_augment=False is the intent; the mask probs are the trigger.)
         self.model = load_pretrained(
-            AutoModelForCTC, model_id, dtype=self.dtype, apply_spec_augment=False
+            AutoModelForCTC, model_id, dtype=self.dtype,
+            apply_spec_augment=False, mask_time_prob=0.0, mask_feature_prob=0.0,
         ).to(self.device).eval()
 
     def recognize(self, segment: SpeechSegment, *, n_best: int) -> list[TextCandidate]:

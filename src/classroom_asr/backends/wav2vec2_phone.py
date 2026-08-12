@@ -43,10 +43,12 @@ class Wav2Vec2Phone(PhoneEncoder):
         self.dtype = torch.float16 if (fp16 and str(self.device).startswith("cuda")) else torch.float32
 
         self.fe, self.tok = self._load_fe_tok(model_id)
-        # apply_spec_augment=False: inference-correct and avoids the newly-initialized
-        # masked_spec_embed warning at its source (see Wav2Vec2CTC).
+        # mask_time_prob=mask_feature_prob=0: inference-correct and stops the model from
+        # allocating the training-only masked_spec_embed parameter, fixing the
+        # newly-initialized warning at its source (see Wav2Vec2CTC).
         self.model = load_pretrained(
-            AutoModelForCTC, model_id, dtype=self.dtype, apply_spec_augment=False
+            AutoModelForCTC, model_id, dtype=self.dtype,
+            apply_spec_augment=False, mask_time_prob=0.0, mask_feature_prob=0.0,
         ).to(self.device).eval()
 
     @staticmethod
