@@ -38,6 +38,8 @@ class FasterWhisperASR(AcousticModel):
         compute_type: str | None = None,
         beam_size: int = 1,
         vad_filter: bool = True,
+        batched: bool = True,
+        batch_size: int = 16,
     ) -> None:
         from faster_whisper import WhisperModel
 
@@ -48,6 +50,7 @@ class FasterWhisperASR(AcousticModel):
         self.language = language
         self.beam_size = beam_size
         self.vad_filter = vad_filter
+        self.batch_size = batch_size
 
         dev, index = _split_device(device or "cuda:0")
         # int8 kernels: int8_float16 on GPU, int8 on CPU.
@@ -55,6 +58,17 @@ class FasterWhisperASR(AcousticModel):
             compute_type = "int8_float16" if dev == "cuda" else "int8"
         self.model = WhisperModel(model_id, device=dev, device_index=index,
                                   compute_type=compute_type)
+
+        # BatchedInferencePipeline decodes the VAD segments in parallel batches — several
+        # times faster than sequential, same model/weights. It's VAD-based, so it's only
+        # used when vad_filter is on (matches our whole-recording branch-A default).
+        self._bpipe = None
+        if batched:
+            try:
+                from faster_whisper import BatchedInferencePipeline
+                self._bpipe = BatchedInferencePipeline(model=self.model)
+            except Exception:
+                self._bpipe = None
 
     def recognize(self, segment: SpeechSegment, *, n_best: int) -> list[TextCandidate]:
         if segment.waveform is None:
@@ -85,10 +99,23 @@ class FasterWhisperASR(AcousticModel):
         """
         if vad_filter is None:
             vad_filter = self.vad_filter
-        segments, _ = self.model.transcribe(
-            waveform, language=self.language, beam_size=self.beam_size,
-            word_timestamps=True, vad_filter=vad_filter, condition_on_previous_text=True,
-        )
+        # Batched path (parallel VAD-segment decode) when VAD is on; else sequential so a
+        # no-VAD run still keeps every quiet word (§6.1). Fall back to sequential on any
+        # batched-API mismatch.
+        segments = None
+        if self._bpipe is not None and vad_filter:
+            try:
+                segments, _ = self._bpipe.transcribe(
+                    waveform, language=self.language, beam_size=self.beam_size,
+                    batch_size=self.batch_size, word_timestamps=True,
+                )
+            except Exception:
+                segments = None
+        if segments is None:
+            segments, _ = self.model.transcribe(
+                waveform, language=self.language, beam_size=self.beam_size,
+                word_timestamps=True, vad_filter=vad_filter, condition_on_previous_text=True,
+            )
         words: list[tuple[float, float, str]] = []
         for seg in segments:
             if getattr(seg, "words", None):
