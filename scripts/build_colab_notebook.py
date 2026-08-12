@@ -91,10 +91,10 @@ USE_PHONE      = True;  PHONE_MODEL    = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
 USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbatim
 
-# Speed notes: the LLM branches auto-pick fp16 on T4 (Turing has no bf16 tensor cores —
-# that was most of the slowness). Voxtral is the heaviest; each Voxtral toggle is a full
-# 9.5 GB load + a whole-hour pass, so set USE_VOXTRAL=False to run only the verbatim one.
-# CRISPER_SIZE="turbo" is faster than "large" if you want to trade a little quality.
+# Speed (all quality-neutral): the LLM branches auto-pick fp16 on T4 (Turing has no bf16
+# tensor cores — that was most of the slowness; fp16 is the same inference path Whisper
+# uses, no quality cost). Windows are batched. Voxtral's two passes share ONE 9.5 GB load.
+# Defaults keep full quality: CrisperWhisper "large", BOTH Voxtral passes on.
 
 # Window (seconds) for the audio-LLM branches (Qwen3, Voxtral). These emit a BOUNDED
 # number of output tokens per call, so an over-long window truncates the transcript
@@ -255,14 +255,40 @@ if USE_QWEN3ASR:
         get_text=lambda m, a: m.transcribe_full(a, chunk_s=LLM_CHUNK_S))
     add_branch("A+B+Qwen3", hyp_Z)
 """),
-    md("## 9. Branch C — Voxtral Mini 3B (audio-LLM)"),
+    md("""## 9. Branch C / VV — Voxtral Mini 3B, **both passes on one load**
+Voxtral runs twice — clean transcription and verbatim-prompted (instruct mode, told to
+keep every filler/false start/repetition) — but the 9.5 GB weights are loaded **once**
+and reused for both passes (quality-neutral: same model, only the decode mode changes).
+Both are scored so we see the clean vs verbatim oracle contribution side by side."""),
     code(r"""
-hyp_C = None
-if USE_VOXTRAL:
+hyp_C = hyp_VV = None
+if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
     from classroom_asr.backends.voxtral_asr import VoxtralASR
-    hyp_C = run_branch("+Voxtral", lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev),
-                       get_text=lambda m, a: m.transcribe_full(a, chunk_s=LLM_CHUNK_S))
-    add_branch("+Voxtral", hyp_C)
+    vmodels = [VoxtralASR(VOXTRAL_MODEL, language="en",
+                          device=("cpu" if g is None else f"cuda:{g}")) for g in GPUS]
+    def _vox_pass(mode, tag):                       # run one decode mode across the GPUs
+        for m in vmodels: m.mode = mode
+        out = [""] * len(interviews)
+        shards = [list(range(len(interviews)))[i::len(GPUS)] for i in range(len(GPUS))]
+        def worker(model, sh, pos):
+            for k in tqdm(sh, desc=f"{tag}:{pos}", position=pos, leave=False):
+                try: out[k] = model.transcribe_full(load_16k(interviews[k][0]), chunk_s=LLM_CHUNK_S)
+                except Exception as e: print(tag, "failed:", repr(e)[:120]); out[k] = ""
+        ts = [threading.Thread(target=worker, args=(vmodels[i], shards[i], i)) for i in range(len(GPUS))]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        return out
+    if USE_VOXTRAL:
+        hyp_C = _vox_pass("transcription", "+Voxtral"); add_branch("+Voxtral", hyp_C)
+    if USE_VOXTRAL_VERBATIM:
+        hyp_VV = _vox_pass("verbatim", "+VoxtralVerbatim"); add_branch("+VoxtralVerbatim", hyp_VV)
+    for m in vmodels:
+        if hasattr(m, "unload"): m.unload()
+    vmodels = None; del vmodels; _free()
+    if torch.cuda.is_available():
+        for g in GPUS:
+            if g is not None:
+                with torch.cuda.device(g): torch.cuda.empty_cache()
 """),
     md("""## 9a. Branch CW — CrisperWhisper 2.0 (**verbatim** Whisper)
 The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts the
@@ -277,20 +303,6 @@ if USE_CRISPER:
     hyp_CW = run_branch("+CrisperWhisper",
                         lambda dev: CrisperWhisperV2(CRISPER_SIZE, device=dev))
     add_branch("+CrisperWhisper", hyp_CW)
-"""),
-    md("""## 9b. Branch VV — Voxtral, **verbatim-prompted**
-The same Voxtral checkpoint, but in instruct mode told to transcribe verbatim (keep
-every filler, false start, repetition). A second, independent verbatim source — an
-audio-LLM's take on the same job CrisperWhisper does acoustically."""),
-    code(r"""
-hyp_VV = None
-if USE_VOXTRAL_VERBATIM:
-    from classroom_asr.backends.voxtral_asr import VoxtralASR
-    hyp_VV = run_branch("+VoxtralVerbatim",
-                        lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev,
-                                               mode="verbatim"),
-                        get_text=lambda m, a: m.transcribe_full(a, chunk_s=LLM_CHUNK_S))
-    add_branch("+VoxtralVerbatim", hyp_VV)
 """),
     md("""## 10. Phone branch — realized IPA (the pronunciation path)
 Not a word transcript: the phone branch's product is *pronunciation*. Scoring it needs a
