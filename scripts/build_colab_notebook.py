@@ -63,6 +63,17 @@ Run All). If it ever still stops here, just click Run All once more."""),
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"   # Rust parallel-chunk downloads (2-5x faster)
+# Persist heavy artifacts across Kaggle sessions when notebook Persistence is ON
+# (Settings -> Persistence -> "Files only"): /kaggle/working survives between sessions, but
+# /root/.cache (the default HF cache) does NOT. Point the HF cache + the CrisperWhisper venv
+# (built in 2a) at the persisted dir so weights download and the venv builds ONCE, then get
+# reused next session. Best-effort: /kaggle/working is size-capped (~20 GB) and the full model
+# set is ~26 GB, so whatever is evicted simply re-downloads. Harmless when persistence is off
+# (it's just a working dir that's wiped each session -> same as today).
+ASR_PERSIST = "/kaggle/working" if os.path.isdir("/kaggle/working") else os.path.abspath("asr_persist")
+os.environ["ASR_PERSIST"] = ASR_PERSIST
+os.environ["HF_HOME"] = os.path.join(ASR_PERSIST, "hf_cache")   # snapshot_download + from_pretrained live here
+os.makedirs(os.environ["HF_HOME"], exist_ok=True)
 import torch
 # TF32 matmul: free speedup on Ampere+ (Colab A100/L4), no-op on T4/Turing; inference-safe.
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -125,22 +136,31 @@ COMP = COMPONENT.upper()
     md("""## 2a. Prewarm in the background (overlap setup with compute)
 Two serial blockers moved off the critical path: the isolated CrisperWhisper **venv build**
 (§9a) and the **model downloads** (esp. Voxtral, ~9.5 GB). Both run in background threads
-now, so they finish *while* the A→Qwen branches compute. Pure overlap — no GPU used here."""),
+now, so they finish *while* the A→Qwen branches compute. Pure overlap — no GPU used here.
+
+**One-time setup to reuse this work across runs:** in the Kaggle editor, open **Settings →
+Persistence → "Files only"**. Then the HF weight cache and the CrisperWhisper venv (both under
+`/kaggle/working`, §1) survive between sessions — weights download and the venv builds *once*,
+and later runs reuse them. `/kaggle/working` is ~20 GB and the full model set is ~26 GB, so
+whatever doesn't fit just re-downloads; transcription still runs fresh every time."""),
     code(r"""
 import os, sys, subprocess, threading
-# (a) CrisperWhisper CT2 venv — built in the background; §9a just joins this thread.
-CW_WORK = os.path.abspath("cw_iso"); os.makedirs(CW_WORK, exist_ok=True)
+# (a) CrisperWhisper CT2 venv — built in the background; §9a just joins this thread. Lives under
+# the persisted dir (§1), so once built it's reused next session instead of rebuilt every run.
+CW_WORK = os.path.join(os.environ.get("ASR_PERSIST", os.path.abspath(".")), "cw_iso")
+os.makedirs(CW_WORK, exist_ok=True)
 CW_VENV = os.path.join(CW_WORK, "venv"); CW_VENV_PY = os.path.join(CW_VENV, "bin", "python")
 _cw = {"thread": None, "err": None}
 def _cw_prewarm():
     try:
-        if not os.path.exists(CW_VENV_PY):
-            # virtualenv (not venv): seeds pip from bundled wheels, so it avoids the
-            # ensurepip failure `python -m venv` hits on Kaggle. Reuses system torch.
-            subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", CW_VENV],
-                           check=True)
-            subprocess.run([os.path.join(CW_VENV, "bin", "pip"), "-q", "install",
-                            "crisperwhisper[ct2]", "hf_transfer"], check=True)  # fast venv downloads
+        if os.path.exists(CW_VENV_PY):
+            print("CrisperWhisper venv: reusing persisted build", flush=True); return
+        # virtualenv (not venv): seeds pip from bundled wheels, so it avoids the
+        # ensurepip failure `python -m venv` hits on Kaggle. Reuses system torch.
+        subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", CW_VENV],
+                       check=True)
+        subprocess.run([os.path.join(CW_VENV, "bin", "pip"), "-q", "install",
+                        "crisperwhisper[ct2]", "hf_transfer"], check=True)  # fast venv downloads
     except Exception as e:
         _cw["err"] = e
 if USE_CRISPER:
