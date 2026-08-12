@@ -338,7 +338,7 @@ def window_pass(models, desc, *, chunk_s, batch_size):
 def run_windows(desc, make_model, *, chunk_s, batch_size):
     t0 = time.time()
     try:
-        models = load_models(make_model)           # parallel per-GPU load
+        models = load_models(make_model)           # serial per-GPU load (thread-safe; see load_models)
     except Exception as e:
         print(f"[{desc:14s}] load FAILED: {repr(e)[:160]}"); _free(); return [""] * len(interviews)
     tload = time.time() - t0
@@ -418,7 +418,7 @@ if USE_QWEN3ASR:
     # windows balanced across GPUs (no 2+1 idle), reassembled in order (same output)
     hyp_Z = run_windows("A+B+Qwen3",
                         lambda dev: Qwen3ASR(QWEN3ASR_MODEL, language="English", device=dev),
-                        chunk_s=LLM_CHUNK_S, batch_size=32)   # 1.7B: room for a big batch
+                        chunk_s=LLM_CHUNK_S, batch_size=64)   # 1.7B: room for a big batch (OOM-backoff guards)
     add_branch("A+B+Qwen3", hyp_Z)
 """),
     md("""## 9. Branch C / VV — Voxtral Mini 3B, **both passes on one load**
@@ -449,11 +449,14 @@ site-packages with faster-whisper (branch A) — so CrisperWhisper runs in a
 `--system-site-packages` **venv** (reuses the main torch/transformers, shadows only
 `ctranslate2` with the fork) driven by a subprocess. The venv was built in the background
 back in §2a, so this cell usually just joins it and transcribes. Branch A keeps stock CT2;
-the main kernel never imports the fork."""),
+the main kernel never imports the fork. **Both GPUs are used**: one pinned subprocess per GPU
+transcribes a disjoint slice of the interviews in parallel (whole files, so each keeps
+CrisperWhisper's native chunking and the output is identical). The worker prints which backend
+it got — `ct2 (fast)` or the `transformers (SLOW)` fallback — so a slow run is visible."""),
     code(r"""
 hyp_CW = None
 if USE_CRISPER:
-    import os, sys, json, subprocess
+    import os, sys, json, subprocess, threading
     _cw_t0 = time.time()
     WORKER = os.path.join(CW_WORK, "cw_worker.py")
     try:
@@ -480,8 +483,9 @@ size, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 paths = json.load(open(inp))
 try:
     m = CrisperWhisperModel(size, backend="ct2")          # fast forked CT2
+    print("CW backend: ct2 (fast)", flush=True)           # to STDOUT so we can see the path taken
 except Exception as e:
-    print("ct2 unavailable, transformers backend:", repr(e)[:120], file=sys.stderr)
+    print("CW backend: transformers (SLOW) -- ct2 failed:", repr(e)[:200], flush=True)
     m = CrisperWhisperModel(size, backend="transformers")  # in-venv fallback
 out = {}
 for p in paths:
@@ -492,10 +496,27 @@ for p in paths:
 json.dump(out, open(outp, "w"))
 ''')
         paths = [os.path.abspath(str(interviews[k][0])) for k in range(len(interviews))]
-        json.dump(paths, open(os.path.join(CW_WORK, "in.json"), "w"))
-        subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE,
-                        os.path.join(CW_WORK, "in.json"), os.path.join(CW_WORK, "out.json")], check=True)
-        res = json.load(open(os.path.join(CW_WORK, "out.json")))
+        # One worker per GPU, pinned via CUDA_VISIBLE_DEVICES, run in parallel so both GPUs
+        # transcribe instead of one sitting idle. Whole files are split across GPUs (no
+        # cross-file interaction and each file keeps CrisperWhisper's native internal 30s
+        # chunking), so the per-file output is byte-identical to the single-worker run.
+        gpus = [g for g in GPUS if g is not None] or [None]
+        shards = [paths[i::len(gpus)] for i in range(len(gpus))]
+        res = {}
+        def _cw_run(gi, gpu, shard):
+            if not shard:
+                return
+            inp = os.path.join(CW_WORK, f"in_{gi}.json"); outp = os.path.join(CW_WORK, f"out_{gi}.json")
+            json.dump(shard, open(inp, "w"))
+            env = dict(os.environ)
+            if gpu is not None:
+                env["CUDA_VISIBLE_DEVICES"] = str(gpu)      # each subprocess sees exactly one GPU
+            subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE, inp, outp], check=True, env=env)
+            res.update(json.load(open(outp)))               # disjoint keys per shard -> safe
+        _cw_ts = [threading.Thread(target=_cw_run, args=(gi, gpus[gi], shards[gi]))
+                  for gi in range(len(gpus))]
+        for t in _cw_ts: t.start()
+        for t in _cw_ts: t.join()
         from classroom_asr.backends.crisperwhisper_asr import CrisperWhisperV2
         hyp_CW = [CrisperWhisperV2._clean(res.get(p, "")) for p in paths]   # [um]->um, drop [laughter]
     except Exception as e:
