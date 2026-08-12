@@ -80,7 +80,8 @@ class Wav2Vec2Phone(PhoneEncoder):
             results.append([PhonePath("p1", ipa, float(conf[i]))] if ipa else [])
         return results
 
-    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000, chunk_s: float = 24.0) -> str:
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000, chunk_s: float = 24.0,
+                        batch_size: int = 8) -> str:
         """Whole-recording **realized IPA** (chunked). This is the phone branch's
         actual product — a pronunciation transcript — not a word transcript. Its
         value (OOV/nonce recovery, pronunciation/PER metrics — §10, §18.1) needs a
@@ -88,13 +89,14 @@ class Wav2Vec2Phone(PhoneEncoder):
         Chunk boundaries are snapped to silence so a token isn't split across a cut."""
         from . import iter_silence_chunks
 
+        chunks = [c for _, c in iter_silence_chunks(waveform, sampling_rate, chunk_s)
+                  if len(c) >= 400]
         parts = []
-        for _start, chunk in iter_silence_chunks(waveform, sampling_rate, chunk_s):
-            if len(chunk) < 400:
-                continue
-            r = self.recognize_batch([chunk], top_k=1, sampling_rate=sampling_rate)[0]
-            if r:
-                parts.append(r[0].ipa)
+        for b in range(0, len(chunks), batch_size):     # batch windows per forward pass
+            for r in self.recognize_batch(chunks[b:b + batch_size], top_k=1,
+                                          sampling_rate=sampling_rate):
+                if r:
+                    parts.append(r[0].ipa)
         return " ".join(parts).strip()
 
     def unload(self) -> None:

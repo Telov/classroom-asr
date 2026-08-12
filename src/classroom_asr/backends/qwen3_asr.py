@@ -122,22 +122,25 @@ class Qwen3ASR(AcousticModel):
         return out
 
     def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
-                        chunk_s: float = 30.0, min_chunk_s: float = 10.0) -> str:
-        """Whole-recording transcript, transcribed in short windows.
+                        chunk_s: float = 30.0, batch_size: int = 8) -> str:
+        """Whole-recording transcript: silence-snapped short windows, **batched**.
 
         Qwen3-ASR is an audio-*LLM*: one ``transcribe`` call emits a bounded number
         of output tokens, so an over-long window has its transcript **truncated**
-        (most words never emitted → massive deletions). The window is therefore kept
-        near the utterance scale (~30 s, like Whisper's internal window), NOT sized to
-        GPU memory. ``chunked_transcribe`` still backs off on OOM as a safety net."""
-        from . import chunked_transcribe
+        (most words never emitted → massive deletions). Windows are kept near the
+        utterance scale (~30 s, like Whisper's internal window) and cut at silence so
+        no word is split. qwen-asr batches natively, so the windows go through in
+        mini-batches (big speedup vs one call per window), with OOM batch-backoff."""
+        from . import batched_transcribe, iter_silence_chunks
 
-        def one(chunk):
-            c = self.nbest(chunk, sampling_rate=sampling_rate)
-            return c[0].text if c else ""
+        chunks = [c for _, c in iter_silence_chunks(waveform, sampling_rate, chunk_s)
+                  if len(c) >= 400]
 
-        return chunked_transcribe(waveform, sampling_rate, one,
-                                  chunk_s=chunk_s, min_chunk_s=min_chunk_s, torch_mod=self._torch)
+        def batch(cs):
+            res = self.nbest_batch(cs, sampling_rate=sampling_rate)
+            return [(r[0].text if r else "") for r in res]
+
+        return batched_transcribe(chunks, batch, batch_size=batch_size, torch_mod=self._torch)
 
     def unload(self) -> None:
         import gc

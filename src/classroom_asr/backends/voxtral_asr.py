@@ -1,18 +1,21 @@
-"""Mistral Voxtral backend — a third, audio-LLM branch.
+"""Mistral Voxtral backend — an audio-LLM branch, in two modes.
 
 Voxtral (Mistral, 2025) is an audio-input LLM: a different family again from
 Whisper (attention seq2seq) and wav2vec2 (CTC), so it contributes genuinely
 different hypotheses to the candidate graph (§8, §12). Voxtral **Mini 3B**
 (~9.5 GB in bf16) fits a T4; Voxtral **Small 24B** (~55 GB) does not.
 
-Uses the transformers transcription API:
-``AutoProcessor.apply_transcription_request`` +
-``VoxtralForConditionalGeneration.generate`` (transformers >= 4.54,
-``mistral-common[audio] >= 1.8.1``). That method takes an audio **file path**, so
-for our in-memory segment slices we write a temporary wav per call. Voxtral is
-heavier than the CTC/Whisper branches, so run it on a subset of the lesson.
+Two decode modes, exposed as ``mode``:
 
-Everything is imported lazily; the core package needs none of it.
+* ``"transcription"`` (default) — ``AutoProcessor.apply_transcription_request`` +
+  ``generate``: Voxtral's clean transcription path (drops most disfluencies).
+* ``"verbatim"`` — instruct/chat path (``apply_chat_template`` with the audio plus
+  a text instruction) telling the model to keep every filler, false start and
+  repetition. This is the design's *verbatim* lever (§1.2, §9.2): the same
+  checkpoint, prompted to preserve what the transcription mode strips.
+
+Both take audio as a **file path**, so in-memory segment slices are written to a
+temp wav per call. Everything is imported lazily; the core package needs none of it.
 """
 
 from __future__ import annotations
@@ -23,6 +26,13 @@ import tempfile
 from ..datamodel import TextCandidate
 from ..pipeline.base import AcousticModel, SpeechSegment
 from ..types import CandidateSource
+
+VERBATIM_INSTRUCTION = (
+    "Transcribe the audio exactly as spoken, word for word. Include every filler "
+    "(um, uh, mm-hmm), false start, repetition and stutter. Do not paraphrase, "
+    "summarize, translate, correct grammar, or add commentary or punctuation beyond "
+    "what is spoken. Output only the verbatim transcription."
+)
 
 
 class VoxtralASR(AcousticModel):
@@ -35,6 +45,8 @@ class VoxtralASR(AcousticModel):
         language: str = "en",
         device: str | None = None,
         max_new_tokens: int = 64,   # CORAAL segments are short; caps decode time
+        mode: str = "transcription",           # "transcription" | "verbatim"
+        instruction: str | None = None,        # prompt used in "verbatim" mode
     ) -> None:
         import torch  # lazy
         from transformers import AutoProcessor, VoxtralForConditionalGeneration
@@ -47,10 +59,12 @@ class VoxtralASR(AcousticModel):
         self.source_name = source.value
         self.language = language
         self.max_new_tokens = max_new_tokens
+        self.mode = mode
+        self.instruction = instruction or VERBATIM_INSTRUCTION
 
         self._torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
+        self.dtype = torch.bfloat16 if str(self.device).startswith("cuda") else torch.float32
 
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = load_pretrained(
@@ -76,21 +90,49 @@ class VoxtralASR(AcousticModel):
             paths.append(tmp.name)
         return paths
 
-    def _generate(self, audio, *, max_new_tokens=None):
+    def _generate(self, paths, *, max_new_tokens=None):
+        """Decode a batch of audio **file paths** → list[str]. Dispatches on mode."""
         torch = self._torch
+        mnt = max_new_tokens or self.max_new_tokens
+        if self.mode == "verbatim":
+            return self._generate_instruct(paths, mnt)
         inputs = self.processor.apply_transcription_request(
-            language=self.language if isinstance(audio, str) else [self.language] * len(audio),
-            audio=audio, model_id=self.model_id,
+            language=[self.language] * len(paths), audio=paths, model_id=self.model_id,
         ).to(self.device, dtype=self.dtype)
         with torch.no_grad():
-            out = self.model.generate(**inputs, max_new_tokens=max_new_tokens or self.max_new_tokens)
+            out = self.model.generate(**inputs, max_new_tokens=mnt)
         return self.processor.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
+
+    def _generate_instruct(self, paths, max_new_tokens):
+        """Verbatim/instruct path: audio + a 'transcribe verbatim' instruction."""
+        torch = self._torch
+        convs = [
+            [{"role": "user", "content": [
+                {"type": "audio", "path": p},
+                {"type": "text", "text": self.instruction},
+            ]}]
+            for p in paths
+        ]
+
+        def run(conv_list):
+            inputs = self.processor.apply_chat_template(
+                conv_list, add_generation_prompt=True, tokenize=True,
+                return_dict=True, return_tensors="pt",
+            ).to(self.device, dtype=self.dtype)
+            with torch.no_grad():
+                out = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+            return self.processor.batch_decode(
+                out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+        try:
+            return run(convs)                          # one batched chat call
+        except Exception:
+            return [run([c])[0] for c in convs]        # per-item fallback
 
     def nbest_batch(self, waveforms, *, n_best: int = 1,
                     sampling_rate: int = 16_000) -> list[list[TextCandidate]]:
-        """Batch several waveforms through one generate call (Voxtral supports
-        batched transcription). Falls back to per-item if the batched request
-        form isn't accepted by the installed transformers."""
+        """Batch several waveforms through one generate call. Falls back to per-item
+        if the batched request form isn't accepted by the installed transformers."""
         wavs = list(waveforms)
         if not wavs:
             return []
@@ -99,7 +141,7 @@ class VoxtralASR(AcousticModel):
             try:
                 texts = self._generate(paths)              # one batched call
             except Exception:
-                texts = [self._generate(p)[0] for p in paths]  # per-item fallback
+                texts = [self._generate([p])[0] for p in paths]  # per-item fallback
         finally:
             for p in paths:
                 os.unlink(p)
@@ -114,30 +156,30 @@ class VoxtralASR(AcousticModel):
         return results
 
     def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
-                        chunk_s: float = 30.0, min_chunk_s: float = 10.0) -> str:
-        """Whole-recording transcript, transcribed in short windows.
+                        chunk_s: float = 30.0, batch_size: int = 4) -> str:
+        """Whole-recording transcript: silence-snapped short windows, **batched**.
 
         Voxtral is an audio-LLM whose ``generate`` emits a bounded number of output
         tokens, so an over-long window truncates (the segment-tuned ``max_new_tokens``
-        of 64 clips anything past ~15 s). The window is kept near the utterance scale
-        and the token budget is scaled to it (~8 tok/s + headroom) so nothing is
-        dropped; ``chunked_transcribe`` still backs off on OOM as a safety net."""
-        from . import chunked_transcribe
+        of 64 clips anything past ~15 s). Windows are kept near the utterance scale,
+        cut at silence (no split words), and the token budget is scaled to the window
+        (~8 tok/s + headroom). Windows go through in mini-batches for speed, with OOM
+        batch-backoff."""
+        from . import batched_transcribe, iter_silence_chunks
 
-        # scale the output-token budget to the window so long chunks aren't clipped
+        chunks = [c for _, c in iter_silence_chunks(waveform, sampling_rate, chunk_s)
+                  if len(c) >= 400]
         budget = max(self.max_new_tokens, int(chunk_s * 8) + 32)
 
-        def one(chunk):
-            paths = self._write_wavs([chunk], sampling_rate)
+        def batch(cs):
+            paths = self._write_wavs(cs, sampling_rate)
             try:
-                texts = self._generate(paths, max_new_tokens=budget)
+                return self._generate(paths, max_new_tokens=budget)
             finally:
                 for p in paths:
                     os.unlink(p)
-            return (texts[0] or "").strip() if texts else ""
 
-        return chunked_transcribe(waveform, sampling_rate, one,
-                                  chunk_s=chunk_s, min_chunk_s=min_chunk_s, torch_mod=self._torch)
+        return batched_transcribe(chunks, batch, batch_size=batch_size, torch_mod=self._torch)
 
     def unload(self) -> None:
         import gc

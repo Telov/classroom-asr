@@ -101,7 +101,8 @@ class Wav2Vec2CTC(AcousticModel):
             )
         return results
 
-    def transcribe_words(self, waveform, *, sampling_rate: int = 16_000, chunk_s: float = 24.0):
+    def transcribe_words(self, waveform, *, sampling_rate: int = 16_000, chunk_s: float = 24.0,
+                         batch_size: int = 8):
         """Whole-recording CTC transcription with word timestamps (§6.1).
 
         wav2vec2 can't hold a 30–60 min interview in one forward pass, so we run
@@ -116,25 +117,32 @@ class Wav2Vec2CTC(AcousticModel):
         torch = self._torch
         # seconds per logit frame (e.g. 320 samples / 16 kHz = 0.02 s)
         spf = float(self.model.config.inputs_to_logits_ratio) / sampling_rate
+        pieces = [(start, chunk) for start, chunk in
+                  iter_silence_chunks(waveform, sampling_rate, chunk_s) if len(chunk) >= 400]
         out: list[tuple[float, float, str]] = []
-        for start, chunk in iter_silence_chunks(waveform, sampling_rate, chunk_s):
-            if len(chunk) < 400:
-                continue
-            iv = self.processor(chunk, sampling_rate=sampling_rate,
-                                return_tensors="pt").input_values.to(self.device, self.dtype)
+        # batch several windows through one padded forward pass (big speedup); the
+        # attention mask keeps padding from bleeding into each item's word offsets.
+        for b in range(0, len(pieces), batch_size):
+            group = pieces[b:b + batch_size]
+            enc = self.processor([c for _, c in group], sampling_rate=sampling_rate,
+                                 return_tensors="pt", padding=True)
+            iv = enc.input_values.to(self.device, self.dtype)
+            attn = getattr(enc, "attention_mask", None)
+            kw = {"attention_mask": attn.to(self.device)} if attn is not None else {}
             with torch.no_grad():
-                logits = self.model(iv).logits
+                logits = self.model(iv, **kw).logits
             dec = self.processor.batch_decode(
                 logits.argmax(dim=-1), output_word_offsets=True,
                 clean_up_tokenization_spaces=False,
             )
-            offsets = dec.word_offsets[0] if hasattr(dec, "word_offsets") else dec["word_offsets"][0]
-            base = start / sampling_rate
-            for wo in offsets:
-                w = (wo["word"] or "").strip().lower()
-                if w:
-                    out.append((base + wo["start_offset"] * spf,
-                                base + wo["end_offset"] * spf, w))
+            offs = dec.word_offsets if hasattr(dec, "word_offsets") else dec["word_offsets"]
+            for (start, _c), word_offsets in zip(group, offs):
+                base = start / sampling_rate
+                for wo in word_offsets:
+                    w = (wo["word"] or "").strip().lower()
+                    if w:
+                        out.append((base + wo["start_offset"] * spf,
+                                    base + wo["end_offset"] * spf, w))
         return out
 
     def transcribe_full(self, waveform, *, sampling_rate: int = 16_000) -> str:

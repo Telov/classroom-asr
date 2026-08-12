@@ -65,6 +65,35 @@ def iter_silence_chunks(waveform, sampling_rate, chunk_s, *, search_s=1.5):
         i = end
 
 
+def batched_transcribe(chunks, transcribe_batch, *, batch_size, torch_mod, min_batch=1):
+    """Transcribe pre-cut chunks in **mini-batches**, backing off on CUDA OOM.
+
+    ``transcribe_batch(list_of_waveforms) -> list_of_str`` (same length/order). This
+    is the speed lever for the per-chunk branches: instead of one forward/generate
+    per 30 s window (dozens per interview, serial), whole batches go through the GPU
+    at once. On OOM the batch size halves (to ``min_batch``) and retries, so a
+    memory-tight recording still finishes. Returns the joined non-empty parts.
+    """
+    texts = []
+    i = 0
+    bs = max(1, batch_size)
+    n = len(chunks)
+    while i < n:
+        batch = chunks[i:i + bs]
+        try:
+            res = transcribe_batch(batch)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower() and bs > min_batch:
+                if torch_mod.cuda.is_available():
+                    torch_mod.cuda.empty_cache()
+                bs = max(min_batch, bs // 2)
+                continue
+            raise
+        texts.extend((t or "").strip() for t in res if t and t.strip())
+        i += len(batch)
+    return " ".join(texts).strip()
+
+
 def chunked_transcribe(waveform, sampling_rate, transcribe_chunk, *,
                        chunk_s, min_chunk_s, torch_mod, search_s=1.5):
     """Transcribe a long recording in silence-snapped windows (~``chunk_s``).

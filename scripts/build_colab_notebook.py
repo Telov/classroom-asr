@@ -43,6 +43,8 @@ Branches (each a different architecture → complementary errors, §8):
 * **B** wav2vec2 CTC (no LM; never hallucinates on silence)
 * **Z** Qwen3-ASR-1.7B (the design's real backbone)
 * **C** Voxtral Mini 3B (audio-LLM)
+* **CW** CrisperWhisper 2.0 — a **verbatim**-tuned Whisper (keeps um/uh/false starts)
+* **VV** Voxtral, **verbatim-prompted** (instruct mode, told to keep disfluencies)
 * **phone** wav2vec2 phoneme CTC → **realized IPA** (the pronunciation path; its
   value is OOV/nonce recovery + PER, which CORAAL can't score — reported, not forced
   into word WER)
@@ -60,8 +62,11 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # 
 import torch
 # Everything up front (mid-notebook installs don't reliably import on Kaggle).
 # Pin transformers to what qwen-asr needs (==4.57.6); also satisfies Whisper/Voxtral.
-!pip -q install "transformers==4.57.6" "accelerate==1.12.0" soundfile rapidfuzz
 !pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr
+!pip -q install "crisperwhisper[ct2]"      # verbatim Whisper 2.0 (own CT2 runtime)
+# Pin transformers/accelerate LAST so the qwen-asr-required versions win over anything
+# crisperwhisper/others pulled in (==4.57.6 also satisfies Whisper/Voxtral).
+!pip -q install "transformers==4.57.6" "accelerate==1.12.0" soundfile rapidfuzz
 !pip -q install "git+https://github.com/{GITHUB_REPO}.git"
 import classroom_asr, os
 if os.environ.get("HF_TOKEN"):
@@ -82,6 +87,9 @@ USE_CTC        = True;  CTC_MODEL      = "facebook/wav2vec2-large-960h-lv60-self
 USE_QWEN3ASR   = True;  QWEN3ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 USE_VOXTRAL    = True;  VOXTRAL_MODEL  = "mistralai/Voxtral-Mini-3B-2507"
 USE_PHONE      = True;  PHONE_MODEL    = "facebook/wav2vec2-lv-60-espeak-cv-ft"
+# Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
+USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
+USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbatim
 
 # Window (seconds) for the audio-LLM branches (Qwen3, Voxtral). These emit a BOUNDED
 # number of output tokens per call, so an over-long window truncates the transcript
@@ -250,6 +258,34 @@ if USE_VOXTRAL:
     hyp_C = run_branch("+Voxtral", lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev),
                        get_text=lambda m, a: m.transcribe_full(a, chunk_s=LLM_CHUNK_S))
     add_branch("+Voxtral", hyp_C)
+"""),
+    md("""## 9a. Branch CW — CrisperWhisper 2.0 (**verbatim** Whisper)
+The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts the
+clean branches delete — exactly the deletions that dominate the residual WER on a
+verbatim reference. Its CT2 runtime does its own long-form windowing, so it's as fast
+as the Whisper baseline. Watch whether it drops `oracle(pool)` more than the clean
+LLM branches did."""),
+    code(r"""
+hyp_CW = None
+if USE_CRISPER:
+    from classroom_asr.backends.crisperwhisper_asr import CrisperWhisperV2
+    hyp_CW = run_branch("+CrisperWhisper",
+                        lambda dev: CrisperWhisperV2(CRISPER_SIZE, device=dev))
+    add_branch("+CrisperWhisper", hyp_CW)
+"""),
+    md("""## 9b. Branch VV — Voxtral, **verbatim-prompted**
+The same Voxtral checkpoint, but in instruct mode told to transcribe verbatim (keep
+every filler, false start, repetition). A second, independent verbatim source — an
+audio-LLM's take on the same job CrisperWhisper does acoustically."""),
+    code(r"""
+hyp_VV = None
+if USE_VOXTRAL_VERBATIM:
+    from classroom_asr.backends.voxtral_asr import VoxtralASR
+    hyp_VV = run_branch("+VoxtralVerbatim",
+                        lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev,
+                                               mode="verbatim"),
+                        get_text=lambda m, a: m.transcribe_full(a, chunk_s=LLM_CHUNK_S))
+    add_branch("+VoxtralVerbatim", hyp_VV)
 """),
     md("""## 10. Phone branch — realized IPA (the pronunciation path)
 Not a word transcript: the phone branch's product is *pronunciation*. Scoring it needs a
