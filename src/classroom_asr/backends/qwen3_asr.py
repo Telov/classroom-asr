@@ -27,10 +27,13 @@ class Qwen3ASR(AcousticModel):
         source: CandidateSource = CandidateSource.QWEN,
         language: str | None = "English",
         device: str | None = None,
+        dtype=None,
         max_inference_batch_size: int = 16,
     ) -> None:
         import torch  # lazy
         from qwen_asr import Qwen3ASRModel
+
+        from . import best_dtype
 
         self.model_id = model_id
         self.id_prefix = id_prefix
@@ -40,14 +43,16 @@ class Qwen3ASR(AcousticModel):
 
         self._torch = torch
         self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        # fp16 on T4/Turing (no bf16 tensor cores) → big speedup vs bf16
+        self.dtype = dtype or best_dtype(torch, self.device)
         try:
             self.model = Qwen3ASRModel.from_pretrained(
-                model_id, dtype=torch.bfloat16, device_map=self.device,
+                model_id, dtype=self.dtype, device_map=self.device,
                 max_inference_batch_size=max_inference_batch_size,
             )
         except TypeError:  # older/newer signature without the kwarg
             self.model = Qwen3ASRModel.from_pretrained(
-                model_id, dtype=torch.bfloat16, device_map=self.device
+                model_id, dtype=self.dtype, device_map=self.device
             )
 
     def recognize(self, segment: SpeechSegment, *, n_best: int) -> list[TextCandidate]:

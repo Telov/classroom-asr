@@ -55,19 +55,19 @@ Branches (each a different architecture → complementary errors, §8):
 CORAAL is spontaneous English (high, deletion-heavy WER). Scoring folds
 numbers/ordinals/spelling but keeps fillers (verbatim, §18/§29).
 """),
-    md("## 1. Install (from GitHub — nothing to upload)"),
+    md("""## 1. Install (from GitHub — nothing to upload)
+`%pip` installs into the *running* kernel, so **Run All** completes in one click (with
+`!pip`, Kaggle would stop after this cell because the env changed, needing a second
+Run All). If it ever still stops here, just click Run All once more."""),
     code(f"""
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
 import torch
-# Everything up front (mid-notebook installs don't reliably import on Kaggle).
-# Pin transformers to what qwen-asr needs (==4.57.6); also satisfies Whisper/Voxtral.
-!pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr
-!pip -q install "crisperwhisper[ct2]"      # verbatim Whisper 2.0 (own CT2 runtime)
-# Pin transformers/accelerate LAST so the qwen-asr-required versions win over anything
-# crisperwhisper/others pulled in (==4.57.6 also satisfies Whisper/Voxtral).
-!pip -q install "transformers==4.57.6" "accelerate==1.12.0" soundfile rapidfuzz
-!pip -q install "git+https://github.com/{GITHUB_REPO}.git"
+# Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
+# loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
+# versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
+%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr "crisperwhisper[ct2]" soundfile rapidfuzz
+%pip -q install "transformers==4.57.6" "accelerate==1.12.0" "git+https://github.com/{GITHUB_REPO}.git"
 import classroom_asr, os
 if os.environ.get("HF_TOKEN"):
     from huggingface_hub import login; login(os.environ["HF_TOKEN"])
@@ -90,6 +90,11 @@ USE_PHONE      = True;  PHONE_MODEL    = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 # Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
 USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbatim
+
+# Speed notes: the LLM branches auto-pick fp16 on T4 (Turing has no bf16 tensor cores —
+# that was most of the slowness). Voxtral is the heaviest; each Voxtral toggle is a full
+# 9.5 GB load + a whole-hour pass, so set USE_VOXTRAL=False to run only the verbatim one.
+# CRISPER_SIZE="turbo" is faster than "large" if you want to trade a little quality.
 
 # Window (seconds) for the audio-LLM branches (Qwen3, Voxtral). These emit a BOUNDED
 # number of output tokens per call, so an over-long window truncates the transcript

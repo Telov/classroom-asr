@@ -44,6 +44,7 @@ class VoxtralASR(AcousticModel):
         source: CandidateSource = CandidateSource.QWEN,
         language: str = "en",
         device: str | None = None,
+        dtype=None,
         max_new_tokens: int = 64,   # CORAAL segments are short; caps decode time
         mode: str = "transcription",           # "transcription" | "verbatim"
         instruction: str | None = None,        # prompt used in "verbatim" mode
@@ -51,7 +52,7 @@ class VoxtralASR(AcousticModel):
         import torch  # lazy
         from transformers import AutoProcessor, VoxtralForConditionalGeneration
 
-        from . import load_pretrained
+        from . import best_dtype, load_pretrained
 
         self.model_id = model_id
         self.id_prefix = id_prefix
@@ -64,7 +65,8 @@ class VoxtralASR(AcousticModel):
 
         self._torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = torch.bfloat16 if str(self.device).startswith("cuda") else torch.float32
+        # fp16 on T4/Turing (no bf16 tensor cores) → big speedup vs bf16
+        self.dtype = dtype or best_dtype(torch, self.device)
 
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = load_pretrained(

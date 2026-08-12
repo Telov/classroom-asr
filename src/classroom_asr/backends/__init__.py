@@ -65,6 +65,24 @@ def iter_silence_chunks(waveform, sampling_rate, chunk_s, *, search_s=1.5):
         i = end
 
 
+def best_dtype(torch_mod, device):
+    """Pick the fastest inference dtype for ``device``.
+
+    T4/Turing (compute capability 7.5) has fp16 and int8 tensor cores but **no bf16
+    tensor-core path** — running bf16 there falls back to a slow kernel, which is why
+    the bf16 LLM branches were ~20x the int8/fp16 Whisper baseline. bf16 tensor cores
+    start at Ampere (cc 8.0). So: fp16 on pre-Ampere GPUs, bf16 on Ampere+, fp32 on CPU.
+    """
+    if not str(device).startswith("cuda") or not torch_mod.cuda.is_available():
+        return torch_mod.float32
+    try:
+        idx = int(str(device).split(":")[1]) if ":" in str(device) else 0
+        major = torch_mod.cuda.get_device_capability(idx)[0]
+    except Exception:
+        major = 0
+    return torch_mod.bfloat16 if major >= 8 else torch_mod.float16
+
+
 def batched_transcribe(chunks, transcribe_batch, *, batch_size, torch_mod, min_batch=1):
     """Transcribe pre-cut chunks in **mini-batches**, backing off on CUDA OOM.
 
