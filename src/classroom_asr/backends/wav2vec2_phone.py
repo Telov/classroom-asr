@@ -50,14 +50,32 @@ class Wav2Vec2Phone(PhoneEncoder):
     def _load_fe_tok(model_id):
         """Load the feature extractor and phoneme tokenizer **separately**.
 
-        On transformers 4.57.x ``Wav2Vec2Processor.__init__`` rejects this model's
-        ``Wav2Vec2PhonemeCTCTokenizer`` ("Received a bool for argument tokenizer") — the
-        combined Processor wrapper is broken, not its parts. So we skip the wrapper and
-        use the feature extractor (for input features) and tokenizer (for CTC decode)
-        directly — equivalent, and it dodges the wrapper bug entirely."""
-        from transformers import AutoFeatureExtractor, AutoTokenizer
+        On transformers 4.57.x the combined ``Wav2Vec2Processor`` is broken for this
+        phoneme model, and ``AutoTokenizer`` can even return a *bool* instead of a
+        tokenizer. So load the feature extractor and tokenizer directly, trying the
+        explicit phoneme-tokenizer class first and **validating** that we actually got a
+        decoder (``batch_decode``) — raising clearly if this build can't provide one."""
+        from transformers import AutoFeatureExtractor
+        import transformers as tf
+
         fe = AutoFeatureExtractor.from_pretrained(model_id)
-        tok = AutoTokenizer.from_pretrained(model_id)
+        tok = None
+        loaders = [
+            lambda: tf.Wav2Vec2PhonemeCTCTokenizer.from_pretrained(model_id),
+            lambda: tf.AutoTokenizer.from_pretrained(model_id, use_fast=False),
+            lambda: tf.AutoTokenizer.from_pretrained(model_id),
+        ]
+        for load in loaders:
+            try:
+                cand = load()
+            except Exception:
+                continue
+            if hasattr(cand, "batch_decode"):
+                tok = cand
+                break
+        if tok is None:
+            raise RuntimeError(
+                f"no usable phoneme tokenizer for {model_id} on this transformers build")
         return fe, tok
 
     def recognize(self, segment: SpeechSegment, *, top_k: int) -> list[PhonePath]:

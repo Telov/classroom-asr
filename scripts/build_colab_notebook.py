@@ -81,6 +81,17 @@ GPUS = list(range(torch.cuda.device_count())) or [None]
 print("classroom_asr", classroom_asr.__version__, "| GPUs:", torch.cuda.device_count(),
       "|", [torch.cuda.get_device_name(g) for g in range(torch.cuda.device_count())])
 """),
+    md("### Timing helper — every stage prints a persistent `⏱` line and is collected at the end"),
+    code(r"""
+import time as _time
+TIMINGS = []                       # (stage_name, seconds); printed as a table in the last cell
+def rec(name, dt):
+    TIMINGS.append((name, dt)); print(f"⏱  {name}: {dt:.1f}s", flush=True); return dt
+class stage:                       # `with stage("name"):` -> times the block, prints, records
+    def __init__(self, name): self.name = name
+    def __enter__(self): self.t0 = _time.time(); return self
+    def __exit__(self, *a): rec(self.name, _time.time() - self.t0); return False
+"""),
     md("## 2. Parameters"),
     code(r"""
 COMPONENT, VERSION, AUDIO_PART = "les", "2021.07", "part01"   # or "prv","2018.10.06"
@@ -157,6 +168,7 @@ print("model prefetch: started in background")
     code(r"""
 import os, tarfile, urllib.request, ssl
 from pathlib import Path
+_dl0 = _time.time()
 os.makedirs("coraal/txt", exist_ok=True); os.makedirs("coraal/audio", exist_ok=True)
 
 def fetch(url, dest):
@@ -173,6 +185,7 @@ for tarball, dest in [("coraal/txt.tar.gz","coraal/txt"), ("coraal/audio.tar.gz"
     with tarfile.open(tarball) as t: t.extractall(dest, filter="data")
 print("transcripts:", len(list(Path('coraal/txt').rglob('*.txt'))),
       "| wavs:", len(list(Path('coraal/audio').rglob('*.wav'))))
+rec("download+extract CORAAL", _time.time() - _dl0)
 """),
     md("## 4. Build interviews: full audio + full verbatim reference (~1h total)"),
     code(r"""
@@ -191,6 +204,7 @@ def load_16k(path):
 
 interviews = []   # (wav_path, full_reference_text)
 total = 0.0
+_bld0 = _time.time()
 for txt in iter_transcripts("coraal/txt"):
     if txt.stem not in wavs: continue
     segs = sorted(parse_transcript(txt), key=lambda x: x.start)
@@ -202,13 +216,14 @@ for txt in iter_transcripts("coraal/txt"):
 refs = [r for _, r in interviews]
 print(f"{len(interviews)} interviews, {total/60:.1f} min, "
       f"{sum(len(r.split()) for r in refs)} reference words")
+rec("build interviews (load+resample)", _time.time() - _bld0)
 """),
     md("""## 5. Whole-recording runner + scoring (rapidfuzz)
 `whole_rec` transcribes each interview on the GPUs. `wer_of` scores a branch over the
 full transcripts; `oracle_wer` is the candidate-oracle at the word level — the fraction
 of reference words that **no** branch recovers (a lower bound the pool can't beat)."""),
     code(r"""
-import threading, gc
+import threading, gc, time
 from tqdm.auto import tqdm
 from rapidfuzz.distance import Levenshtein
 from classroom_asr.normalize import Normalizer
@@ -221,15 +236,19 @@ def _free():
 
 def whole_rec(make_model, get_text, desc):
     out = [""] * len(interviews)
+    t0 = time.time()
     models = [make_model("cpu" if g is None else f"cuda:{g}") for g in GPUS]
+    tload = time.time() - t0                       # includes first-time model download
     shards = [list(range(len(interviews)))[i::len(GPUS)] for i in range(len(GPUS))]
     def worker(model, sh, pos):
-        for k in tqdm(sh, desc=f"{desc}:{pos}", position=pos, leave=False):
+        for k in tqdm(sh, desc=f"{desc}:{pos}", position=pos, leave=True):  # leave=True: bar persists
             try: out[k] = get_text(model, load_16k(interviews[k][0]))
             except Exception as e: print(desc, "failed:", repr(e)[:120]); out[k] = ""
+    t1 = time.time()
     ts = [threading.Thread(target=worker, args=(models[i], shards[i], i)) for i in range(len(GPUS))]
     for t in ts: t.start()
     for t in ts: t.join()
+    trun = time.time() - t1
     for m in models:
         if hasattr(m, "unload"):
             try: m.unload()
@@ -239,6 +258,8 @@ def whole_rec(make_model, get_text, desc):
         for g in GPUS:
             if g is not None:
                 with torch.cuda.device(g): torch.cuda.empty_cache()
+    print(f"   {desc}: load {tload:.1f}s + transcribe {trun:.1f}s", flush=True)
+    rec(desc, tload + trun)
     return out
 
 def _free_models(models):
@@ -283,18 +304,24 @@ def window_pass(models, desc, *, chunk_s, batch_size):
         out.append(" ".join(p for p in parts if p).strip())
     return out
 
-# window_pass with its own model load/unload + per-branch error guard.
+# window_pass with its own model load/unload + per-branch error guard + timing.
 def run_windows(desc, make_model, *, chunk_s, batch_size):
+    t0 = time.time()
     try:
         models = [make_model("cpu" if g is None else f"cuda:{g}") for g in GPUS]
     except Exception as e:
         print(f"[{desc:14s}] load FAILED: {repr(e)[:160]}"); _free(); return [""] * len(interviews)
+    tload = time.time() - t0
     try:
-        return window_pass(models, desc, chunk_s=chunk_s, batch_size=batch_size)
+        t1 = time.time()
+        out = window_pass(models, desc, chunk_s=chunk_s, batch_size=batch_size)
+        print(f"   {desc}: load {tload:.1f}s + transcribe {time.time()-t1:.1f}s", flush=True)
+        return out
     except Exception as e:
         print(f"[{desc:14s}] FAILED: {repr(e)[:160]}"); return [""] * len(interviews)
     finally:
         _free_models(models)
+        rec(desc, time.time() - t0)
 
 _reftok = [SCORE.tokens(r) for r in refs]
 def wer_of(hyps):
@@ -368,11 +395,13 @@ Both are scored so we see the clean vs verbatim oracle contribution side by side
 hyp_C = hyp_VV = None
 if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
     from classroom_asr.backends.voxtral_asr import VoxtralASR
-    vmodels = [VoxtralASR(VOXTRAL_MODEL, language="en",
-                          device=("cpu" if g is None else f"cuda:{g}")) for g in GPUS]
+    with stage("Voxtral load (shared)"):            # one 9.5 GB load reused by both passes
+        vmodels = [VoxtralASR(VOXTRAL_MODEL, language="en",
+                              device=("cpu" if g is None else f"cuda:{g}")) for g in GPUS]
     def _vox_pass(mode, tag):                       # windows balanced across GPUs, one mode
         for m in vmodels: m.mode = mode
-        return window_pass(vmodels, tag, chunk_s=LLM_CHUNK_S, batch_size=6)
+        t0 = time.time(); out = window_pass(vmodels, tag, chunk_s=LLM_CHUNK_S, batch_size=6)
+        rec(tag, time.time() - t0); return out
     if USE_VOXTRAL:
         hyp_C = _vox_pass("transcription", "+Voxtral"); add_branch("+Voxtral", hyp_C)
     if USE_VOXTRAL_VERBATIM:
@@ -391,6 +420,7 @@ the main kernel never imports the fork."""),
 hyp_CW = None
 if USE_CRISPER:
     import os, sys, json, subprocess
+    _cw_t0 = time.time()
     WORKER = os.path.join(CW_WORK, "cw_worker.py")
     try:
         if _cw["thread"] is not None:
@@ -425,6 +455,7 @@ json.dump(out, open(outp, "w"))
         hyp_CW = [CrisperWhisperV2._clean(res.get(p, "")) for p in paths]   # [um]->um, drop [laughter]
     except Exception as e:
         print("CrisperWhisper isolation failed:", repr(e)[:200]); hyp_CW = [""] * len(interviews)
+    rec("+CrisperWhisper", time.time() - _cw_t0)
     add_branch("+CrisperWhisper", hyp_CW)
 """),
     md("""## 10. Phone branch — realized IPA (the pronunciation path)
@@ -434,12 +465,15 @@ realized IPA rather than force it through a naive P2G into a misleading word WER
 first-class part of the design (OOV/nonce recovery), just not exercised by this dataset."""),
     code(r"""
 if USE_PHONE:
-    from classroom_asr.backends.wav2vec2_phone import Wav2Vec2Phone
-    ipa = whole_rec(lambda dev: Wav2Vec2Phone(PHONE_MODEL, device=dev),
-                    lambda m, a: m.transcribe_full(a), "phone")
-    print("realized IPA (first 300 chars of interview 0):")
-    print(" ", (ipa[0] or "")[:300])
-    print("\nreference words (for contrast):", refs[0][:200])
+    try:                                    # illustrative + unscored: never let it stop the run
+        from classroom_asr.backends.wav2vec2_phone import Wav2Vec2Phone
+        ipa = whole_rec(lambda dev: Wav2Vec2Phone(PHONE_MODEL, device=dev),
+                        lambda m, a: m.transcribe_full(a), "phone")
+        print("realized IPA (first 300 chars of interview 0):")
+        print(" ", (ipa[0] or "")[:300])
+        print("\nreference words (for contrast):", refs[0][:200])
+    except Exception as e:
+        print("phone branch skipped:", repr(e)[:160])
 """),
     md("## 11. What specific mistakes — error analysis (branch A vs reference)"),
     code(r"""
@@ -467,16 +501,25 @@ for p, n in subs.most_common(15): print(f"   {p:30} x{n}")
 print("\nMost-inserted words (hyp words with no ref):")
 for w, n in ins.most_common(15): print(f"   {w!r:18} x{n}")
 """),
-    md("## 12. Save summary"),
+    md("""## 12. Timings + save summary
+Persistent per-stage wall-times (every stage `⏱`-printed as it finished; here they're
+collected into one table) and the WER/oracle summary."""),
     code(r"""
 import json
+# --- timing table (slowest first) ---
+print("=== wall-time by stage ===")
+for name, dt in sorted(TIMINGS, key=lambda x: -x[1]):
+    print(f"   {dt:7.1f}s  {name}")
+print(f"   {sum(dt for _, dt in TIMINGS):7.1f}s  TOTAL (sum of tracked stages)")
+
 res = {}
 for name, h in [("A_whisper", hyp_A), ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C)]:
     if h and any(h): res[name] = round(wer_of(h), 4)
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",
            "branch_wer": res, "oracle_wer": round(oracle_wer(pool), 4),
-           "baseline_wer": res.get("A_whisper")}
+           "baseline_wer": res.get("A_whisper"),
+           "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
 json.dump(summary, open("coraal_oracle_summary.json", "w"), indent=2)
 print(json.dumps(summary, indent=2))
 """),
