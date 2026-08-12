@@ -69,9 +69,19 @@ class VoxtralASR(AcousticModel):
         self.dtype = dtype or best_dtype(torch, self.device)
 
         self.processor = AutoProcessor.from_pretrained(model_id)
-        self.model = load_pretrained(
-            VoxtralForConditionalGeneration, model_id, dtype=self.dtype, device_map=self.device
-        ).eval()
+        # attn_implementation="sdpa": same math as eager, but PyTorch's scaled-dot-product
+        # kernel is faster and lighter on the autoregressive decode that dominates Voxtral's
+        # time (T4/Turing has no FlashAttention-2 path, but SDPA's mem-efficient kernel still
+        # wins over eager). Falls back cleanly if this build won't accept the kwarg for Voxtral.
+        try:
+            self.model = load_pretrained(
+                VoxtralForConditionalGeneration, model_id, dtype=self.dtype,
+                device_map=self.device, attn_implementation="sdpa",
+            ).eval()
+        except (ValueError, TypeError, KeyError, ImportError):
+            self.model = load_pretrained(
+                VoxtralForConditionalGeneration, model_id, dtype=self.dtype, device_map=self.device
+            ).eval()
 
         # Fix generate-time warnings at the source: set pad_token_id and drop sampling-only
         # flags (we decode greedily) so generate() doesn't warn about pad_token / temperature.
