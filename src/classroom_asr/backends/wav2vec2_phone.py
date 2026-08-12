@@ -84,7 +84,7 @@ class Wav2Vec2Phone(PhoneEncoder):
         attn = getattr(inputs, "attention_mask", None)
         kwargs = {"attention_mask": attn.to(self.device)} if attn is not None else {}
 
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = self.model(input_values, **kwargs).logits
         probs = logits.softmax(dim=-1)
         pred_ids = probs.argmax(dim=-1)

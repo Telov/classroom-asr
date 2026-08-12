@@ -97,7 +97,7 @@ class Wav2Vec2CTC(AcousticModel):
         if attn is not None:
             kwargs["attention_mask"] = attn.to(self.device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = self.model(input_values, **kwargs).logits
         pred_ids = logits.argmax(dim=-1)
         texts = self.processor.batch_decode(pred_ids, clean_up_tokenization_spaces=False)
@@ -139,7 +139,7 @@ class Wav2Vec2CTC(AcousticModel):
             iv = enc.input_values.to(self.device, self.dtype)
             attn = getattr(enc, "attention_mask", None)
             kw = {"attention_mask": attn.to(self.device)} if attn is not None else {}
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits = self.model(iv, **kw).logits
             dec = self.processor.batch_decode(
                 logits.argmax(dim=-1), output_word_offsets=True,

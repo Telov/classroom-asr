@@ -83,16 +83,16 @@ def best_dtype(torch_mod, device):
     return torch_mod.bfloat16 if major >= 8 else torch_mod.float16
 
 
-def batched_transcribe(chunks, transcribe_batch, *, batch_size, torch_mod, min_batch=1):
-    """Transcribe pre-cut chunks in **mini-batches**, backing off on CUDA OOM.
+def batched_transcribe_list(chunks, transcribe_batch, *, batch_size, torch_mod, min_batch=1):
+    """Transcribe pre-cut chunks in **mini-batches**, returning one text **per chunk**.
 
-    ``transcribe_batch(list_of_waveforms) -> list_of_str`` (same length/order). This
-    is the speed lever for the per-chunk branches: instead of one forward/generate
-    per 30 s window (dozens per interview, serial), whole batches go through the GPU
-    at once. On OOM the batch size halves (to ``min_batch``) and retries, so a
-    memory-tight recording still finishes. Returns the joined non-empty parts.
+    ``transcribe_batch(list_of_waveforms) -> list_of_str`` (same length/order). Instead
+    of one forward/generate per window (serial), whole batches go through the GPU at
+    once. On CUDA OOM the batch size halves (to ``min_batch``) and retries. The result
+    is aligned 1:1 with ``chunks`` (empty string where a chunk produced nothing), so a
+    caller can reassemble per-recording transcripts after distributing windows freely.
     """
-    texts = []
+    texts = [""] * len(chunks)
     i = 0
     bs = max(1, batch_size)
     n = len(chunks)
@@ -107,9 +107,17 @@ def batched_transcribe(chunks, transcribe_batch, *, batch_size, torch_mod, min_b
                 bs = max(min_batch, bs // 2)
                 continue
             raise
-        texts.extend((t or "").strip() for t in res if t and t.strip())
+        for j, t in enumerate(res):
+            texts[i + j] = (t or "").strip()
         i += len(batch)
-    return " ".join(texts).strip()
+    return texts
+
+
+def batched_transcribe(chunks, transcribe_batch, *, batch_size, torch_mod, min_batch=1):
+    """Like :func:`batched_transcribe_list` but joins the non-empty parts into one string."""
+    parts = batched_transcribe_list(chunks, transcribe_batch, batch_size=batch_size,
+                                    torch_mod=torch_mod, min_batch=min_batch)
+    return " ".join(t for t in parts if t).strip()
 
 
 def chunked_transcribe(waveform, sampling_rate, transcribe_chunk, *,

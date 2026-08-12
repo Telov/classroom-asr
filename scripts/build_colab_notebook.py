@@ -63,6 +63,9 @@ Run All). If it ever still stops here, just click Run All once more."""),
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
 import torch
+# TF32 matmul: free speedup on Ampere+ (Colab A100/L4), no-op on T4/Turing; inference-safe.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 # Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
 # loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
 # versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
@@ -195,6 +198,61 @@ def whole_rec(make_model, get_text, desc):
                 with torch.cuda.device(g): torch.cuda.empty_cache()
     return out
 
+def _free_models(models):
+    for m in models:
+        if hasattr(m, "unload"):
+            try: m.unload()
+            except Exception as e: print("unload failed:", repr(e)[:100])
+    _free()
+    if torch.cuda.is_available():
+        for g in GPUS:
+            if g is not None:
+                with torch.cuda.device(g): torch.cuda.empty_cache()
+
+def _windows_of(k, chunk_s):
+    from classroom_asr.backends import iter_silence_chunks
+    wav = load_16k(interviews[k][0])
+    return [c for _, c in iter_silence_chunks(wav, 16000, chunk_s) if len(c) >= 400]
+
+# Balance ALL ~chunk_s windows from ALL interviews evenly across the GPUs (so no GPU idles
+# on the 2+1 interview split), transcribe, then reassemble each transcript in order. Output
+# is identical to per-interview transcription (pure utilization win). `models` are preloaded
+# (one per GPU) and NOT unloaded here (the caller owns them).
+def window_pass(models, desc, *, chunk_s, batch_size):
+    iv_chunks = [_windows_of(k, chunk_s) for k in range(len(interviews))]
+    tasks = [(k, wi, c) for k, cs in enumerate(iv_chunks) for wi, c in enumerate(cs)]
+    shards = [tasks[i::len(models)] for i in range(len(models))]
+    results = {}
+    def worker(model, shard, pos):
+        cks = [t[2] for t in shard]
+        if not cks: return
+        try:
+            texts = model.transcribe_chunk_list(cks, batch_size=batch_size)
+        except Exception as e:
+            print(desc, "failed:", repr(e)[:120]); texts = [""] * len(cks)
+        for (k, wi, _), txt in zip(shard, texts): results[(k, wi)] = txt
+    ts = [threading.Thread(target=worker, args=(models[i], shards[i], i)) for i in range(len(models))]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    out = []
+    for k, cs in enumerate(iv_chunks):
+        parts = [results.get((k, wi), "") for wi in range(len(cs))]
+        out.append(" ".join(p for p in parts if p).strip())
+    return out
+
+# window_pass with its own model load/unload + per-branch error guard.
+def run_windows(desc, make_model, *, chunk_s, batch_size):
+    try:
+        models = [make_model("cpu" if g is None else f"cuda:{g}") for g in GPUS]
+    except Exception as e:
+        print(f"[{desc:14s}] load FAILED: {repr(e)[:160]}"); _free(); return [""] * len(interviews)
+    try:
+        return window_pass(models, desc, chunk_s=chunk_s, batch_size=batch_size)
+    except Exception as e:
+        print(f"[{desc:14s}] FAILED: {repr(e)[:160]}"); return [""] * len(interviews)
+    finally:
+        _free_models(models)
+
 _reftok = [SCORE.tokens(r) for r in refs]
 def wer_of(hyps):
     E = R = 0
@@ -252,9 +310,10 @@ if USE_CTC:
 hyp_Z = None
 if USE_QWEN3ASR:
     from classroom_asr.backends.qwen3_asr import Qwen3ASR
-    hyp_Z = run_branch("A+B+Qwen3", lambda dev: Qwen3ASR(
-        QWEN3ASR_MODEL, language="English", device=dev),
-        get_text=lambda m, a: m.transcribe_full(a, chunk_s=LLM_CHUNK_S))
+    # windows balanced across GPUs (no 2+1 idle), reassembled in order (same output)
+    hyp_Z = run_windows("A+B+Qwen3",
+                        lambda dev: Qwen3ASR(QWEN3ASR_MODEL, language="English", device=dev),
+                        chunk_s=LLM_CHUNK_S, batch_size=16)
     add_branch("A+B+Qwen3", hyp_Z)
 """),
     md("""## 9. Branch C / VV — Voxtral Mini 3B, **both passes on one load**
@@ -268,29 +327,14 @@ if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
     from classroom_asr.backends.voxtral_asr import VoxtralASR
     vmodels = [VoxtralASR(VOXTRAL_MODEL, language="en",
                           device=("cpu" if g is None else f"cuda:{g}")) for g in GPUS]
-    def _vox_pass(mode, tag):                       # run one decode mode across the GPUs
+    def _vox_pass(mode, tag):                       # windows balanced across GPUs, one mode
         for m in vmodels: m.mode = mode
-        out = [""] * len(interviews)
-        shards = [list(range(len(interviews)))[i::len(GPUS)] for i in range(len(GPUS))]
-        def worker(model, sh, pos):
-            for k in tqdm(sh, desc=f"{tag}:{pos}", position=pos, leave=False):
-                try: out[k] = model.transcribe_full(load_16k(interviews[k][0]), chunk_s=LLM_CHUNK_S)
-                except Exception as e: print(tag, "failed:", repr(e)[:120]); out[k] = ""
-        ts = [threading.Thread(target=worker, args=(vmodels[i], shards[i], i)) for i in range(len(GPUS))]
-        for t in ts: t.start()
-        for t in ts: t.join()
-        return out
+        return window_pass(vmodels, tag, chunk_s=LLM_CHUNK_S, batch_size=6)
     if USE_VOXTRAL:
         hyp_C = _vox_pass("transcription", "+Voxtral"); add_branch("+Voxtral", hyp_C)
     if USE_VOXTRAL_VERBATIM:
         hyp_VV = _vox_pass("verbatim", "+VoxtralVerbatim"); add_branch("+VoxtralVerbatim", hyp_VV)
-    for m in vmodels:
-        if hasattr(m, "unload"): m.unload()
-    vmodels = None; del vmodels; _free()
-    if torch.cuda.is_available():
-        for g in GPUS:
-            if g is not None:
-                with torch.cuda.device(g): torch.cuda.empty_cache()
+    _free_models(vmodels); vmodels = None; del vmodels
 """),
     md("""## 9a. Branch CW — CrisperWhisper 2.0 (**verbatim** Whisper, isolated CT2)
 The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts the clean

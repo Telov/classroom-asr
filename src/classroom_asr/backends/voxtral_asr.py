@@ -109,7 +109,7 @@ class VoxtralASR(AcousticModel):
         inputs = self.processor.apply_transcription_request(
             language=[self.language] * len(paths), audio=paths, model_id=self.model_id,
         ).to(self.device, dtype=self.dtype)
-        with torch.no_grad():
+        with torch.inference_mode():
             out = self.model.generate(**inputs, max_new_tokens=mnt)
         return self.processor.batch_decode(out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
 
@@ -130,7 +130,7 @@ class VoxtralASR(AcousticModel):
         def run(conversation):
             inputs = self.processor.apply_chat_template(conversation).to(
                 self.device, dtype=self.dtype)
-            with torch.no_grad():
+            with torch.inference_mode():
                 out = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
             return self.processor.batch_decode(
                 out[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)
@@ -166,20 +166,15 @@ class VoxtralASR(AcousticModel):
             )
         return results
 
-    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
-                        chunk_s: float = 30.0, batch_size: int = 6) -> str:
-        """Whole-recording transcript: silence-snapped short windows, **batched**.
+    def transcribe_chunk_list(self, chunks, *, sampling_rate: int = 16_000,
+                              batch_size: int = 6, chunk_s: float = 30.0) -> list[str]:
+        """Transcribe pre-cut windows → one text **per window** (batched, OOM-backoff).
 
-        Voxtral is an audio-LLM whose ``generate`` emits a bounded number of output
-        tokens, so an over-long window truncates (the segment-tuned ``max_new_tokens``
-        of 64 clips anything past ~15 s). Windows are kept near the utterance scale,
-        cut at silence (no split words), and the token budget is scaled to the window
-        (~8 tok/s + headroom). Windows go through in mini-batches for speed, with OOM
-        batch-backoff."""
-        from . import batched_transcribe, iter_silence_chunks
+        Splitting chunking from transcription lets an external runner pool windows from
+        several recordings and spread them across GPUs (no idle GPU), then reassemble in
+        order. ``chunk_s`` only sizes the output-token budget (~8 tok/s + headroom)."""
+        from . import batched_transcribe_list
 
-        chunks = [c for _, c in iter_silence_chunks(waveform, sampling_rate, chunk_s)
-                  if len(c) >= 400]
         budget = max(self.max_new_tokens, int(chunk_s * 8) + 32)
 
         def batch(cs):
@@ -190,7 +185,25 @@ class VoxtralASR(AcousticModel):
                 for p in paths:
                     os.unlink(p)
 
-        return batched_transcribe(chunks, batch, batch_size=batch_size, torch_mod=self._torch)
+        return batched_transcribe_list(chunks, batch, batch_size=batch_size, torch_mod=self._torch)
+
+    def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
+                        chunk_s: float = 30.0, batch_size: int = 6) -> str:
+        """Whole-recording transcript: silence-snapped short windows, **batched**.
+
+        Voxtral is an audio-LLM whose ``generate`` emits a bounded number of output
+        tokens, so an over-long window truncates (the segment-tuned ``max_new_tokens``
+        of 64 clips anything past ~15 s). Windows are kept near the utterance scale,
+        cut at silence (no split words), and the token budget is scaled to the window
+        (~8 tok/s + headroom). Windows go through in mini-batches for speed, with OOM
+        batch-backoff."""
+        from . import iter_silence_chunks
+
+        chunks = [c for _, c in iter_silence_chunks(waveform, sampling_rate, chunk_s)
+                  if len(c) >= 400]
+        parts = self.transcribe_chunk_list(chunks, sampling_rate=sampling_rate,
+                                           batch_size=batch_size, chunk_s=chunk_s)
+        return " ".join(p for p in parts if p).strip()
 
     def unload(self) -> None:
         import gc

@@ -126,6 +126,21 @@ class Qwen3ASR(AcousticModel):
                 out.append((float(st.start_time), float(st.end_time), text))
         return out
 
+    def transcribe_chunk_list(self, chunks, *, sampling_rate: int = 16_000,
+                              batch_size: int = 16) -> list[str]:
+        """Transcribe pre-cut windows → one text **per window** (batched, OOM-backoff).
+
+        Splitting chunking from transcription lets an external runner pool windows from
+        several recordings and spread them evenly across GPUs (no idle GPU), then
+        reassemble each transcript in order — same output, better utilization."""
+        from . import batched_transcribe_list
+
+        def batch(cs):
+            res = self.nbest_batch(cs, sampling_rate=sampling_rate)
+            return [(r[0].text if r else "") for r in res]
+
+        return batched_transcribe_list(chunks, batch, batch_size=batch_size, torch_mod=self._torch)
+
     def transcribe_full(self, waveform, *, sampling_rate: int = 16_000,
                         chunk_s: float = 30.0, batch_size: int = 16) -> str:
         """Whole-recording transcript: silence-snapped short windows, **batched**.
@@ -136,16 +151,13 @@ class Qwen3ASR(AcousticModel):
         utterance scale (~30 s, like Whisper's internal window) and cut at silence so
         no word is split. qwen-asr batches natively, so the windows go through in
         mini-batches (big speedup vs one call per window), with OOM batch-backoff."""
-        from . import batched_transcribe, iter_silence_chunks
+        from . import iter_silence_chunks
 
         chunks = [c for _, c in iter_silence_chunks(waveform, sampling_rate, chunk_s)
                   if len(c) >= 400]
-
-        def batch(cs):
-            res = self.nbest_batch(cs, sampling_rate=sampling_rate)
-            return [(r[0].text if r else "") for r in res]
-
-        return batched_transcribe(chunks, batch, batch_size=batch_size, torch_mod=self._torch)
+        parts = self.transcribe_chunk_list(chunks, sampling_rate=sampling_rate,
+                                           batch_size=batch_size)
+        return " ".join(p for p in parts if p).strip()
 
     def unload(self) -> None:
         import gc
