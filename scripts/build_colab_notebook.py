@@ -800,13 +800,54 @@ if USE_LLM_SELECTOR:
         if _sel.get("err") is not None: raise _sel["err"]
         with open(SEL_WORKER, "w") as f:
             f.write('''
-import sys, json, torch, transformers
+import sys, json, re, torch, transformers
 from transformers import AutoModelForMultimodalLM, AutoProcessor
-from classroom_asr.selector import generated_token_ids, select_transcript
+import classroom_asr.selector as selector_module
+from classroom_asr.selector import select_transcript
 from classroom_asr.normalize import Normalizer
 SCORE = Normalizer(fold_numbers=True, fold_spelling=True)
 model_id, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 data = json.load(open(inp))
+
+# Keep this generated worker compatible with the classroom_asr revision installed from GitHub.
+# A copied notebook can be newer than origin/main, so its worker must not import newly-added
+# helpers from the package. Patch the module global used by select_transcript with the tolerant
+# parser locally; once origin contains the same implementation this remains harmless.
+_ANSWER = re.compile(
+    r"^\s*(?:[-*]\s*)?[\"']?(\d+)[\"']?\s*(?:[:.)=\-]|->)\s*"
+    r"(?:[\"']?\s*)?(?:option\s+)?([A-Za-z])\b", re.IGNORECASE | re.MULTILINE)
+def parse_batch_compat(text, decisions):
+    raw = text or ""; answers = []
+    try: payload = json.loads(raw.strip())
+    except (TypeError, ValueError, json.JSONDecodeError): payload = None
+    if isinstance(payload, dict):
+        answers.extend(payload.items())
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                answers.append((item.get("item", item.get("number", item.get("n"))),
+                                item.get("answer", item.get("choice", item.get("letter")))))
+    answers.extend((m.group(1), m.group(2)) for m in _ANSWER.finditer(raw))
+    choices = {}
+    for number, answer in answers:
+        try: n = int(number)
+        except (TypeError, ValueError): continue
+        if 1 <= n <= len(decisions):
+            decision = decisions[n - 1]; options = dict(decision.options)
+            match = re.search(r"\b([A-Za-z])\b", str(answer or ""))
+            if match and match.group(1).upper() in options:
+                choices[decision.slot] = options[match.group(1).upper()]
+    return choices
+selector_module.parse_batch = parse_batch_compat
+
+def generated_token_ids_compat(generated_ids, input_ids):
+    generated = generated_ids.tolist() if hasattr(generated_ids, "tolist") else generated_ids
+    prompt = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
+    if generated and isinstance(generated[0], (list, tuple)): generated = generated[0]
+    if prompt and isinstance(prompt[0], (list, tuple)): prompt = prompt[0]
+    generated, prompt = list(generated or []), list(prompt or [])
+    return generated[len(prompt):] if generated[:len(prompt)] == prompt else generated
+
 processor = AutoProcessor.from_pretrained(model_id)
 # Full fp16, sharded across BOTH T4s (acoustic models are unloaded -> 32 GB free; 9B fp16 ~18 GB).
 # No quantization: the design wants the judge validated at full precision first (§21). fp16 (not
@@ -821,6 +862,7 @@ _dev = next(model.parameters()).device            # feed inputs to the shard hol
 _dbg = {"n": 0}
 print(f"selector runtime: transformers={transformers.__version__} model={type(model).__name__}",
       file=sys.stderr)
+print(f"selector package: {selector_module.__file__}", file=sys.stderr)
 def llm_fn(prompt):
     # Follow Qwen3.5's official AutoProcessor + multimodal-model interface even for text-only
     # input. Hard-disable thinking in the chat template so it cannot consume the answer budget.
@@ -830,7 +872,7 @@ def llm_fn(prompt):
         return_dict=True, return_tensors="pt").to(_dev)
     with torch.inference_mode():
         out = model.generate(**inputs, max_new_tokens=512, do_sample=False)
-    completion = generated_token_ids(out, inputs["input_ids"])
+    completion = generated_token_ids_compat(out, inputs["input_ids"])
     resp = processor.decode(completion, skip_special_tokens=True)
     if _dbg["n"] < 1:                              # surface the first raw exchange so we can see
         _dbg["n"] += 1                             # the real output format and fix parsing if needed
