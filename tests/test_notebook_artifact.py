@@ -269,6 +269,20 @@ def test_window_batches_emit_progress_and_fail_independently():
     assert "if vmodels is not None: _free_models(vmodels)" in source
 
 
+def test_partial_multi_gpu_loads_are_released_and_crisper_emits_heartbeats():
+    source = _notebook_source()
+
+    load_models = source[source.index("def load_models(make_model):"):source.index(
+        "def whole_rec", source.index("def load_models(make_model):")
+    )]
+    assert "models.append(make_model(device))" in load_models
+    assert 'model load {index + 1}/{len(GPUS)} on {device}: started' in load_models
+    assert "for model in models:" in load_models
+    assert "with torch.cuda.device(g): torch.cuda.empty_cache()" in load_models
+    assert 'print("CW independent:", os.path.basename(p), "started"' in source
+    assert 'f"{wi + 1}/{len(rows)} windows"' in source
+
+
 def test_voxtral_verbatim_prompt_uses_aae_as_context_without_identity_guessing():
     source = (ROOT / "src" / "classroom_asr" / "backends" / "voxtral_asr.py").read_text(
         encoding="utf-8"

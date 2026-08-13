@@ -435,12 +435,33 @@ def _free():
 # tensor; no data!"). It's a race, so it only bit some runs. The heavy downloads are already
 # prefetched in §2a, so a serial load is just the local disk->GPU copy (tens of seconds).
 def load_models(make_model):
-    return [make_model("cpu" if g is None else f"cuda:{g}") for g in GPUS]
+    models = []
+    try:
+        for index, g in enumerate(GPUS):
+            device = "cpu" if g is None else f"cuda:{g}"
+            print(f"model load {index + 1}/{len(GPUS)} on {device}: started", flush=True)
+            models.append(make_model(device))
+            print(f"model load {index + 1}/{len(GPUS)} on {device}: ready", flush=True)
+        return models
+    except Exception:
+        # A list comprehension loses its partially constructed list when (say) GPU 1 fails after
+        # GPU 0 loaded successfully. Explicit cleanup prevents that orphan from consuming VRAM
+        # and cascading one optional model-load failure into every later branch.
+        for model in models:
+            if hasattr(model, "unload"):
+                try: model.unload()
+                except Exception: pass
+        _free()
+        if torch.cuda.is_available():
+            for g in GPUS:
+                if g is not None:
+                    with torch.cuda.device(g): torch.cuda.empty_cache()
+        raise
 
 def whole_rec(make_model, get_text, desc):
     out = [""] * len(interviews)
     t0 = time.time()
-    models = load_models(make_model)               # parallel per-GPU load
+    models = load_models(make_model)               # deliberately serial per-GPU load (§5)
     tload = time.time() - t0                       # includes first-time model download
     shards = [list(range(len(interviews)))[i::len(GPUS)] for i in range(len(GPUS))]
     def worker(model, sh, pos):
@@ -800,7 +821,9 @@ except Exception as e:
 t0 = time.perf_counter(); independent = {}
 for p in paths:
     try:
+        print("CW independent:", os.path.basename(p), "started", flush=True)
         r = m.transcribe(p, language="en"); independent[p] = getattr(r, "text", "") or ""
+        print("CW independent:", os.path.basename(p), "ready", flush=True)
     except Exception as e:
         independent[p] = ""; print("independent fail", p, repr(e)[:120], file=sys.stderr)
 independent_s = time.perf_counter() - t0
@@ -829,6 +852,9 @@ if qwen_windows:
             except Exception as e:
                 parts.append("")
                 print("verbatize fail", p, wi, repr(e)[:120], file=sys.stderr)
+            if (wi + 1) % 10 == 0 or wi + 1 == len(rows):
+                print("CW verbatize:", os.path.basename(p),
+                      f"{wi + 1}/{len(rows)} windows", flush=True)
         verbatized[p] = parts
 verbatize_s = time.perf_counter() - t0
 json.dump({"independent": independent, "verbatized": verbatized,
