@@ -460,6 +460,10 @@ def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():
     assert "format_batch(decisions)" in source
     assert "evidence_by_slot=evidence" in source
     assert "phone evidence attached to" in source
+    assert "_anchor_candidates = [" in source
+    assert "for _k in range(len(interviews)):" in source
+    assert 'hyps and hyps[_k] and key in WINDOW_PARTS' in source
+    assert "selector retrieval anchors by interview" in source
     assert "lambda m, a: m.transcribe_full(a), \"PhoneticXeus\"" not in source
 
 

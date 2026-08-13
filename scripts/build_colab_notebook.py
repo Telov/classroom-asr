@@ -1748,11 +1748,17 @@ json.dump({"selected": selected, "threshold_selected": threshold_selected, "stat
 ''')
         # Qwen's ~30 s timestamped text windows are the preferred retrieval anchor. If that branch
         # failed, fall back to another timestamped word branch; the phone windows remain immutable.
-        _anchor_key = next((key for key, hyps in [
+        _anchor_candidates = [
             ("A+B+Qwen3", hyp_Z), ("+Voxtral", hyp_C), ("+VoxtralVerbatim", hyp_VV),
-            ("Whisper large-v3 quality", hyp_A3), ("A whisper", hyp_A),
-            ("A+B", hyp_B)] if hyps and any(hyps) and key in WINDOW_PARTS), None)
-        _anchors = WINDOW_PARTS.get(_anchor_key, [[] for _ in interviews])
+            ("Whisper large-v3 quality", hyp_A3), ("A whisper", hyp_A), ("A+B", hyp_B),
+        ]
+        _anchors = []; _anchor_keys = []
+        for _k in range(len(interviews)):
+            _anchor_key = next((key for key, hyps in _anchor_candidates
+                                if hyps and hyps[_k] and key in WINDOW_PARTS
+                                and any(row.get("text") for row in WINDOW_PARTS[key][_k])), None)
+            _anchor_keys.append(_anchor_key or "none")
+            _anchors.append(WINDOW_PARTS[_anchor_key][_k] if _anchor_key else [])
         _selector_input = {
             # _wb is already Qwen-first. The worker removes empty results per interview without
             # reordering, so abstentions retain Qwen when present and the first available emergency
@@ -1761,7 +1767,8 @@ json.dump({"selected": selected, "threshold_selected": threshold_selected, "stat
             "anchor_chunks": _anchors,
             "phone_evidence": phone_evidence,
         }
-        print(f"selector retrieval anchor: {_anchor_key or 'none'}; "
+        _anchor_counts = {key: _anchor_keys.count(key) for key in dict.fromkeys(_anchor_keys)}
+        print(f"selector retrieval anchors by interview: {_anchor_counts}; "
               f"phone windows={sum(len(rows) for rows in phone_evidence)}")
         json.dump(_selector_input, open(os.path.join(SEL_RUN, "in.json"), "w"))
         subprocess.run([SEL_VENV_PY, SEL_WORKER, SELECTOR_MODEL,
