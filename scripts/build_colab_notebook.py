@@ -1871,7 +1871,8 @@ try:   # recall-floor breakdown from §11.5 (defined only if the pool had branch
     summary["recall_floor_top"] = [[w, n] for w, n in floor.most_common(30)]
 except NameError:
     pass
-json.dump(summary, open("coraal_oracle_summary.json", "w"), indent=2)
+# Print the complete machine-readable result, but do not write it under /kaggle/working: Files
+# persistence must retain dependencies/models only, never derived inference or benchmark output.
 print(json.dumps(summary, indent=2))
 """),
 ]

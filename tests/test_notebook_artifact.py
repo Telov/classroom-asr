@@ -39,6 +39,13 @@ def test_persistent_launcher_fetches_an_immutable_payload_revision():
     assert "raise error" in source
 
 
+def test_payload_does_not_persist_derived_summary_or_inference_results():
+    source = _notebook_source()
+
+    assert "coraal_oracle_summary.json" not in source
+    assert "print(json.dumps(summary, indent=2))" in source
+
+
 def test_launcher_control_state_survives_payload_variable_collision():
     source, = _code_sources(LAUNCHER_NOTEBOOK)
     downloaded = {
