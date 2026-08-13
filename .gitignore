@@ -21,3 +21,6 @@ coraal/
 *.tar.gz
 *.safetensors
 *.bin
+
+# Private project design material (keep local; never publish)
+docs/design/RU_EN_Classroom_ASR_Design_Document.docx
