@@ -647,6 +647,34 @@ else:
     for w, n in floor.most_common(30):
         print(f"   {w!r:16} x{n:<4} [{cat(w)}]")
 """),
+    md("""## 11.6 Selection — deterministic ROVER fusion (the LLM selector's substrate)
+The oracle (0.073) is the *ceiling* if you always pick the right branch per word; the baseline
+(branch A, ~0.193) is one branch alone. A real system has no reference, so it aligns the
+branches to each other and votes. This is that layer: `rover.fuse` builds the per-word candidate
+graph (each slot = every branch's aligned candidate, `NULL` = drop) and majority-votes it — a
+strong no-LLM baseline that also settles the confident, agreeing spans (§12.5). The design's
+Qwen3.5-9B judge (§14) is a drop-in `chooser` that overrides only the *uncertain* slots; this
+number is what it has to beat, on the way from baseline down toward the oracle floor."""),
+    code(r"""
+from classroom_asr.rover import fuse, build_graph
+# every whole-recording WORD branch we actually produced (phone branches are IPA, excluded)
+_wb = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
+_wb = [h for h in _wb if h and any(h)]
+fused = [fuse([h[k] for h in _wb], norm=SCORE) for k in range(len(interviews))]
+fused_wer = wer_of(fused)
+# how many slots the LLM would even be asked about (disagreement), vs frozen-confident ones
+_disagree = _total = 0
+for k in range(len(interviews)):
+    for s in build_graph([SCORE.tokens(h[k]) for h in _wb if h[k]]):
+        _total += 1; _disagree += 0 if s.agreed else 1
+print(f"fused {len(_wb)} word branches")
+print(f"[FUSED (ROVER)  ] final WER={fused_wer:.3f}"
+      f"   vs baseline A={wer_of(hyp_A):.3f}  vs oracle floor={oracle_wer(pool):.3f}")
+print(f"headroom captured by deterministic vote: "
+      f"{100*(wer_of(hyp_A)-fused_wer)/max(wer_of(hyp_A)-oracle_wer(pool),1e-9):.0f}% of baseline->oracle gap")
+print(f"uncertain slots (what the LLM judge would see): {_disagree}/{_total} "
+      f"({100*_disagree/max(_total,1):.0f}%); the rest are frozen-confident (§12.5)")
+"""),
     md("""## 12. Timings + save summary
 Persistent per-stage wall-times (every stage `⏱`-printed as it finished; here they're
 collected into one table) and the WER/oracle summary."""),
@@ -665,6 +693,7 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",
            "branch_wer": res, "oracle_wer": round(oracle_wer(pool), 4),
            "baseline_wer": res.get("A_whisper"),
+           "fused_rover_wer": round(fused_wer, 4) if "fused_wer" in dir() else None,
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
 try:   # oracle-floor breakdown from §11.5 (defined only if the pool had branches)
     summary["oracle_floor_by_category"] = dict(bycat.most_common())
