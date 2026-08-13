@@ -215,13 +215,27 @@ SEL_VENV = os.path.join(SEL_WORK, "venv"); SEL_VENV_PY = os.path.join(SEL_VENV, 
 SEL_READY = os.path.join(SEL_WORK, ".venv_ready")
 SEL_ENV_SPEC = f"transformers=={SELECTOR_TRANSFORMERS}|accelerate=={SELECTOR_ACCELERATE}"
 _sel = {"thread": None, "err": None}
+def _sel_runtime_ok():
+    # A matching sentinel is insufficient if persistence restored a partial/corrupt environment.
+    # Import the exact load-bearing API before accepting the venv or marking it ready.
+    probe = (
+        "import accelerate, transformers; "
+        "from transformers import AutoModelForMultimodalLM, AutoProcessor; "
+        f"assert transformers.__version__ == '{SELECTOR_TRANSFORMERS}'; "
+        f"assert accelerate.__version__ == '{SELECTOR_ACCELERATE}'"
+    )
+    try:
+        return subprocess.run([SEL_VENV_PY, "-c", probe], capture_output=True, timeout=60).returncode == 0
+    except Exception:
+        return False
 def _sel_prewarm():
     try:
         try:
             _ready_spec = open(SEL_READY).read().strip()
         except OSError:
             _ready_spec = ""
-        if _reusable(SEL_READY, SEL_VENV_PY, SEL_VENV) and _ready_spec == SEL_ENV_SPEC:
+        if (_reusable(SEL_READY, SEL_VENV_PY, SEL_VENV)
+                and _ready_spec == SEL_ENV_SPEC and _sel_runtime_ok()):
             print("selector venv: reusing persisted build", flush=True); return
         if not _venv_ok(SEL_VENV_PY):
             subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", SEL_VENV],
@@ -229,6 +243,8 @@ def _sel_prewarm():
         subprocess.run([os.path.join(SEL_VENV, "bin", "pip"), "-q", "install", "-U",
                         f"transformers=={SELECTOR_TRANSFORMERS}",
                         f"accelerate=={SELECTOR_ACCELERATE}"], check=True)   # fp16, no bnb
+        if not _sel_runtime_ok():
+            raise RuntimeError(f"selector runtime smoke check failed: {SEL_ENV_SPEC}")
         with open(SEL_READY, "w") as f: f.write(SEL_ENV_SPEC)
     except Exception as e:
         _sel["err"] = e
