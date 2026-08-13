@@ -40,6 +40,10 @@
   to 0.181 and increased runtime. Keep the external silence-snapped Qwen windows at 30 seconds
   while retaining automatic language detection. Pursue context continuity through a separately
   validated long-form/stitching method rather than simply enlarging independent windows.
+- Evaluate Crisper Verbatimize as a shadow branch by pairing each session-temporary 30-second
+  Qwen audio window with Qwen's transcript for that exact window. Do not apply Verbatimize to a
+  whole interview: its documented input is at most 30 seconds. Score this conditioned output
+  separately from independent Crisper transcription before choosing either path.
 
 ## Document reading and project notes
 

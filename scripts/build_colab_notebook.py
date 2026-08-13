@@ -45,6 +45,7 @@ Branches (each a different architecture → complementary errors, §8):
 * **Z** Qwen3-ASR-1.7B (the design's real backbone)
 * **C** Voxtral Mini 3B (audio-LLM)
 * **CW** CrisperWhisper 2.0 — a **verbatim**-tuned Whisper (keeps um/uh/false starts)
+* **CWV** Crisper Verbatimize — Qwen content conditioned on each matching audio window
 * **VV** Voxtral, **verbatim-prompted** (instruct mode, told to keep disfluencies)
 * **phone** wav2vec2 phoneme CTC + PhoneticXEUS → timestamped **realized-IPA evidence** when
   the selector is enabled (currently paused during word-branch overlap analysis)
@@ -133,6 +134,7 @@ PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
 # Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
 CRISPER_VERSION      = "2.0.2"  # exact CT2 runtime validated by the notebook integration
+USE_CRISPER_VERBATIZE = USE_CRISPER and USE_QWEN3ASR  # Qwen content + acoustic disfluencies
 USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbatim
 # Conversation-LLM selector (§14): the design's judge over the candidate graph. Overrides only
 # the contested slots (confident spans frozen, §12.5), driving the final transcript from the
@@ -656,7 +658,7 @@ if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
         hyp_VV = _vox_pass("verbatim", "+VoxtralVerbatim"); add_branch("+VoxtralVerbatim", hyp_VV)
     _free_models(vmodels); vmodels = None; del vmodels
 """),
-    md("""## 9a. Branch CW — CrisperWhisper 2.0 (**verbatim** Whisper, isolated CT2)
+    md("""## 9a. Branch CW / CWV — CrisperWhisper, independent + Qwen-conditioned
 The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts the clean
 branches delete. Its fast **CT2 runtime uses a forked `ctranslate2`** that can't share
 site-packages with faster-whisper (branch A) — so CrisperWhisper runs in a
@@ -665,10 +667,16 @@ site-packages with faster-whisper (branch A) — so CrisperWhisper runs in a
 back in §2a, so this cell usually just joins it and transcribes. Branch A keeps stock CT2;
 the main kernel never imports the fork. **Both GPUs are used**: one pinned subprocess per GPU
 transcribes a disjoint slice of the interviews in parallel (whole files, so each keeps
-CrisperWhisper's native chunking and the output is identical). The worker prints which backend
-it got — `ct2 (fast)` or the `transformers (SLOW)` fallback — so a slow run is visible."""),
+CrisperWhisper's native chunking and the output is identical).
+
+The same loaded model also runs **Verbatimize** on each matching Qwen 30-second audio window.
+That path treats Qwen as the content transcript and asks Crisper to insert only acoustically
+supported fillers, repetitions, and repairs. Crisper documents Verbatimize for audio no longer
+than 30 seconds, so we deliberately use the exact Qwen window/audio pairs rather than a whole
+interview. Both outputs are scored independently. The worker prints which backend it got —
+`ct2 (fast)` or the `transformers (SLOW)` fallback — so a slow run is visible."""),
     code(r"""
-hyp_CW = None
+hyp_CW = hyp_CWV = None
 if USE_CRISPER:
     import os, sys, json, subprocess, threading, tempfile
     _cw_t0 = time.time()
@@ -683,7 +691,7 @@ if USE_CRISPER:
             raise _cw["err"]
         with open(WORKER, "w") as f:
             f.write(r'''
-import sys, os, json, warnings, logging, fcntl, hashlib
+import sys, os, json, warnings, logging, fcntl, hashlib, time
 from crisperwhisper import CrisperWhisperModel   # imports transformers -> its loggers now exist
 # The crisperwhisper package still calls from_pretrained with the old `torch_dtype=` kwarg;
 # that is inside the dependency, so it can't be fixed at our source. transformers emits it via
@@ -699,7 +707,9 @@ _flt = _DropTorchDtype()
 for _name in ("transformers", "transformers.modeling_utils"):
     logging.getLogger(_name).addFilter(_flt)
 size, cache_dir, inp, outp, init_lock = sys.argv[1:6]
-paths = json.load(open(inp))
+payload = json.load(open(inp))
+paths = payload["paths"]
+qwen_windows = payload.get("qwen_windows", {})
 
 def _official_model(name):
     return name if "/" in name else f"nyralabs/CrisperWhisper2.0_{name}"
@@ -736,13 +746,43 @@ try:
 except Exception as e:
     print("CW backend: transformers (SLOW) -- ct2 failed:", repr(e)[:200], flush=True)
     m = CrisperWhisperModel(size, backend="transformers")
-out = {}
+t0 = time.perf_counter(); independent = {}
 for p in paths:
     try:
-        r = m.transcribe(p, language="en"); out[p] = getattr(r, "text", "") or ""
+        r = m.transcribe(p, language="en"); independent[p] = getattr(r, "text", "") or ""
     except Exception as e:
-        out[p] = ""; print("fail", p, repr(e)[:120], file=sys.stderr)
-json.dump(out, open(outp, "w"))
+        independent[p] = ""; print("independent fail", p, repr(e)[:120], file=sys.stderr)
+independent_s = time.perf_counter() - t0
+
+# Verbatimize is explicitly a <=30 s API. Reuse the full recording once, slice it by the
+# silence-snapped Qwen timestamps, and pair every slice with exactly the Qwen text decoded from
+# that slice. Inputs and outputs live only in this session-temporary worker handoff.
+t0 = time.perf_counter(); verbatized = {}
+if qwen_windows:
+    from crisperwhisper.audio import load_audio
+    for p in paths:
+        rows = qwen_windows.get(p, [])
+        if not rows:
+            continue
+        audio = load_audio(p)
+        parts = []
+        for wi, row in enumerate(rows):
+            transcript = (row.get("text") or "").strip()
+            if not transcript:
+                parts.append(""); continue
+            start = max(0, int(round(float(row["start_s"]) * 16000)))
+            end = min(len(audio), int(round(float(row["end_s"]) * 16000)))
+            try:
+                r = m.verbatimize(audio[start:end], transcript, language="en", sr=16000)
+                parts.append(getattr(r, "text", "") or "")
+            except Exception as e:
+                parts.append("")
+                print("verbatize fail", p, wi, repr(e)[:120], file=sys.stderr)
+        verbatized[p] = parts
+verbatize_s = time.perf_counter() - t0
+json.dump({"independent": independent, "verbatized": verbatized,
+           "timings": {"independent_s": independent_s, "verbatize_s": verbatize_s}},
+          open(outp, "w"))
 ''')
         paths = [os.path.abspath(str(interviews[k][0])) for k in range(len(interviews))]
         # One worker per GPU, pinned via CUDA_VISIBLE_DEVICES, run in parallel so both GPUs
@@ -764,21 +804,30 @@ json.dump(out, open(outp, "w"))
         print("Crisper whole-file GPU plan:",
               [f"GPU{g}: {len(shards[i])} files, {shard_seconds[i]/60:.1f} min"
                for i, g in enumerate(gpus)], flush=True)
-        res = {}
+        res = {}; verb_res = {}; worker_timings = []
+        _qwen_parts = WINDOW_PARTS.get("A+B+Qwen3", [[] for _ in interviews])
+        qwen_windows_by_path = {
+            paths[k]: _qwen_parts[k] for k in range(len(paths))
+        } if USE_CRISPER_VERBATIZE and hyp_Z and any(hyp_Z) else {}
         init_lock = os.path.join(CW_RUN, "ct2_model_init.lock")
         def _cw_run(gi, gpu, shard):
             if not shard:
                 return
             try:
                 inp = os.path.join(CW_RUN, f"in_{gi}.json"); outp = os.path.join(CW_RUN, f"out_{gi}.json")
-                json.dump(shard, open(inp, "w"))
+                json.dump({"paths": shard,
+                           "qwen_windows": {p: qwen_windows_by_path.get(p, []) for p in shard}},
+                          open(inp, "w"))
                 env = dict(os.environ)
                 if gpu is not None:
                     env["CUDA_VISIBLE_DEVICES"] = str(gpu)  # each subprocess sees exactly one GPU
                 subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE, CW_CT2_CACHE,
                                 inp, outp, init_lock],
                                check=True, env=env)
-                res.update(json.load(open(outp)))           # disjoint keys per shard -> safe
+                worker_result = json.load(open(outp))
+                res.update(worker_result.get("independent", {}))
+                verb_res.update(worker_result.get("verbatized", {}))
+                worker_timings.append(worker_result.get("timings", {}))
             except Exception as e:                          # don't crash the thread; skip cleanly
                 print(f"CrisperWhisper GPU{gpu} worker failed: {repr(e)[:160]}", flush=True)
         _cw_ts = [threading.Thread(target=_cw_run, args=(gi, gpus[gi], shards[gi]))
@@ -787,10 +836,20 @@ json.dump(out, open(outp, "w"))
         for t in _cw_ts: t.join()
         from classroom_asr.backends.crisperwhisper_asr import CrisperWhisperV2
         hyp_CW = [CrisperWhisperV2._clean(res.get(p, "")) for p in paths]   # [um]->um, drop [laughter]
+        if qwen_windows_by_path:
+            hyp_CWV = [" ".join(
+                CrisperWhisperV2._clean(part) for part in verb_res.get(p, []) if part
+            ).strip() for p in paths]
+        if worker_timings:
+            print("Crisper worker phase maxima:",
+                  {key: round(max(float(t.get(key, 0.0)) for t in worker_timings), 1)
+                   for key in ("independent_s", "verbatize_s")}, flush=True)
     except Exception as e:
-        print("CrisperWhisper isolation failed:", repr(e)[:200]); hyp_CW = [""] * len(interviews)
+        print("CrisperWhisper isolation failed:", repr(e)[:200])
+        hyp_CW = hyp_CWV = [""] * len(interviews)
     rec("+CrisperWhisper", time.time() - _cw_t0)
     add_branch("+CrisperWhisper", hyp_CW)
+    if hyp_CWV and any(hyp_CWV): add_branch("+CrisperQwenVerbatize", hyp_CWV)
 """),
     md("""## 10. Phone branches — timestamped acoustic evidence for the LLM (paused with selector)
 The phone path is *pronunciation evidence*, not a word transcript. CORAAL has no phonetic
@@ -993,7 +1052,8 @@ _wb_named = [("Qwen3-ASR", globals().get("hyp_Z")),
              ("wav2vec2 CTC", globals().get("hyp_B")),
              ("Voxtral", globals().get("hyp_C")),
              ("VoxtralVerbatim", globals().get("hyp_VV")),
-             ("CrisperWhisper", globals().get("hyp_CW"))]
+             ("CrisperWhisper", globals().get("hyp_CW")),
+             ("CrisperQwenVerbatize", globals().get("hyp_CWV"))]
 _wb_named = [(name, h) for name, h in _wb_named if h and any(h)]
 if not _wb_named:
     raise RuntimeError("no word-recognition branch produced a candidate transcript")
@@ -1039,7 +1099,8 @@ _stage_for_branch = {"Qwen3-ASR": "A+B+Qwen3", "Whisper": "A whisper",
                      "WhisperLargeV3": "Whisper large-v3 quality",
                      "wav2vec2 CTC": "A+B", "Voxtral": "+Voxtral",
                      "VoxtralVerbatim": "+VoxtralVerbatim",
-                     "CrisperWhisper": "+CrisperWhisper"}
+                     "CrisperWhisper": "+CrisperWhisper",
+                     "CrisperQwenVerbatize": "+CrisperWhisper"}
 branch_overlap_ablation = []
 print("\n=== word-branch overlap: exact leave-one-out floor + graph-oracle effect ===")
 print("branch                 WER   unique  floor_without  oracle_without  oracle_delta  stage_s")
@@ -1480,7 +1541,8 @@ print(f"   {sum(dt for _, dt in TIMINGS):7.1f}s  TOTAL (sum of tracked stages)")
 res = {}
 for name, h in [("A_whisper_turbo", hyp_A), ("A3_whisper_large_v3", hyp_A3),
                 ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C),
-                ("VV_voxtral_verbatim", hyp_VV), ("CW_crisperwhisper", hyp_CW)]:
+                ("VV_voxtral_verbatim", hyp_VV), ("CW_crisperwhisper", hyp_CW),
+                ("CWV_crisper_qwen_verbatize", hyp_CWV)]:
     if h and any(h): res[name] = round(wer_of(h), 4)
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",

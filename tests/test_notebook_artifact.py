@@ -173,6 +173,18 @@ def test_completed_crisper_conversion_skips_source_prefetch_and_balances_whole_f
     assert "Crisper whole-file GPU plan:" in source
 
 
+def test_crisper_verbatize_pairs_qwen_text_with_the_same_temporary_audio_window():
+    source = _notebook_source()
+
+    assert "USE_CRISPER_VERBATIZE = USE_CRISPER and USE_QWEN3ASR" in source
+    assert "qwen_windows_by_path = {" in source
+    assert 'WINDOW_PARTS.get("A+B+Qwen3"' in source
+    assert "from crisperwhisper.audio import load_audio" in source
+    assert 'm.verbatimize(audio[start:end], transcript, language="en", sr=16000)' in source
+    assert '("CrisperQwenVerbatize", globals().get("hyp_CWV"))' in source
+    assert '"CWV_crisper_qwen_verbatize"' in source
+
+
 def test_silence_windows_are_cached_only_in_memory_for_the_current_run():
     source = _notebook_source()
 
