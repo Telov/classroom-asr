@@ -122,6 +122,11 @@ USE_PHONETIC_XEUS = True;  PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
 # Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
 USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbatim
+# Conversation-LLM selector (§14): the design's judge over the candidate graph. Overrides only
+# the contested slots (confident spans frozen, §12.5), driving the final transcript from the
+# branch baseline toward the oracle floor. Qwen3.5-9B = design's "default first judge" (§14.2);
+# runs isolated (own venv, newer transformers) in 4-bit. NEW/novel escape hatch off (§14.5).
+USE_LLM_SELECTOR = True;  SELECTOR_MODEL = "Qwen/Qwen3.5-9B"
 
 # Speed (all quality-neutral): the LLM branches auto-pick fp16 on T4 (Turing has no bf16
 # tensor cores — that was most of the slowness; fp16 is the same inference path Whisper
@@ -177,6 +182,30 @@ if USE_CRISPER:
     _cw["thread"] = threading.Thread(target=_cw_prewarm, daemon=True); _cw["thread"].start()
     print("CrisperWhisper venv prewarm: started")
 
+# (a2) Selector venv — Qwen3.5-9B needs a newer transformers than the 4.57.6 the main kernel pins
+# for qwen-asr, so the LLM judge runs in its OWN --system-site-packages venv (shadows
+# transformers/accelerate/bitsandbytes; reuses system torch + the installed classroom_asr).
+# Built in the background so it's ready when the acoustic branches finish (§11.7).
+SEL_WORK = os.path.join(os.environ.get("ASR_PERSIST", os.path.abspath(".")), "sel_iso")
+os.makedirs(SEL_WORK, exist_ok=True)
+SEL_VENV = os.path.join(SEL_WORK, "venv"); SEL_VENV_PY = os.path.join(SEL_VENV, "bin", "python")
+SEL_READY = os.path.join(SEL_WORK, ".venv_ready")
+_sel = {"thread": None, "err": None}
+def _sel_prewarm():
+    try:
+        if os.path.exists(SEL_READY) and os.path.exists(SEL_VENV_PY):
+            print("selector venv: reusing persisted build", flush=True); return
+        subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", SEL_VENV],
+                       check=True)
+        subprocess.run([os.path.join(SEL_VENV, "bin", "pip"), "-q", "install", "-U",
+                        "transformers", "accelerate", "bitsandbytes", "hf_transfer"], check=True)
+        open(SEL_READY, "w").close()
+    except Exception as e:
+        _sel["err"] = e
+if USE_LLM_SELECTOR:
+    _sel["thread"] = threading.Thread(target=_sel_prewarm, daemon=True); _sel["thread"].start()
+    print("selector venv prewarm: started")
+
 # (b) Prefetch model weights (hf_transfer-accelerated) so the heavy Voxtral/Qwen downloads
 # overlap earlier branches instead of blocking their cells. Best-effort; branches re-fetch
 # lazily if a prefetch fails.
@@ -188,6 +217,7 @@ def _prefetch():
     repos = [m for m, on in [
         (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM), (QWEN3ASR_MODEL, USE_QWEN3ASR),
         (f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}", USE_CRISPER),   # venv reads same HF cache
+        (SELECTOR_MODEL, USE_LLM_SELECTOR),                            # §14 LLM judge (big, prefetch early)
         (FW_MODEL, True), (CTC_MODEL, USE_CTC), (PHONE_MODEL, USE_PHONE)] if on]
     for r in repos:                                   # biggest first (Voxtral) for max overlap
         try: snapshot_download(r)
@@ -675,6 +705,67 @@ print(f"headroom captured by deterministic vote: "
 print(f"uncertain slots (what the LLM judge would see): {_disagree}/{_total} "
       f"({100*_disagree/max(_total,1):.0f}%); the rest are frozen-confident (§12.5)")
 """),
+    md("""## 11.7 Conversation-LLM selector (§14) — Qwen3.5-9B judge over the graph
+The design's judge (§14.2 "default first judge"). It sees only the **contested** slots (§11.6),
+each as its branch candidates + context, and picks the option that best fits — the confident
+spans are frozen (§12.5) and every slot it can't decide falls back to the ROVER vote, so the
+result is **never worse than the fusion**. `needs_novel_candidate`/NEW is off (§14.5). Runs in
+its own venv (Qwen3.5 needs newer transformers than the pinned 4.57.6) in 4-bit; acoustic models
+are already unloaded, so it has the GPU (§21 staging). This is the final transcript WER."""),
+    code(r"""
+if USE_LLM_SELECTOR:
+    import os, json, subprocess, time
+    _sel_t0 = time.time(); SEL_WORKER = os.path.join(SEL_WORK, "sel_worker.py")
+    llm_sel, sel_wer = fused, fused_wer          # default: fall back to the ROVER fusion
+    try:
+        if _sel.get("thread") is not None: _sel["thread"].join()   # wait for the venv build (§2a)
+        if _sel.get("err") is not None: raise _sel["err"]
+        with open(SEL_WORKER, "w") as f:
+            f.write('''
+import sys, json, torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from classroom_asr.selector import select_transcript
+from classroom_asr.normalize import Normalizer
+SCORE = Normalizer(fold_numbers=True, fold_spelling=True)
+model_id, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.load(open(inp))
+tok = AutoTokenizer.from_pretrained(model_id)
+if tok.pad_token_id is None: tok.pad_token = tok.eos_token
+bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=bnb, device_map="cuda:0").eval()
+def llm_fn(prompt):
+    msgs = [{"role": "user", "content": prompt}]
+    try:
+        ids = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, return_tensors="pt")
+    except TypeError:
+        ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
+    ids = ids.to(model.device)
+    with torch.inference_mode():
+        out = model.generate(ids, max_new_tokens=512, do_sample=False, pad_token_id=tok.pad_token_id)
+    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+selected = []
+for branches in data["branch_transcripts"]:
+    text, n = select_transcript([b for b in branches if b], llm_fn, norm=SCORE, batch_size=24)
+    selected.append(text)
+json.dump({"selected": selected}, open(outp, "w"))
+''')
+        _wb2 = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
+        _wb2 = [h for h in _wb2 if h and any(h)]
+        payload = {"branch_transcripts": [[h[k] for h in _wb2] for k in range(len(interviews))]}
+        json.dump(payload, open(os.path.join(SEL_WORK, "in.json"), "w"))
+        subprocess.run([SEL_VENV_PY, SEL_WORKER, SELECTOR_MODEL,
+                        os.path.join(SEL_WORK, "in.json"), os.path.join(SEL_WORK, "out.json")], check=True)
+        llm_sel = json.load(open(os.path.join(SEL_WORK, "out.json")))["selected"]
+        sel_wer = wer_of(llm_sel)
+        print(f"[LLM SELECTED   ] final WER={sel_wer:.3f}"
+              f"   vs fused(ROVER)={fused_wer:.3f}  vs baseline A={wer_of(hyp_A):.3f}"
+              f"  vs oracle floor={oracle_wer(pool):.3f}")
+        gap = wer_of(hyp_A) - oracle_wer(pool)
+        print(f"captured {100*(wer_of(hyp_A)-sel_wer)/max(gap,1e-9):.0f}% of the baseline->oracle headroom")
+    except Exception as e:
+        print("LLM selector failed -> keeping ROVER fusion:", repr(e)[:200])
+    rec("+LLMSelector", time.time() - _sel_t0)
+"""),
     md("""## 12. Timings + save summary
 Persistent per-stage wall-times (every stage `⏱`-printed as it finished; here they're
 collected into one table) and the WER/oracle summary."""),
@@ -694,6 +785,7 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
            "branch_wer": res, "oracle_wer": round(oracle_wer(pool), 4),
            "baseline_wer": res.get("A_whisper"),
            "fused_rover_wer": round(fused_wer, 4) if "fused_wer" in dir() else None,
+           "llm_selected_wer": round(sel_wer, 4) if "sel_wer" in dir() else None,
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
 try:   # oracle-floor breakdown from §11.5 (defined only if the pool had branches)
     summary["oracle_floor_by_category"] = dict(bycat.most_common())
