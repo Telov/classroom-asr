@@ -313,6 +313,20 @@ def test_whole_recording_candidate_graphs_use_cached_compiled_alignment():
     assert "opcodes_fn=lambda pivot, hyp: Levenshtein.opcodes(pivot, hyp).as_list()" in source
 
 
+def test_summary_identifies_run_and_reports_each_branch_error_shape():
+    source = _notebook_source()
+
+    assert "RUN_STARTED_EPOCH = _run_time.time()" in source
+    assert "def error_counts_of(hyps):" in source
+    assert '"substitutions": S, "deletions": D, "insertions": I' in source
+    assert '"interviews_with_text"' in source
+    assert '"source_git_ref": ASR_GIT_REF' in source
+    assert '"overall_wall_seconds"' in source
+    assert '"resolved_hf_revisions"' in source
+    assert '"branch_metrics": branch_metrics' in source
+    assert '"run_fingerprint": run_fingerprint' in source
+
+
 def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():
     source = _notebook_source()
 

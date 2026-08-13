@@ -61,7 +61,8 @@ numbers/ordinals/spelling but keeps fillers (verbatim, §18/§29).
 `!pip`, Kaggle would stop after this cell because the env changed, needing a second
 Run All). If it ever still stops here, just click Run All once more."""),
     code(f"""
-import os
+import os, time as _run_time
+RUN_STARTED_EPOCH = _run_time.time()          # includes installs, downloads, and every branch
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
 os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"     # current high-throughput Hub/Xet downloads
 ASR_GIT_REF = os.environ.get("CLASSROOM_ASR_GIT_REF", "main")
@@ -550,6 +551,23 @@ def wer_of(hyps):
     for rt, h in zip(_reftok, hyps):
         E += Levenshtein.distance(rt, SCORE.tokens(h or "")); R += len(rt)
     return E / R if R else 0.0
+
+def error_counts_of(hyps):
+    # RapidFuzz editops are one record per minimal edit, unlike opcodes whose records can span
+    # several words. Keep S/D/I alongside aggregate WER so a seemingly better branch cannot hide
+    # a deletion regression that matters to verbatim classroom transcription.
+    S = D = I = R = 0
+    for rt, h in zip(_reftok, hyps):
+        R += len(rt)
+        for tag, _src_pos, _dest_pos in Levenshtein.editops(
+                rt, SCORE.tokens(h or "")).as_list():
+            if tag == "replace": S += 1
+            elif tag == "delete": D += 1
+            elif tag == "insert": I += 1
+    E = S + D + I
+    return {"reference_words": R, "substitutions": S, "deletions": D, "insertions": I,
+            "errors": E, "wer": round(E / R if R else 0.0, 4),
+            "deletion_rate": round(D / R if R else 0.0, 4)}
 
 def recall_floor(pool):
     # Fraction of REFERENCE words that NO branch produced anywhere. This is a RECALL lower bound
@@ -1595,7 +1613,8 @@ Persistent per-stage wall-times (every stage `⏱`-printed as it finished; here 
 collected into one table) and the WER summary (branch WERs, recall floor, realizable oracle,
 Qwen backbone, and the canonical constrained-selector result when selection succeeds)."""),
     code(r"""
-import json
+import json, sys, importlib.metadata as _metadata
+from datetime import datetime, timezone
 # --- timing table (slowest first) ---
 print("=== wall-time by stage ===")
 for name, dt in sorted(TIMINGS, key=lambda x: -x[1]):
@@ -1603,14 +1622,74 @@ for name, dt in sorted(TIMINGS, key=lambda x: -x[1]):
 print(f"   {sum(dt for _, dt in TIMINGS):7.1f}s  TOTAL (sum of tracked stages)")
 
 res = {}
+branch_metrics = {}
 for name, h in [("A_whisper_turbo", hyp_A), ("A3_whisper_large_v3", hyp_A3),
                 ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C),
                 ("VV_voxtral_verbatim", hyp_VV), ("CW_crisperwhisper", hyp_CW),
                 ("CWV_crisper_qwen_verbatize", hyp_CWV)]:
-    if h and any(h): res[name] = round(wer_of(h), 4)
+    if h and any(h):
+        branch_metrics[name] = error_counts_of(h)
+        branch_metrics[name]["interviews_with_text"] = sum(bool(text) for text in h)
+        branch_metrics[name]["interviews_total"] = len(interviews)
+        res[name] = branch_metrics[name]["wer"]
+
+_package_names = ["classroom-asr", "torch", "transformers", "accelerate", "qwen-asr",
+                  "faster-whisper", "mistral-common", "huggingface-hub", "rapidfuzz"]
+_packages = {}
+for _package in _package_names:
+    try: _packages[_package] = _metadata.version(_package)
+    except _metadata.PackageNotFoundError: pass
+
+_model_ids = [FW_MODEL, FW_QUALITY_MODEL, CTC_MODEL, QWEN3ASR_MODEL, VOXTRAL_MODEL,
+              f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}", PHONE_MODEL,
+              PHONETIC_XEUS_MODEL, SELECTOR_MODEL]
+_resolved_hf_revisions = {}
+try:
+    from huggingface_hub import scan_cache_dir
+    for _repo in scan_cache_dir().repos:
+        if _repo.repo_id in _model_ids:
+            _resolved_hf_revisions[_repo.repo_id] = sorted(
+                revision.commit_hash for revision in _repo.revisions)
+except Exception as _cache_error:
+    _resolved_hf_revisions["_scan_error"] = type(_cache_error).__name__
+
+_completed_epoch = _run_time.time()
+run_fingerprint = {
+    "source_git_ref": ASR_GIT_REF,
+    "started_utc": datetime.fromtimestamp(RUN_STARTED_EPOCH, timezone.utc).isoformat(),
+    "completed_utc": datetime.fromtimestamp(_completed_epoch, timezone.utc).isoformat(),
+    "overall_wall_seconds": round(_completed_epoch - RUN_STARTED_EPOCH, 1),
+    "tracked_stage_seconds": round(sum(dt for _, dt in TIMINGS), 1),
+    "python": sys.version.split()[0],
+    "packages": _packages,
+    "hardware": {"gpu_count": torch.cuda.device_count(),
+                 "gpu_names": [torch.cuda.get_device_name(i)
+                               for i in range(torch.cuda.device_count())],
+                 "cuda": torch.version.cuda},
+    "models": {
+        "whisper_turbo": {"id": FW_MODEL, "vad": WHISPER_VAD},
+        "whisper_large_v3": {"id": FW_QUALITY_MODEL, "beam_size": 5,
+                             "compute_type": "float16", "vad": WHISPER_VAD},
+        "ctc": {"id": CTC_MODEL},
+        "qwen3_asr": {"id": QWEN3ASR_MODEL, "language": "auto",
+                      "window_seconds": QWEN_CHUNK_S,
+                      "max_new_tokens": QWEN_MAX_NEW_TOKENS},
+        "voxtral": {"id": VOXTRAL_MODEL, "language": "en",
+                    "window_seconds": VOXTRAL_CHUNK_S},
+        "crisper": {"id": f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}",
+                    "package_version": CRISPER_VERSION,
+                    "qwen_verbatize": USE_CRISPER_VERBATIZE},
+        "phone": {"wav2vec2": PHONE_MODEL, "phonetic_xeus": PHONETIC_XEUS_MODEL},
+        "selector": {"enabled": USE_LLM_SELECTOR, "id": SELECTOR_MODEL,
+                     "transformers": SELECTOR_TRANSFORMERS,
+                     "accelerate": SELECTOR_ACCELERATE},
+    },
+    "resolved_hf_revisions": _resolved_hf_revisions,
+}
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",
-           "branch_wer": res, "baseline_wer": res.get("A_whisper_turbo"),
+           "branch_wer": res, "branch_metrics": branch_metrics,
+           "baseline_wer": res.get("A_whisper_turbo"),
            # honest metrics: recall_floor = fraction of ref words no branch produced (a recall
            # LOWER BOUND, ignores insertions); realizable_oracle = best full-WER a selector over
            # the Qwen-anchored candidate graph could reach (a real transcript).
@@ -1633,6 +1712,7 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
                                    if "branch_pair_overlap" in dir() else None),
            "branch_subset_pareto": (branch_subset_pareto
                                      if "branch_subset_pareto" in dir() else None),
+           "run_fingerprint": run_fingerprint,
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
 try:   # recall-floor breakdown from §11.5 (defined only if the pool had branches)
     summary["recall_floor_by_category"] = dict(bycat.most_common())
