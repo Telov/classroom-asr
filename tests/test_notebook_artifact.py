@@ -232,11 +232,11 @@ def test_prefetch_excludes_unused_framework_weights_and_prioritizes_first_branch
     )
 
 
-def test_accuracy_shadow_uses_auto_language_longer_qwen_context_and_full_whisper():
+def test_accuracy_shadow_uses_auto_language_known_good_qwen_windows_and_full_whisper():
     source = _notebook_source()
 
-    assert 'QWEN_CHUNK_S = 90' in source
-    assert 'QWEN_MAX_NEW_TOKENS = 1024' in source
+    assert 'QWEN_CHUNK_S = 30' in source
+    assert 'QWEN_MAX_NEW_TOKENS = 512' in source
     assert 'VOXTRAL_CHUNK_S = 30' in source
     assert 'Qwen3ASR(\n                            QWEN3ASR_MODEL, language=None' in source
     assert 'max_new_tokens=QWEN_MAX_NEW_TOKENS' in source
@@ -267,9 +267,12 @@ def test_overlap_mode_skips_selector_and_its_now_unused_phone_branches():
 def test_word_branch_overlap_ablation_is_reported_without_rerunning_asr():
     source = _notebook_source()
 
-    assert "=== word-branch overlap: exact leave-one-out recall-floor effect ===" in source
+    assert "=== word-branch overlap: exact leave-one-out floor + graph-oracle effect ===" in source
     assert '"unique_reference_hits": len(_unique)' in source
     assert '"recall_floor_increase_if_removed"' in source
+    assert '"realizable_oracle_without"' in source
+    assert '"realizable_oracle_increase_if_removed"' in source
+    assert "_oracle_without = realizable_oracle_wer(_other_branches)" in source
     assert '"branch_overlap_ablation"' in source
     assert "=== pairwise overlap of correctly recovered reference occurrences ===" in source
     assert '"smaller_hit_set_covered_fraction"' in source

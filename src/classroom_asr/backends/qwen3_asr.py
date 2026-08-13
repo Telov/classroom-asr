@@ -29,7 +29,7 @@ class Qwen3ASR(AcousticModel):
         device: str | None = None,
         dtype=None,
         max_inference_batch_size: int = 16,
-        max_new_tokens: int = 1024,
+        max_new_tokens: int = 512,
     ) -> None:
         import torch  # lazy
         from qwen_asr import Qwen3ASRModel

@@ -36,6 +36,10 @@
   benchmark demonstrates otherwise.
 - In the CORAAL Voxtral verbatim prompt, describe the material as predominantly African American
   English while explicitly forbidding identity-based guessing or dialect normalization.
+- A 90-second Qwen window with a 1024-token budget regressed English CORAAL WER from about 0.157
+  to 0.181 and increased runtime. Keep the external silence-snapped Qwen windows at 30 seconds
+  while retaining automatic language detection. Pursue context continuity through a separately
+  validated long-form/stitching method rather than simply enlarging independent windows.
 
 ## Document reading and project notes
 

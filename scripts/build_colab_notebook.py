@@ -148,12 +148,12 @@ SELECTOR_TRANSFORMERS = "5.15.0"; SELECTOR_ACCELERATE = "1.14.0"
 # uses, no quality cost). Windows are batched. Voxtral's two passes share ONE 9.5 GB load.
 # Defaults keep full quality: CrisperWhisper "large", BOTH Voxtral passes on.
 
-# Qwen supports long audio, so give it substantially more conversational context than the old
-# shared 30 s windows while retaining silence-snapped boundaries. Its official evaluation uses a
-# 1024-token output budget. Voxtral keeps 30 s windows because it has a different memory profile
-# and its two modes already share those windows.
-QWEN_CHUNK_S = 90
-QWEN_MAX_NEW_TOKENS = 1024
+# The 90 s Qwen shadow regressed WER 0.157 -> 0.181 and ran slower. Restore the known-good
+# silence-snapped 30 s windows and isolate automatic language detection as the only Qwen decode
+# change in the next run. Larger-context continuity needs a boundary-aware method, not merely a
+# larger independent request. 512 tokens is ample for a 30 s verbatim window.
+QWEN_CHUNK_S = 30
+QWEN_MAX_NEW_TOKENS = 512
 VOXTRAL_CHUNK_S = 30
 
 BASE = f"http://lingtools.uoregon.edu/coraal/{COMPONENT}/{VERSION}"
@@ -1017,11 +1017,12 @@ print(f"[BACKBONE       ] {backbone_name} WER={canonical_wer:.3f}"
 print(f"selector decisions: {_decisions}/{_total} aligned slots "
       f"({100*_decisions/max(_total,1):.1f}%); every unselected slot keeps the backbone token")
 
-# Cheap, exact leave-one-branch-out analysis for the candidate recall floor. Each branch is
+# Exact leave-one-branch-out analysis for both the candidate recall floor and the realizable
+# Qwen-anchored oracle. Each branch is
 # aligned to the reference once with RapidFuzz; a reference occurrence is "unique" when this is
 # the only word branch that recovered it. Removing that branch raises the recall floor by exactly
-# unique/R. This screens for overlap without rerunning ASR or rebuilding the expensive graph six
-# times. It does NOT prove equal realizable-oracle WER, so branch removal still waits for evidence.
+# unique/R. We also rebuild the inexpensive text candidate graph without each branch and score its
+# exact realizable oracle, so a low unique count cannot hide useful candidate placement.
 _R = sum(len(rt) for rt in _reftok)
 _branch_hits = []
 for _name, _hyps in _wb_named:
@@ -1040,23 +1041,28 @@ _stage_for_branch = {"Qwen3-ASR": "A+B+Qwen3", "Whisper": "A whisper",
                      "VoxtralVerbatim": "+VoxtralVerbatim",
                      "CrisperWhisper": "+CrisperWhisper"}
 branch_overlap_ablation = []
-print("\n=== word-branch overlap: exact leave-one-out recall-floor effect ===")
-print("branch                 WER   ref_hits  unique  overlap  floor_without  stage_s")
+print("\n=== word-branch overlap: exact leave-one-out floor + graph-oracle effect ===")
+print("branch                 WER   unique  floor_without  oracle_without  oracle_delta  stage_s")
 for _bi, ((_name, _hyps), _hits) in enumerate(zip(_wb_named, _branch_hits)):
     _other_hits = set().union(*(_branch_hits[:_bi] + _branch_hits[_bi + 1:]))
     _unique = _hits - _other_hits
     _overlap = len(_hits & _other_hits) / max(len(_hits), 1)
     _floor_without = (_R - len(_other_hits)) / max(_R, 1)
+    _other_branches = _wb[:_bi] + _wb[_bi + 1:]
+    _oracle_without = realizable_oracle_wer(_other_branches)
+    _oracle_delta = _oracle_without - r_oracle
     _stage_s = _timing_by_name.get(_stage_for_branch.get(_name, ""))
     _row = {"branch": _name, "wer": round(wer_of(_hyps), 4),
             "reference_hits": len(_hits), "unique_reference_hits": len(_unique),
             "hit_overlap_fraction": round(_overlap, 4),
             "recall_floor_without": round(_floor_without, 4),
             "recall_floor_increase_if_removed": round(len(_unique) / max(_R, 1), 4),
+            "realizable_oracle_without": round(_oracle_without, 4),
+            "realizable_oracle_increase_if_removed": round(_oracle_delta, 4),
             "stage_seconds": round(_stage_s, 1) if _stage_s is not None else None}
     branch_overlap_ablation.append(_row)
-    print(f"{_name:22s} {_row['wer']:.3f} {len(_hits):9d} {len(_unique):7d} "
-          f"{100*_overlap:7.1f}% {_floor_without:14.3f} "
+    print(f"{_name:22s} {_row['wer']:.3f} {len(_unique):7d} "
+          f"{_floor_without:14.3f} {_oracle_without:15.3f} {_oracle_delta:+12.3f} "
           f"{_stage_s if _stage_s is not None else float('nan'):8.1f}")
 print(f"full-pool recall floor: {(_R-len(_all_hits))/max(_R,1):.3f}")
 branch_pair_overlap = []
@@ -1473,7 +1479,8 @@ print(f"   {sum(dt for _, dt in TIMINGS):7.1f}s  TOTAL (sum of tracked stages)")
 
 res = {}
 for name, h in [("A_whisper_turbo", hyp_A), ("A3_whisper_large_v3", hyp_A3),
-                ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C)]:
+                ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C),
+                ("VV_voxtral_verbatim", hyp_VV), ("CW_crisperwhisper", hyp_CW)]:
     if h and any(h): res[name] = round(wer_of(h), 4)
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",
