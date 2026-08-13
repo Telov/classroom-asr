@@ -65,7 +65,7 @@ python -m pip install -e .            # core only, no ML deps
 python scripts/run_demo.py            # run the stub pipeline end-to-end
 python -m classroom_asr demo          # same, via the installed package
 python -m classroom_asr demo --json   # machine-readable output
-python -m pytest                      # run the test suite
+python -m pytest                      # run the test suite (40 tests)
 ```
 
 (The `classroom-asr` console script is also installed; it needs your Python
@@ -87,32 +87,13 @@ architecture that fails differently — so the A→A+B headroom measures genuine
 complementary evidence, not just beam diversity (the multi-encoder bet, §8).
 
 Runs on **Colab or Kaggle** (Kaggle 2×T4 recommended — the notebook shards across
-all GPUs). It installs the package from GitHub; regenerate it with
-`python scripts/build_colab_notebook.py`. Branches: Whisper turbo (A, 1-best),
-wav2vec2 CTC (B), **Qwen3-ASR-1.7B (Z,
+all GPUs). The wheel is **embedded in the notebook** (base64), so there is no upload
+step; regenerate with `python scripts/build_colab_notebook.py` after rebuilding the
+wheel. Branches: Whisper turbo (A, 1-best), wav2vec2 CTC (B), **Qwen3-ASR-1.7B (Z,
 the design's real backbone)**, Voxtral Mini (C, subset), and a wav2vec2 phoneme path.
 Includes an **error-analysis** section (S/D/I, most-deleted words, worst utterances).
 CORAAL is spontaneous **English**, so read the baseline→oracle *gap*, not absolute
 WER (§1.3, §18).
-
-### Quota-friendly Kaggle iteration
-
-A full acoustic run writes `selector_iteration_bundle.json` before starting the LLM
-judge. Preserve that small file with Kaggle Files persistence, download it, or attach
-it as a private dataset on the next run. The same notebook auto-detects it and then:
-
-1. installs only the selector/scoring dependencies;
-2. skips CORAAL download and every acoustic model;
-3. reconstructs ROVER and oracle metrics from the saved hypotheses; and
-4. runs the full Qwen3.5-9B selector.
-
-By default, the expensive acoustic session runs only a one-batch Qwen3.5-0.8B smoke
-test. This validates model loading, prompt formatting, generation, parsing, and output
-plumbing without spending the full judge budget. Set
-`RUN_FULL_SELECTOR_DURING_ACOUSTIC_RUN=True` for a one-session acoustics + 9B run, or
-`FORCE_FULL_RUN=True` to ignore an attached/preserved bundle. Phone/IPA diagnostics are
-off by default because CORAAL cannot score them and they do not feed the word selector;
-enable `RUN_PHONE_DIAGNOSTICS` only for a dedicated pronunciation-path run.
 
 ## Non-goals (§2)
 
