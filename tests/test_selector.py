@@ -1,7 +1,8 @@
 from classroom_asr.normalize import Normalizer
 from classroom_asr.rover import build_graph, NULL
 from classroom_asr.selector import (
-    build_decisions, format_batch, parse_batch, generated_token_ids, assemble, select_transcript,
+    build_decisions, format_batch, format_choice_prompt, parse_batch, generated_token_ids,
+    assemble, select_transcript, select_transcript_with_chooser,
 )
 
 N = Normalizer()
@@ -32,6 +33,14 @@ def test_prompt_and_parse_roundtrip():
     letter_for = {tok: L for L, tok in decs[0].options}
     choices = parse_batch(f"1:{letter_for['there']}", decs)
     assert choices == {decs[0].slot: "there"}
+
+
+def test_choice_prompt_ends_at_the_single_candidate_id_position():
+    decision = build_decisions(_graph("their house", "there house", "they're house"))[0]
+    prompt = format_choice_prompt(decision)
+
+    assert "A=their" in prompt and "[?]" in prompt
+    assert prompt.endswith("Candidate ID:")
 
 
 def test_prompt_includes_deduplicated_acoustic_evidence():
@@ -96,6 +105,25 @@ def test_bad_llm_output_falls_back_to_rover():
     out2, n2, nc2 = select_transcript(["a b c", "a x c", "a y c"], judge, norm=N)
     assert out2.split()[0] == "a" and out2.split()[-1] == "c"
     assert nc2 >= 1                                      # the working judge decided the contested slot
+
+
+def test_constrained_chooser_accepts_only_advertised_candidates():
+    transcripts = ["their house", "there house", "they're house"]
+
+    def choose_there(batch):
+        decision = batch[0]
+        return {decision.slot: "there", 999: "invented"}
+
+    out, n, chosen = select_transcript_with_chooser(transcripts, choose_there, norm=N)
+    assert out == "there house"
+    assert n == chosen == 1
+
+    def invent_word(batch):
+        return {batch[0].slot: "definitely-not-a-candidate"}
+
+    default, n2, chosen2 = select_transcript_with_chooser(transcripts, invent_word, norm=N)
+    assert default == "their house"
+    assert n2 == 1 and chosen2 == 0
 
 
 def test_drop_candidate_is_offered_when_branches_delete():

@@ -946,10 +946,16 @@ text anchor and deduplicated per prompt batch. CORAAL's single mixed-speaker rec
 provide the production system's separate teacher/student channels, so role, overlap, lesson
 vocabulary, phonetic RAG, and robust P2G are still absent here.
 
-The judge picks only among branch candidate IDs (`needs_novel_candidate`/NEW off, §14.5); a slot
-it fails to parse falls back to ROVER. A parseable-but-wrong pick can raise WER, so this is measured
-against fusion, not assumed to beat it. It runs in its own venv at full fp16 across both freed T4s
-(§21). This is the final transcript WER."""),
+The judge picks only among branch candidate IDs (`needs_novel_candidate`/NEW off, §14.5). Instead
+of generating prose and parsing `N:LETTER`, Qwen3.5 directly scores only the valid next-token
+candidate IDs for each span, batched across decisions. This is both structurally constrained and
+avoids hundreds of generated answer tokens. It runs in its own venv at full fp16 across both freed
+T4s (§21).
+
+**Shadow gate:** this first restricted-scoring run is diagnostic. ROVER remains the canonical
+transcript regardless of the shadow WER; promotion requires measured non-regression. The same
+forward-pass scores are also reassembled at several non-default logit-margin thresholds, giving a
+promotion curve without extra model inference or any reference-guided canonical choice."""),
     code(r"""
 if USE_LLM_SELECTOR:
     import os, json, subprocess, tempfile, time
@@ -958,7 +964,7 @@ if USE_LLM_SELECTOR:
     # source, and selected output are derived per run and live in the ephemeral session temp dir.
     SEL_RUN = tempfile.mkdtemp(prefix="classroom_asr_selector_")
     SEL_WORKER = os.path.join(SEL_RUN, "sel_worker.py")
-    llm_sel, sel_wer = fused, fused_wer          # default: fall back to the ROVER fusion
+    shadow_sel = None; shadow_wer = None; shadow_stats = None; shadow_threshold_wer = None
     try:
         if _sel.get("thread") is not None: _sel["thread"].join()   # wait for the venv build (§2a)
         if _sel.get("err") is not None: raise _sel["err"]
@@ -966,84 +972,17 @@ if USE_LLM_SELECTOR:
             # Raw literal: the embedded worker contains regexes and ``\n`` string escapes that
             # must reach its source unchanged instead of being decoded by this notebook cell.
             f.write(r'''
-import sys, json, re, torch, transformers
+import sys, json, math, torch, transformers
 from rapidfuzz.distance import Levenshtein
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 import classroom_asr.selector as selector_module
-from classroom_asr.selector import select_transcript
+from classroom_asr.selector import (
+    build_decisions, format_choice_prompt, select_transcript_with_chooser,
+)
 from classroom_asr.normalize import Normalizer
 SCORE = Normalizer(fold_numbers=True, fold_spelling=True)
 model_id, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 data = json.load(open(inp))
-
-# Keep this generated worker compatible with the classroom_asr revision installed from GitHub.
-# A copied notebook can be newer than origin/main, so its worker must not import newly-added
-# helpers from the package. Patch the module global used by select_transcript with the tolerant
-# parser locally; once origin contains the same implementation this remains harmless.
-_ANSWER = re.compile(
-    r"^\s*(?:[-*]\s*)?(\d+)\s*(?:[:.)=]|->)\s*"
-    r"(?:option\s+)?([A-Za-z])\b", re.IGNORECASE | re.MULTILINE)
-def parse_batch_compat(text, decisions):
-    raw = text or ""; answers = []
-    try: payload = json.loads(raw.strip())
-    except (TypeError, ValueError, json.JSONDecodeError): payload = None
-    if isinstance(payload, dict):
-        answers.extend(payload.items())
-    elif isinstance(payload, list):
-        for item in payload:
-            if isinstance(item, dict):
-                answers.append((item.get("item", item.get("number", item.get("n"))),
-                                item.get("answer", item.get("choice", item.get("letter")))))
-    answers.extend((m.group(1), m.group(2)) for m in _ANSWER.finditer(raw))
-    choices = {}
-    for number, answer in answers:
-        try: n = int(number)
-        except (TypeError, ValueError): continue
-        if 1 <= n <= len(decisions):
-            decision = decisions[n - 1]; options = dict(decision.options)
-            match = re.search(r"\b([A-Za-z])\b", str(answer or ""))
-            if match and match.group(1).upper() in options:
-                choices[decision.slot] = options[match.group(1).upper()]
-    return choices
-selector_module.parse_batch = parse_batch_compat
-
-# The installed GitHub package can predate evidence-aware Decision fields, so keep the worker
-# self-contained: attach retrieved phone evidence to the old mutable Decision objects and patch
-# the formatter used by select_transcript. Identical blocks are printed once per batch.
-_BASE_BUILD_DECISIONS = selector_module.build_decisions
-_CURRENT_EVIDENCE = {}
-def build_decisions_evidence(graph, context=8, **_kwargs):
-    decisions = _BASE_BUILD_DECISIONS(graph, context=context)
-    for decision in decisions:
-        decision.evidence = list(_CURRENT_EVIDENCE.get(decision.slot, ()))
-    return decisions
-def _opt_text(tok):
-    return "∅(drop)" if tok is None else str(tok)
-def format_batch_evidence(decisions):
-    lines = [
-        "You are a transcription judge. For each item, choose the evidence-supported VERBATIM",
-        "word from the listed options. Keep fillers, repetitions, false starts, learner errors,",
-        "and quiet words when supported. ∅(drop) means no word was spoken. Retrieved phone evidence",
-        "covers the same short audio region and may contain neighboring words; use it to compare",
-        "the options, never to invent text. Answer each item as N:LETTER and nothing else.", ""]
-    labels = {}
-    for decision in decisions:
-        key = tuple(getattr(decision, "evidence", ()))
-        if key and key not in labels: labels[key] = f"E{len(labels) + 1}"
-    for n, decision in enumerate(decisions, 1):
-        context = " ".join([*decision.before, "[?]", *decision.after]).strip()
-        options = "  ".join(f"{letter}={_opt_text(tok)}" for letter, tok in decision.options)
-        lines += [f"{n}. context: ...{context}...", f"   options: {options}"]
-        key = tuple(getattr(decision, "evidence", ()))
-        if key: lines.append(f"   acoustic evidence: {labels[key]}")
-    if labels:
-        lines += ["", "Retrieved acoustic evidence blocks:"]
-        for evidence, label in labels.items():
-            lines.append(f"{label}:")
-            lines.extend(f"  {item}" for item in evidence)
-    return "\n".join([*lines, "", "Answers:"])
-selector_module.build_decisions = build_decisions_evidence
-selector_module.format_batch = format_batch_evidence
 
 def _evidence_by_slot(branches, anchor_chunks, phone_chunks):
     # Map ROVER slots to timestamped phone windows through a fast text-anchor alignment.
@@ -1070,7 +1009,7 @@ def _evidence_by_slot(branches, anchor_chunks, phone_chunks):
             for pi in range(i0, i1): pivot_to_anchor[pi] = nearest
 
     evidence = {}
-    for decision in _BASE_BUILD_DECISIONS(graph):
+    for decision in build_decisions(graph):
         slot = graph[decision.slot]
         pi = ((decision.slot - 1) // 2 if slot.kind == "word" else
               min(decision.slot // 2, len(pivot) - 1))
@@ -1090,15 +1029,11 @@ def _evidence_by_slot(branches, anchor_chunks, phone_chunks):
         if lines: evidence[decision.slot] = lines
     return evidence, graph
 
-def generated_token_ids_compat(generated_ids, input_ids):
-    generated = generated_ids.tolist() if hasattr(generated_ids, "tolist") else generated_ids
-    prompt = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
-    if generated and isinstance(generated[0], (list, tuple)): generated = generated[0]
-    if prompt and isinstance(prompt[0], (list, tuple)): prompt = prompt[0]
-    generated, prompt = list(generated or []), list(prompt or [])
-    return generated[len(prompt):] if generated[:len(prompt)] == prompt else generated
-
 processor = AutoProcessor.from_pretrained(model_id)
+tokenizer = processor.tokenizer
+tokenizer.padding_side = "left"                 # final position is the answer position for all rows
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token = tokenizer.eos_token
 # Full fp16, sharded across BOTH T4s (acoustic models are unloaded -> 32 GB free; 9B fp16 ~18 GB).
 # No quantization: the design wants the judge validated at full precision first (§21). fp16 (not
 # bf16) because T4/Turing has fp16 tensor cores but no bf16 path.
@@ -1109,41 +1044,122 @@ except TypeError:
     model = AutoModelForMultimodalLM.from_pretrained(
         model_id, torch_dtype=torch.float16, device_map="auto").eval()
 _dev = next(model.parameters()).device            # feed inputs to the shard holding the embeddings
-_dbg = {"n": 0}
 print(f"selector runtime: transformers={transformers.__version__} model={type(model).__name__}",
       file=sys.stderr)
 print(f"selector package: {selector_module.__file__}", file=sys.stderr)
-def llm_fn(prompt):
-    # Follow Qwen3.5's official AutoProcessor + multimodal-model interface even for text-only
-    # input. Hard-disable thinking in the chat template so it cannot consume the answer budget.
-    msgs = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+
+# Candidate IDs are deliberately single ASCII letters. Derive their IDs after the exact rendered
+# assistant header rather than assuming standalone tokenization matches the causal answer position.
+_letter_token = {}
+_token_probe_messages = [{"role": "user", "content": [
+    {"type": "text", "text": "Answer with one candidate letter.\nCandidate ID:"}]}]
+_token_probe_text = processor.apply_chat_template(
+    _token_probe_messages, add_generation_prompt=True, enable_thinking=False, tokenize=False)
+_token_probe_prefix = tokenizer.encode(_token_probe_text, add_special_tokens=False)
+for _letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    _with_answer = tokenizer.encode(_token_probe_text + _letter, add_special_tokens=False)
+    if (_with_answer[:len(_token_probe_prefix)] != _token_probe_prefix
+            or len(_with_answer) != len(_token_probe_prefix) + 1):
+        raise RuntimeError(f"selector candidate ID {_letter!r} is not one contextual token: "
+                           f"prefix={_token_probe_prefix[-4:]} answer={_with_answer[-5:]}")
+    _letter_token[_letter] = _with_answer[-1]
+
+_stats = {"forward_batches": 0, "oom_splits": 0, "overrides": 0,
+          "evidenced_overrides": 0, "margins": []}
+_decision_scores = {}
+_debugged = False
+
+def _score_once(decisions):
+    # One decision per conversation makes the next assistant token exactly the constrained
+    # candidate ID. Batch those conversations for throughput; no transcript tokens are generated.
+    conversations = [[{"role": "user", "content": [
+        {"type": "text", "text": format_choice_prompt(decision)}]}]
+        for decision in decisions]
     inputs = processor.apply_chat_template(
-        msgs, add_generation_prompt=True, enable_thinking=False, tokenize=True,
-        return_dict=True, return_tensors="pt").to(_dev)
+        conversations, add_generation_prompt=True, enable_thinking=False, tokenize=True,
+        processor_kwargs={"padding": True}, return_dict=True, return_tensors="pt").to(_dev)
     with torch.inference_mode():
-        out = model.generate(**inputs, max_new_tokens=512, do_sample=False)
-    completion = generated_token_ids_compat(out, inputs["input_ids"])
-    resp = processor.decode(completion, skip_special_tokens=True)
-    if _dbg["n"] < 1:                              # surface the first raw exchange so we can see
-        _dbg["n"] += 1                             # the real output format and fix parsing if needed
-        print("=== SAMPLE SELECTOR PROMPT (head) ===", file=sys.stderr)
-        print(prompt[:700], file=sys.stderr)
-        print("=== SAMPLE SELECTOR RESPONSE ===", file=sys.stderr)
-        print(f"generated_tokens={len(completion)} response={resp[:1500]!r}", file=sys.stderr)
-    return resp
-selected = []; tot_dec = tot_chosen = tot_evidenced = 0
+        # Qwen3.5's Transformers 5.15 forward API supports logits_to_keep. Keeping one position
+        # avoids materializing [batch, full_prompt, vocabulary] logits merely to score A/B/C.
+        logits = model(**inputs, logits_to_keep=1, use_cache=False).logits[:, -1, :].float()
+    _stats["forward_batches"] += 1
+    choices = {}
+    global _debugged
+    for row, decision in enumerate(decisions):
+        scored = [(letter, token, float(logits[row, _letter_token[letter]].item()))
+                  for letter, token in decision.options]
+        scored.sort(key=lambda item: item[2], reverse=True)
+        best_letter, best_token, best_score = scored[0]
+        margin = best_score - scored[1][2] if len(scored) > 1 else math.inf
+        _stats["margins"].append(margin)
+        if best_token != decision.default:
+            _stats["overrides"] += 1
+            if decision.evidence:
+                _stats["evidenced_overrides"] += 1
+        _decision_scores[decision.slot] = (best_token, margin)
+        choices[decision.slot] = best_token
+        if not _debugged:
+            _debugged = True
+            print("=== SAMPLE CONSTRAINED SELECTOR PROMPT (head) ===", file=sys.stderr)
+            print(format_choice_prompt(decision)[:1200], file=sys.stderr)
+            print("=== SAMPLE RESTRICTED CANDIDATE SCORES ===", file=sys.stderr)
+            print([(letter, str(token), round(score, 4)) for letter, token, score in scored],
+                  f"chosen={best_letter} margin={margin:.4f}", file=sys.stderr)
+    return choices
+
+def score_choices(decisions):
+    try:
+        return _score_once(decisions)
+    except RuntimeError as exc:
+        if "out of memory" not in str(exc).lower() or len(decisions) <= 1:
+            raise
+        _stats["oom_splits"] += 1
+        torch.cuda.empty_cache()
+        middle = len(decisions) // 2
+        return {**score_choices(decisions[:middle]), **score_choices(decisions[middle:])}
+
+thresholds = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0]
+selected = []; threshold_selected = {f"{threshold:g}": [] for threshold in thresholds}
+tot_dec = tot_chosen = tot_evidenced = 0
 for branches, anchor_chunks, phone_chunks in zip(
         data["branch_transcripts"], data["anchor_chunks"], data["phone_evidence"]):
     active = [b for b in branches if b]
     evidence, _graph = _evidence_by_slot(active, anchor_chunks, phone_chunks)
-    _CURRENT_EVIDENCE.clear(); _CURRENT_EVIDENCE.update(evidence)
-    text, nd, nc = select_transcript([b for b in branches if b], llm_fn, norm=SCORE, batch_size=24)
+    _decision_scores.clear()
+    text, nd, nc = select_transcript_with_chooser(
+        active, score_choices, norm=SCORE, batch_size=24, evidence_by_slot=evidence)
     selected.append(text); tot_dec += nd; tot_chosen += nc; tot_evidenced += len(evidence)
-print(f"selector decided {tot_chosen}/{tot_dec} contested slots; "
-      f"phone evidence attached to {tot_evidenced}/{tot_dec}", file=sys.stderr)
-if tot_dec and not tot_chosen:
-    raise RuntimeError("selector parsed zero answers; inspect SAMPLE SELECTOR RESPONSE above")
-json.dump({"selected": selected}, open(outp, "w"))
+    # Reassemble margin-gated shadow variants without another model forward pass. This produces a
+    # promotion curve from the same scores; references are used only later for benchmark reporting.
+    for threshold in thresholds:
+        def gated_choices(batch, _threshold=threshold):
+            return {decision.slot: (
+                _decision_scores[decision.slot][0]
+                if decision.slot in _decision_scores
+                and _decision_scores[decision.slot][1] >= _threshold
+                else decision.default)
+                for decision in batch}
+        gated_text, _n, _chosen = select_transcript_with_chooser(
+            active, gated_choices, norm=SCORE, batch_size=256, evidence_by_slot=evidence)
+        threshold_selected[f"{threshold:g}"].append(gated_text)
+finite_margins = [m for m in _stats["margins"] if math.isfinite(m)]
+sorted_margins = sorted(finite_margins)
+def _quantile(values, fraction):
+    return values[min(len(values) - 1, int(fraction * (len(values) - 1)))] if values else None
+stats = {"decisions": tot_dec, "scored": tot_chosen, "evidenced": tot_evidenced,
+         "overrides": _stats["overrides"], "forward_batches": _stats["forward_batches"],
+         "evidenced_overrides": _stats["evidenced_overrides"],
+         "oom_splits": _stats["oom_splits"],
+         "mean_logit_margin": (sum(finite_margins) / len(finite_margins)
+                               if finite_margins else None),
+         "p10_logit_margin": _quantile(sorted_margins, 0.10),
+         "median_logit_margin": _quantile(sorted_margins, 0.50)}
+print(f"selector restricted-scored {tot_chosen}/{tot_dec} contested slots; "
+      f"overrode ROVER in {_stats['overrides']}; phone evidence attached to "
+      f"{tot_evidenced}/{tot_dec}; forward batches={_stats['forward_batches']} "
+      f"OOM splits={_stats['oom_splits']}", file=sys.stderr)
+json.dump({"selected": selected, "threshold_selected": threshold_selected, "stats": stats},
+          open(outp, "w"))
 ''')
         _wb2 = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
         _wb2 = [h for h in _wb2 if h and any(h)]
@@ -1163,22 +1179,31 @@ json.dump({"selected": selected}, open(outp, "w"))
         json.dump(_selector_input, open(os.path.join(SEL_RUN, "in.json"), "w"))
         subprocess.run([SEL_VENV_PY, SEL_WORKER, SELECTOR_MODEL,
                         os.path.join(SEL_RUN, "in.json"), os.path.join(SEL_RUN, "out.json")], check=True)
-        llm_sel = json.load(open(os.path.join(SEL_RUN, "out.json")))["selected"]
-        sel_wer = wer_of(llm_sel)
-        print(f"[LLM SELECTED   ] final WER={sel_wer:.3f}"
+        _shadow_result = json.load(open(os.path.join(SEL_RUN, "out.json")))
+        shadow_sel = _shadow_result["selected"]
+        shadow_stats = _shadow_result["stats"]
+        shadow_wer = wer_of(shadow_sel)
+        shadow_threshold_wer = {
+            threshold: round(wer_of(texts), 4)
+            for threshold, texts in _shadow_result["threshold_selected"].items()}
+        print(f"[LLM SHADOW     ] shadow WER={shadow_wer:.3f}"
               f"   vs fused(ROVER)={fused_wer:.3f}  vs baseline A={wer_of(hyp_A):.3f}"
               f"  vs realizable oracle={r_oracle:.3f}")
         gap = wer_of(hyp_A) - r_oracle
-        print(f"captured {100*(wer_of(hyp_A)-sel_wer)/max(gap,1e-9):.0f}% of the baseline->realizable-oracle gap"
-              f"   (delta vs ROVER: {sel_wer-fused_wer:+.3f})")
+        print(f"shadow captured {100*(wer_of(hyp_A)-shadow_wer)/max(gap,1e-9):.0f}% of the "
+              f"baseline->realizable-oracle gap   (delta vs ROVER: {shadow_wer-fused_wer:+.3f})")
+        print("shadow selector stats:", json.dumps(shadow_stats, sort_keys=True))
+        print("shadow non-default override margin curve (threshold -> WER):",
+              json.dumps(shadow_threshold_wer, sort_keys=True))
+        print("^ shadow only; canonical transcript remains FUSED (ROVER)")
     except Exception as e:
-        print("LLM selector failed -> keeping ROVER fusion:", repr(e)[:200])
-    rec("+LLMSelector", time.time() - _sel_t0)
+        print("LLM shadow selector failed; canonical ROVER unaffected:", repr(e)[:500])
+    rec("+LLMSelectorShadow", time.time() - _sel_t0)
 """),
     md("""## 12. Timings + save summary
 Persistent per-stage wall-times (every stage `⏱`-printed as it finished; here they're
 collected into one table) and the WER summary (branch WERs, recall floor, realizable oracle,
-fused, and LLM-selected)."""),
+canonical ROVER, and the non-canonical constrained-LLM shadow result)."""),
     code(r"""
 import json
 # --- timing table (slowest first) ---
@@ -1195,11 +1220,19 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
            "branch_wer": res, "baseline_wer": res.get("A_whisper"),
            # honest metrics: recall_floor = fraction of ref words no branch produced (a recall
            # LOWER BOUND, ignores insertions); realizable_oracle = best full-WER a selector over
-           # the candidate graph could reach (a real transcript). fused/llm are actual WER.
+           # the candidate graph could reach (a real transcript). ROVER is canonical in this run;
+           # the constrained LLM score is shadow-only and cannot alter the saved transcript.
            "candidate_recall_floor": round(recall_floor(pool), 4),
            "realizable_oracle_wer": round(r_oracle, 4) if "r_oracle" in dir() else None,
            "fused_rover_wer": round(fused_wer, 4) if "fused_wer" in dir() else None,
-           "llm_selected_wer": round(sel_wer, 4) if "sel_wer" in dir() else None,
+           "canonical_wer": round(fused_wer, 4) if "fused_wer" in dir() else None,
+           "llm_selected_wer": None,
+           "llm_scored_shadow_wer": (round(shadow_wer, 4)
+                                      if "shadow_wer" in dir() and shadow_wer is not None else None),
+           "llm_scored_shadow_stats": (shadow_stats
+                                        if "shadow_stats" in dir() else None),
+           "llm_scored_shadow_margin_wer": (shadow_threshold_wer
+                                             if "shadow_threshold_wer" in dir() else None),
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
 try:   # recall-floor breakdown from §11.5 (defined only if the pool had branches)
     summary["recall_floor_by_category"] = dict(bycat.most_common())

@@ -79,13 +79,30 @@ def test_payload_is_marked_and_installs_its_exact_revision():
     assert "classroom-asr.git@{ASR_GIT_REF}" in source
 
 
-def test_selector_worker_does_not_require_new_helpers_from_installed_package():
+def test_selector_worker_uses_the_exact_revision_constrained_choice_api():
     source = _notebook_source()
 
-    assert "from classroom_asr.selector import generated_token_ids" not in source
-    assert "def generated_token_ids_compat" in source
-    assert "def parse_batch_compat" in source
-    assert "selector_module.parse_batch = parse_batch_compat" in source
+    assert "format_choice_prompt, select_transcript_with_chooser" in source
+    assert "def generated_token_ids_compat" not in source
+    assert "def parse_batch_compat" not in source
+    assert "selector_module.parse_batch" not in source
+
+
+def test_selector_shadow_scores_only_advertised_next_token_ids():
+    source = _notebook_source()
+
+    assert 'tokenizer.padding_side = "left"' in source
+    assert '_token_probe_text = processor.apply_chat_template(' in source
+    assert 'tokenizer.encode(_token_probe_text + _letter, add_special_tokens=False)' in source
+    assert 'is not one contextual token' in source
+    assert 'model(**inputs, logits_to_keep=1, use_cache=False)' in source
+    assert "model.generate(" not in source[source.index("# Candidate IDs are deliberately"):]
+    assert 'score_choices, norm=SCORE, batch_size=24, evidence_by_slot=evidence' in source
+    assert '"llm_selected_wer": None' in source
+    assert '"llm_scored_shadow_wer"' in source
+    assert 'thresholds = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0]' in source
+    assert '"llm_scored_shadow_margin_wer"' in source
+    assert "canonical transcript remains FUSED (ROVER)" in source
 
 
 def test_embedded_selector_worker_is_valid_python():
@@ -190,6 +207,7 @@ def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():
     assert "def phone_window_pass" in source
     assert '"phone_evidence": phone_evidence' in source
     assert "def _evidence_by_slot" in source
-    assert "selector_module.format_batch = format_batch_evidence" in source
+    assert "format_choice_prompt(decision)" in source
+    assert "evidence_by_slot=evidence" in source
     assert "phone evidence attached to" in source
     assert "lambda m, a: m.transcribe_full(a), \"PhoneticXeus\"" not in source

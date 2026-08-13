@@ -11,9 +11,11 @@ This module is the reference-free realization of that:
 * :func:`format_batch` / :func:`parse_batch` — render a batch of decisions as one prompt and
   read the model's ``N:LETTER`` answers back to candidate tokens. Deterministic, unit-tested,
   and model-agnostic (the LLM call is injected as ``llm_fn``).
+* :func:`format_choice_prompt` / :func:`select_transcript_with_chooser` — the stricter adapter
+  for judges that score only advertised candidate IDs instead of generating and parsing prose.
 * :func:`select_transcript` — glue: graph → contested decisions → LLM choices → assembled
   transcript, with the ROVER majority vote as the default for every slot the LLM didn't (or
-  couldn't) decide. So a bad/blank LLM answer degrades to the deterministic fusion, never worse.
+  couldn't) decide. Valid but wrong LLM choices can still worsen WER and must be measured.
 
 The design's ``NEW`` free-form escape hatch (§14.5) is intentionally **off** here — enabled later
 only for OOV/nonce spans with strong phone/P2G support.
@@ -24,7 +26,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 from .normalize import DEFAULT, Normalizer
 from .rover import NULL, Slot, build_graph
@@ -120,6 +122,32 @@ def format_batch(decisions: list[Decision]) -> str:
     return "\n".join(lines)
 
 
+def format_choice_prompt(decision: Decision) -> str:
+    """Render one decision for restricted next-token candidate-ID scoring.
+
+    The prompt ends immediately after ``Candidate ID:`` so a causal judge's next-token logits can
+    be compared only across the advertised option letters. This removes free-form transcript
+    generation and parsing from the inference path.
+    """
+    context = " ".join([*decision.before, "[?]", *decision.after]).strip()
+    options = "  ".join(f"{letter}={_opt_text(token)}" for letter, token in decision.options)
+    lines = [
+        "You are a transcription judge. Choose the evidence-supported VERBATIM word for [?].",
+        "Keep real fillers, repetitions, false starts, learner errors, and quiet words when",
+        f"supported. {DROP}(drop) means no word belongs there. Choose only a listed candidate;",
+        "never invent or clean text.",
+        f"Context: ...{context}...",
+        f"Candidates: {options}",
+    ]
+    if decision.evidence:
+        lines += [
+            "Acoustic phone evidence for the same short region (it may include neighboring words):",
+            *(f"  {item}" for item in decision.evidence),
+        ]
+    lines += ["Answer with exactly one candidate ID letter and nothing else.", "Candidate ID:"]
+    return "\n".join(lines)
+
+
 def parse_batch(text: str, decisions: list[Decision]) -> dict[int, object]:
     """Map model answers back to ``{slot_index: chosen_token}``.
 
@@ -194,6 +222,42 @@ def assemble(graph: list[Slot], choices: dict[int, object]) -> list[str]:
     return out
 
 
+def select_transcript_with_chooser(
+    transcripts,
+    chooser_fn: Callable[[list[Decision]], Mapping[int, object]],
+    *,
+    norm: Normalizer = DEFAULT,
+    batch_size: int = 24,
+    context: int = 8,
+    evidence_by_slot: Mapping[int, Sequence[str]] | None = None,
+) -> tuple[str, int, int]:
+    """Fuse transcripts using a chooser that returns constrained ``slot -> candidate`` values.
+
+    Every returned value is checked against that decision's advertised candidates. Unknown slots
+    and invented values are ignored, so the deterministic ROVER winner remains the fallback.
+    This is the non-generative adapter used by restricted-logit LLM judges.
+    """
+    token_lists = [norm.tokens(t) for t in transcripts if t and t.strip()]
+    graph = build_graph(token_lists)
+    decisions = build_decisions(graph, context=context, evidence_by_slot=evidence_by_slot)
+    choices: dict[int, object] = {}
+    for b in range(0, len(decisions), batch_size):
+        batch = decisions[b:b + batch_size]
+        try:
+            proposed = chooser_fn(batch)
+        except Exception:
+            continue                            # abstain -> ROVER defaults for the batch
+        if not isinstance(proposed, Mapping):
+            continue
+        for decision in batch:
+            if decision.slot not in proposed:
+                continue
+            candidate = proposed[decision.slot]
+            if any(candidate == option for _letter, option in decision.options):
+                choices[decision.slot] = candidate
+    return " ".join(assemble(graph, choices)).strip(), len(decisions), len(choices)
+
+
 def select_transcript(
     transcripts,
     llm_fn,
@@ -206,17 +270,17 @@ def select_transcript(
     """Fuse branch transcripts with the LLM judge over contested slots.
 
     ``llm_fn(prompt) -> str`` runs the model. Returns ``(transcript, n_decisions, n_chosen)`` —
-    ``n_chosen`` is how many contested slots the LLM actually decided (the rest fell back to the
-    ROVER vote, so the result is never worse than :func:`classroom_asr.rover.fuse`).
+    ``n_chosen`` is how many contested slots the LLM actually decided; the rest fall back to the
+    ROVER vote. Chosen candidates remain constrained but can still be wrong.
     """
-    token_lists = [norm.tokens(t) for t in transcripts if t and t.strip()]
-    graph = build_graph(token_lists)
-    decisions = build_decisions(graph, context=context, evidence_by_slot=evidence_by_slot)
-    choices: dict[int, object] = {}
-    for b in range(0, len(decisions), batch_size):
-        batch = decisions[b:b + batch_size]
-        try:
-            choices.update(parse_batch(llm_fn(format_batch(batch)), batch))
-        except Exception:
-            pass                                # abstain -> ROVER default for those slots
-    return " ".join(assemble(graph, choices)).strip(), len(decisions), len(choices)
+    def parsed_chooser(batch: list[Decision]) -> Mapping[int, object]:
+        return parse_batch(llm_fn(format_batch(batch)), batch)
+
+    return select_transcript_with_chooser(
+        transcripts,
+        parsed_chooser,
+        norm=norm,
+        batch_size=batch_size,
+        context=context,
+        evidence_by_slot=evidence_by_slot,
+    )
