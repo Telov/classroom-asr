@@ -257,6 +257,19 @@ def test_accuracy_shadow_uses_auto_language_known_good_qwen_windows_and_full_whi
     assert '("WhisperLargeV3", globals().get("hyp_A3"))' in source
 
 
+def test_no_vad_whisper_shadow_reuses_baseline_models_and_stays_a_separate_branch():
+    source = _notebook_source()
+
+    assert "USE_WHISPER_NO_VAD_SHADOW = True" in source
+    assert 'with stage("Whisper turbo load (shared)")' in source
+    assert 'hyp_A = _turbo_pass(WHISPER_VAD, "A whisper")' in source
+    assert 'hyp_ANV = _turbo_pass(False, "Whisper no-VAD shadow")' in source
+    assert 'add_branch("+WhisperNoVAD", hyp_ANV)' in source
+    assert '("WhisperNoVAD", globals().get("hyp_ANV"))' in source
+    assert '"WhisperNoVAD": ("Whisper turbo load (shared)",' in source
+    assert '"ANV_whisper_turbo_no_vad"' in source
+
+
 def test_window_batches_emit_progress_and_fail_independently():
     source = _notebook_source()
 

@@ -39,7 +39,8 @@ boundaries** (no leakage), and Voxtral (which has no word timestamps) participat
 naturally.
 
 Branches (each a different architecture → complementary errors, §8):
-* **A** Whisper large-v3-turbo (faster-whisper) — the baseline
+* **A** Whisper large-v3-turbo (faster-whisper, VAD) — the baseline
+* **ANV** the same loaded turbo checkpoint without destructive VAD — quiet-word shadow
 * **A3** Whisper large-v3 (faster-whisper, FP16 beam 5) — quality shadow
 * **B** wav2vec2 CTC (no LM; never hallucinates on silence)
 * **Z** Qwen3-ASR-1.7B (the design's real backbone)
@@ -119,6 +120,7 @@ FW_MODEL       = "deepdml/faster-whisper-large-v3-turbo-ct2"
 FW_QUALITY_MODEL = "Systran/faster-whisper-large-v3"
 USE_WHISPER_LARGE_V3 = True
 WHISPER_VAD    = True      # skip silence (less hallucination); off = keep quiet words
+USE_WHISPER_NO_VAD_SHADOW = True  # §6.1: measure quiet-word recall without replacing baseline
 
 USE_CTC        = True;  CTC_MODEL      = "facebook/wav2vec2-large-960h-lv60-self"
 USE_QWEN3ASR   = True;  QWEN3ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
@@ -657,12 +659,37 @@ from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
 # window-balanced: each interview split into large (~15 min) silence-snapped slices spread
 # across both GPUs, so neither idles on the 2+1 interview split. Transcription is unchanged
 # per slice (faster-whisper VAD+conditioning run inside each), so WER stays put.
-hyp_A = run_windows("A whisper", lambda dev: FasterWhisperASR(
-    FW_MODEL, language="en", device=dev, vad_filter=WHISPER_VAD),
-    chunk_s=900, batch_size=1)
+hyp_A = hyp_ANV = None
+_turbo_models = None
+try:
+    with stage("Whisper turbo load (shared)"):
+        _turbo_models = load_models(lambda dev: FasterWhisperASR(
+            FW_MODEL, language="en", device=dev, vad_filter=WHISPER_VAD))
+    def _turbo_pass(vad_filter, tag):
+        for model in _turbo_models: model.vad_filter = vad_filter
+        started = time.time()
+        output = window_pass(_turbo_models, tag, chunk_s=900, batch_size=1)
+        rec(tag, time.time() - started)
+        return output
+    hyp_A = _turbo_pass(WHISPER_VAD, "A whisper")
+    if USE_WHISPER_NO_VAD_SHADOW:
+        # Same weights/decode, no second model load. This is a candidate-only experiment: no-VAD
+        # may recover quiet words and may hallucinate in silence; exact S/D/I and subset-oracle
+        # metrics decide whether it survives. It never silently replaces the VAD baseline.
+        hyp_ANV = _turbo_pass(False, "Whisper no-VAD shadow")
+except Exception as e:
+    print("[Whisper turbo shared] FAILED:", repr(e)[:500], flush=True)
+    if hyp_A is None: hyp_A = [""] * len(interviews)
+    if USE_WHISPER_NO_VAD_SHADOW and hyp_ANV is None:
+        hyp_ANV = [""] * len(interviews)
+finally:
+    if _turbo_models is not None: _free_models(_turbo_models)
+    _turbo_models = None
 pool = []
 add_branch("A", hyp_A)
 print("^ baseline WER = branch A")
+if USE_WHISPER_NO_VAD_SHADOW:
+    add_branch("+WhisperNoVAD", hyp_ANV)
 
 # Full large-v3 is not assumed to beat turbo: OpenAI reports dataset-dependent differences.
 # Run it as a quality shadow with the documented beam-5 decode and FP16, then let this benchmark
@@ -1125,6 +1152,7 @@ from classroom_asr.selector import build_decisions
 # anchored to it. Phone branches are IPA evidence, not word candidates.
 _wb_named = [("Qwen3-ASR", globals().get("hyp_Z")),
              ("Whisper", globals().get("hyp_A")),
+             ("WhisperNoVAD", globals().get("hyp_ANV")),
              ("WhisperLargeV3", globals().get("hyp_A3")),
              ("wav2vec2 CTC", globals().get("hyp_B")),
              ("Voxtral", globals().get("hyp_C")),
@@ -1174,6 +1202,7 @@ for _name, _hyps in _wb_named:
 _all_hits = set().union(*_branch_hits) if _branch_hits else set()
 _timing_by_name = {name: dt for name, dt in TIMINGS}
 _stage_for_branch = {"Qwen3-ASR": "A+B+Qwen3", "Whisper": "A whisper",
+                     "WhisperNoVAD": "Whisper no-VAD shadow",
                      "WhisperLargeV3": "Whisper large-v3 quality",
                      "wav2vec2 CTC": "A+B", "Voxtral": "+Voxtral",
                      "VoxtralVerbatim": "+VoxtralVerbatim",
@@ -1221,15 +1250,16 @@ for _left in range(len(_wb_named)):
 print("A zero/small unique count identifies overlap worth investigating; it is not by itself "
       "authorization to remove a branch because oracle placement and selector evidence may differ.")
 
-# Exhaustive Qwen-anchored subset frontier. With at most seven optional word branches this is
-# only 2^7=128 inexpensive text-graph evaluations and requires no ASR rerun. Runtime accounting
+# Exhaustive Qwen-anchored subset frontier. With at most eight optional word branches this is
+# only 2^8=256 inexpensive text-graph evaluations and requires no ASR rerun. Runtime accounting
 # deduplicates shared stages: either Voxtral mode pays the shared load once; either Crisper output
 # pays the combined worker once. Keep a subset only when no cheaper/equal-cost subset has an equal
 # or lower realizable-oracle WER.
 from itertools import combinations
 _stage_groups = {
     "Qwen3-ASR": ("A+B+Qwen3",),
-    "Whisper": ("A whisper",),
+    "Whisper": ("Whisper turbo load (shared)", "A whisper"),
+    "WhisperNoVAD": ("Whisper turbo load (shared)", "Whisper no-VAD shadow"),
     "WhisperLargeV3": ("Whisper large-v3 quality",),
     "wav2vec2 CTC": ("A+B",),
     "Voxtral": ("Voxtral load (shared)", "+Voxtral"),
@@ -1674,7 +1704,8 @@ print(f"   {sum(dt for _, dt in TIMINGS):7.1f}s  TOTAL (sum of tracked stages)")
 
 res = {}
 branch_metrics = {}
-for name, h in [("A_whisper_turbo", hyp_A), ("A3_whisper_large_v3", hyp_A3),
+for name, h in [("A_whisper_turbo", hyp_A), ("ANV_whisper_turbo_no_vad", hyp_ANV),
+                ("A3_whisper_large_v3", hyp_A3),
                 ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C),
                 ("VV_voxtral_verbatim", hyp_VV), ("CW_crisperwhisper", hyp_CW),
                 ("CWV_crisper_qwen_verbatize", hyp_CWV)]:
@@ -1719,6 +1750,8 @@ run_fingerprint = {
                  "cuda": torch.version.cuda},
     "models": {
         "whisper_turbo": {"id": FW_MODEL, "vad": WHISPER_VAD},
+        "whisper_turbo_no_vad_shadow": {"id": FW_MODEL, "vad": False,
+                                        "enabled": USE_WHISPER_NO_VAD_SHADOW},
         "whisper_large_v3": {"id": FW_QUALITY_MODEL, "beam_size": 5,
                              "compute_type": "float16", "vad": WHISPER_VAD},
         "ctc": {"id": CTC_MODEL},
