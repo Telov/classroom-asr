@@ -232,6 +232,29 @@ def test_prefetch_excludes_unused_framework_weights_and_prioritizes_first_branch
     )
 
 
+def test_accuracy_shadow_uses_auto_language_longer_qwen_context_and_full_whisper():
+    source = _notebook_source()
+
+    assert 'QWEN_CHUNK_S = 90' in source
+    assert 'QWEN_MAX_NEW_TOKENS = 1024' in source
+    assert 'VOXTRAL_CHUNK_S = 30' in source
+    assert 'Qwen3ASR(\n                            QWEN3ASR_MODEL, language=None' in source
+    assert 'max_new_tokens=QWEN_MAX_NEW_TOKENS' in source
+    assert 'FW_QUALITY_MODEL = "Systran/faster-whisper-large-v3"' in source
+    assert 'compute_type="float16", beam_size=5' in source
+    assert '("WhisperLargeV3", globals().get("hyp_A3"))' in source
+
+
+def test_voxtral_verbatim_prompt_uses_aae_as_context_without_identity_guessing():
+    source = (ROOT / "src" / "classroom_asr" / "backends" / "voxtral_asr.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "African American English (AAE)" in source
+    assert "never infer or invent a word from identity" in source
+    assert "correct grammar, normalize dialect" in source
+
+
 def test_overlap_mode_skips_selector_and_its_now_unused_phone_branches():
     source = _notebook_source()
 

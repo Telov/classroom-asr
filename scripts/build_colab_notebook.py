@@ -40,6 +40,7 @@ naturally.
 
 Branches (each a different architecture → complementary errors, §8):
 * **A** Whisper large-v3-turbo (faster-whisper) — the baseline
+* **A3** Whisper large-v3 (faster-whisper, FP16 beam 5) — quality shadow
 * **B** wav2vec2 CTC (no LM; never hallucinates on silence)
 * **Z** Qwen3-ASR-1.7B (the design's real backbone)
 * **C** Voxtral Mini 3B (audio-LLM)
@@ -113,6 +114,8 @@ COMPONENT, VERSION, AUDIO_PART = "les", "2021.07", "part01"   # or "prv","2018.1
 TARGET_MINUTES = 60
 
 FW_MODEL       = "deepdml/faster-whisper-large-v3-turbo-ct2"
+FW_QUALITY_MODEL = "Systran/faster-whisper-large-v3"
+USE_WHISPER_LARGE_V3 = True
 WHISPER_VAD    = True      # skip silence (less hallucination); off = keep quiet words
 
 USE_CTC        = True;  CTC_MODEL      = "facebook/wav2vec2-large-960h-lv60-self"
@@ -145,11 +148,13 @@ SELECTOR_TRANSFORMERS = "5.15.0"; SELECTOR_ACCELERATE = "1.14.0"
 # uses, no quality cost). Windows are batched. Voxtral's two passes share ONE 9.5 GB load.
 # Defaults keep full quality: CrisperWhisper "large", BOTH Voxtral passes on.
 
-# Window (seconds) for the audio-LLM branches (Qwen3, Voxtral). These emit a BOUNDED
-# number of output tokens per call, so an over-long window truncates the transcript
-# (600 s gave Qwen3 WER 0.87 — near-total deletion). Keep it near the utterance scale,
-# like Whisper's internal 30 s window; this is capped by output budget, not GPU memory.
-LLM_CHUNK_S    = 30
+# Qwen supports long audio, so give it substantially more conversational context than the old
+# shared 30 s windows while retaining silence-snapped boundaries. Its official evaluation uses a
+# 1024-token output budget. Voxtral keeps 30 s windows because it has a different memory profile
+# and its two modes already share those windows.
+QWEN_CHUNK_S = 90
+QWEN_MAX_NEW_TOKENS = 1024
+VOXTRAL_CHUNK_S = 30
 
 BASE = f"http://lingtools.uoregon.edu/coraal/{COMPONENT}/{VERSION}"
 COMP = COMPONENT.upper()
@@ -323,7 +328,8 @@ def _prefetch():
     # Fetch in first-use order so A/B/Z do not wait behind the largest late-stage models. The
     # selector remains far enough ahead of §11.7 because all acoustic inference runs before it.
     repos = [m for m, on in [
-        (FW_MODEL, True), (CTC_MODEL, USE_CTC), (QWEN3ASR_MODEL, USE_QWEN3ASR),
+        (FW_MODEL, True), (FW_QUALITY_MODEL, USE_WHISPER_LARGE_V3),
+        (CTC_MODEL, USE_CTC), (QWEN3ASR_MODEL, USE_QWEN3ASR),
         (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM),
         # The persisted CT2 directory is self-contained. Fetch the 1.62 GB source only when a
         # conversion is actually missing; workers otherwise load the local model directly.
@@ -595,6 +601,16 @@ hyp_A = run_windows("A whisper", lambda dev: FasterWhisperASR(
 pool = []
 add_branch("A", hyp_A)
 print("^ baseline WER = branch A")
+
+# Full large-v3 is not assumed to beat turbo: OpenAI reports dataset-dependent differences.
+# Run it as a quality shadow with the documented beam-5 decode and FP16, then let this benchmark
+# decide. It remains a separate candidate and does not silently replace the faster baseline.
+hyp_A3 = None
+if USE_WHISPER_LARGE_V3:
+    hyp_A3 = run_windows("Whisper large-v3 quality", lambda dev: FasterWhisperASR(
+        FW_QUALITY_MODEL, language="en", device=dev, compute_type="float16", beam_size=5,
+        vad_filter=WHISPER_VAD), chunk_s=900, batch_size=1)
+    add_branch("+WhisperLargeV3", hyp_A3)
 """),
     md("## 7. Branch B — wav2vec2 CTC"),
     code(r"""
@@ -612,8 +628,10 @@ if USE_QWEN3ASR:
     from classroom_asr.backends.qwen3_asr import Qwen3ASR
     # windows balanced across GPUs (no 2+1 idle), reassembled in order (same output)
     hyp_Z = run_windows("A+B+Qwen3",
-                        lambda dev: Qwen3ASR(QWEN3ASR_MODEL, language="English", device=dev),
-                        chunk_s=LLM_CHUNK_S, batch_size=32)   # 64 gave no speedup, 2x VRAM -> back to 32
+                        lambda dev: Qwen3ASR(
+                            QWEN3ASR_MODEL, language=None, device=dev,
+                            max_new_tokens=QWEN_MAX_NEW_TOKENS),
+                        chunk_s=QWEN_CHUNK_S, batch_size=8)
     add_branch("A+B+Qwen3", hyp_Z)
 """),
     md("""## 9. Branch C / VV — Voxtral Mini 3B, **both passes on one load**
@@ -629,7 +647,8 @@ if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
         vmodels = load_models(lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev))
     def _vox_pass(mode, tag):                       # windows balanced across GPUs, one mode
         for m in vmodels: m.mode = mode
-        t0 = time.time(); out = window_pass(vmodels, tag, chunk_s=LLM_CHUNK_S, batch_size=12)
+        t0 = time.time(); out = window_pass(
+            vmodels, tag, chunk_s=VOXTRAL_CHUNK_S, batch_size=12)
         rec(tag, time.time() - t0); return out
     if USE_VOXTRAL:
         hyp_C = _vox_pass("transcription", "+Voxtral"); add_branch("+Voxtral", hyp_C)
@@ -970,6 +989,7 @@ from classroom_asr.selector import build_decisions
 # anchored to it. Phone branches are IPA evidence, not word candidates.
 _wb_named = [("Qwen3-ASR", globals().get("hyp_Z")),
              ("Whisper", globals().get("hyp_A")),
+             ("WhisperLargeV3", globals().get("hyp_A3")),
              ("wav2vec2 CTC", globals().get("hyp_B")),
              ("Voxtral", globals().get("hyp_C")),
              ("VoxtralVerbatim", globals().get("hyp_VV")),
@@ -1015,6 +1035,7 @@ for _name, _hyps in _wb_named:
 _all_hits = set().union(*_branch_hits) if _branch_hits else set()
 _timing_by_name = {name: dt for name, dt in TIMINGS}
 _stage_for_branch = {"Qwen3-ASR": "A+B+Qwen3", "Whisper": "A whisper",
+                     "WhisperLargeV3": "Whisper large-v3 quality",
                      "wav2vec2 CTC": "A+B", "Voxtral": "+Voxtral",
                      "VoxtralVerbatim": "+VoxtralVerbatim",
                      "CrisperWhisper": "+CrisperWhisper"}
@@ -1398,7 +1419,8 @@ json.dump({"selected": selected, "threshold_selected": threshold_selected, "stat
         # failed, fall back to another timestamped word branch; the phone windows remain immutable.
         _anchor_key = next((key for key, hyps in [
             ("A+B+Qwen3", hyp_Z), ("+Voxtral", hyp_C), ("+VoxtralVerbatim", hyp_VV),
-            ("A whisper", hyp_A), ("A+B", hyp_B)] if hyps and any(hyps) and key in WINDOW_PARTS), None)
+            ("Whisper large-v3 quality", hyp_A3), ("A whisper", hyp_A),
+            ("A+B", hyp_B)] if hyps and any(hyps) and key in WINDOW_PARTS), None)
         _anchors = WINDOW_PARTS.get(_anchor_key, [[] for _ in interviews])
         _selector_input = {
             # _wb is already Qwen-first. The worker preserves this order and anchors its graph to
@@ -1450,11 +1472,12 @@ for name, dt in sorted(TIMINGS, key=lambda x: -x[1]):
 print(f"   {sum(dt for _, dt in TIMINGS):7.1f}s  TOTAL (sum of tracked stages)")
 
 res = {}
-for name, h in [("A_whisper", hyp_A), ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C)]:
+for name, h in [("A_whisper_turbo", hyp_A), ("A3_whisper_large_v3", hyp_A3),
+                ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C)]:
     if h and any(h): res[name] = round(wer_of(h), 4)
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",
-           "branch_wer": res, "baseline_wer": res.get("A_whisper"),
+           "branch_wer": res, "baseline_wer": res.get("A_whisper_turbo"),
            # honest metrics: recall_floor = fraction of ref words no branch produced (a recall
            # LOWER BOUND, ignores insertions); realizable_oracle = best full-WER a selector over
            # the Qwen-anchored candidate graph could reach (a real transcript).

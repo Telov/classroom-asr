@@ -89,8 +89,10 @@ complementary evidence, not just beam diversity (the multi-encoder bet, §8).
 Runs on **Colab or Kaggle** (Kaggle 2×T4 recommended — the notebook shards across
 all GPUs). The wheel is **embedded in the notebook** (base64), so there is no upload
 step; regenerate with `python scripts/build_colab_notebook.py` after rebuilding the
-wheel. Branches: Whisper turbo (A, 1-best), wav2vec2 CTC (B), **Qwen3-ASR-1.7B (Z,
-the design's real backbone)**, Voxtral Mini (C, subset), and a wav2vec2 phoneme path.
+wheel. Active overlap-benchmark branches: Whisper turbo (A, baseline), full Whisper
+large-v3 (A3, FP16 beam-5 shadow), wav2vec2 CTC (B), **Qwen3-ASR-1.7B (Z, the
+design's real backbone)**, Voxtral Mini clean and AAE-aware verbatim variants, and
+CrisperWhisper. The selector and its phone/IPA inputs are paused in this mode.
 Includes an **error-analysis** section (S/D/I, most-deleted words, worst utterances).
 CORAAL is spontaneous **English**, so read the baseline→oracle *gap*, not absolute
 WER (§1.3, §18).

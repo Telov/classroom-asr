@@ -25,10 +25,11 @@ class Qwen3ASR(AcousticModel):
         *,
         id_prefix: str = "z",
         source: CandidateSource = CandidateSource.QWEN,
-        language: str | None = "English",
+        language: str | None = None,
         device: str | None = None,
         dtype=None,
         max_inference_batch_size: int = 16,
+        max_new_tokens: int = 1024,
     ) -> None:
         import torch  # lazy
         from qwen_asr import Qwen3ASRModel
@@ -45,15 +46,24 @@ class Qwen3ASR(AcousticModel):
         self.device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
         # fp16 on T4/Turing (no bf16 tensor cores) → big speedup vs bf16
         self.dtype = dtype or best_dtype(torch, self.device)
+        load_kwargs = {
+            "dtype": self.dtype,
+            "device_map": self.device,
+            "max_inference_batch_size": max_inference_batch_size,
+            "max_new_tokens": max_new_tokens,
+        }
         try:
-            self.model = Qwen3ASRModel.from_pretrained(
-                model_id, dtype=self.dtype, device_map=self.device,
-                max_inference_batch_size=max_inference_batch_size,
-            )
-        except TypeError:  # older/newer signature without the kwarg
-            self.model = Qwen3ASRModel.from_pretrained(
-                model_id, dtype=self.dtype, device_map=self.device
-            )
+            self.model = Qwen3ASRModel.from_pretrained(model_id, **load_kwargs)
+        except TypeError:
+            # Keep compatibility with qwen-asr releases that predate either optional
+            # constructor argument. Prefer retaining the larger output budget because it
+            # is what makes longer, less fragmented audio windows safe.
+            load_kwargs.pop("max_inference_batch_size")
+            try:
+                self.model = Qwen3ASRModel.from_pretrained(model_id, **load_kwargs)
+            except TypeError:
+                load_kwargs.pop("max_new_tokens")
+                self.model = Qwen3ASRModel.from_pretrained(model_id, **load_kwargs)
 
         # Fix the generate-time warnings at the source: set pad_token_id (kills the
         # per-call "Setting pad_token_id …") and drop sampling-only flags since we decode

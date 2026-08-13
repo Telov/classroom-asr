@@ -28,10 +28,14 @@ from ..pipeline.base import AcousticModel, SpeechSegment
 from ..types import CandidateSource
 
 VERBATIM_INSTRUCTION = (
-    "Transcribe the audio exactly as spoken, word for word. Include every filler "
-    "(um, uh, mm-hmm), false start, repetition and stutter. Do not paraphrase, "
-    "summarize, translate, correct grammar, or add commentary or punctuation beyond "
-    "what is spoken. Output only the verbatim transcription."
+    "The recording is an English sociolinguistic interview, and most speakers use "
+    "African American English (AAE). Transcribe the audio exactly as spoken, word for "
+    "word. Preserve vernacular forms as actually pronounced, along with every filler "
+    "(um, uh, mm-hmm), false start, repetition, and stutter. Use the speaker description "
+    "only as dialect context: never infer or invent a word from identity, and prefer the "
+    "acoustic evidence whenever uncertain. Do not paraphrase, summarize, translate, "
+    "correct grammar, normalize dialect, or add commentary. Output only the verbatim "
+    "transcription."
 )
 
 

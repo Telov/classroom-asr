@@ -28,6 +28,14 @@
   phone branches currently feed only that selector, skip them as well in this mode. Use exact
   leave-one-branch-out reference coverage before proposing removal of any word branch; do not
   equate high overlap alone with unchanged realizable-oracle WER.
+- The current recordings and CORAAL benchmark are English; do not add or substitute GigaAM for
+  now. Qwen3-ASR should auto-detect language rather than being forced to English, so the same
+  backbone remains suitable when later recordings contain code-switching.
+- Compare Whisper large-v3-turbo with full Whisper large-v3 as measured branches; do not assume
+  either is universally more accurate. Keep the turbo result as the baseline until the local
+  benchmark demonstrates otherwise.
+- In the CORAAL Voxtral verbatim prompt, describe the material as predominantly African American
+  English while explicitly forbidding identity-based guessing or dialect normalization.
 
 ## Document reading and project notes
 
