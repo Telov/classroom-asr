@@ -2,7 +2,7 @@ from classroom_asr.normalize import Normalizer
 from classroom_asr.rover import build_graph, NULL
 from classroom_asr.selector import (
     build_decisions, format_batch, format_choice_prompt, parse_batch, generated_token_ids,
-    assemble, select_transcript, select_transcript_with_chooser,
+    assemble, select_graph_with_chooser, select_transcript, select_transcript_with_chooser,
 )
 
 N = Normalizer()
@@ -124,6 +124,18 @@ def test_constrained_chooser_accepts_only_advertised_candidates():
     default, n2, chosen2 = select_transcript_with_chooser(transcripts, invent_word, norm=N)
     assert default == "their house"
     assert n2 == 1 and chosen2 == 0
+
+
+def test_prebuilt_graph_chooser_matches_transcript_entrypoint():
+    transcripts = ["their house", "there house", "they're house"]
+
+    def choose_there(batch):
+        return {batch[0].slot: "there"}
+
+    expected = select_transcript_with_chooser(transcripts, choose_there, norm=N)
+    reused = select_graph_with_chooser(_graph(*transcripts), choose_there)
+
+    assert reused == expected == ("there house", 1, 1)
 
 
 def test_drop_candidate_is_offered_when_branches_delete():

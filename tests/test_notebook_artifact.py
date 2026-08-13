@@ -82,7 +82,7 @@ def test_payload_is_marked_and_installs_its_exact_revision():
 def test_selector_worker_uses_the_exact_revision_constrained_choice_api():
     source = _notebook_source()
 
-    assert "format_batch, select_transcript_with_chooser" in source
+    assert "format_batch, select_graph_with_chooser" in source
     assert "def generated_token_ids_compat" not in source
     assert "def parse_batch_compat" not in source
     assert "selector_module.parse_batch" not in source
@@ -98,11 +98,13 @@ def test_selector_shadow_scores_only_advertised_next_token_ids():
     assert 'prompt = format_batch(decisions) + "\\n1:"' in source
     assert 'model(**inputs, logits_to_keep=1, use_cache=True)' in source
     assert 'past_key_values=cache, logits_to_keep=1, use_cache=True' in source
-    assert 'selector batch {batch_number}: prefill' in source
-    assert 'selector batch {batch_number}: complete' in source
+    assert 'selector attempt {attempt_number}: prefill' in source
+    assert 'selector progress: {_stats[\'completed_decisions\']}/{_total_decisions}' in source
+    assert 'selector OOM: splitting {len(decisions)} decisions' in source
+    assert 'selector plan: {_total_decisions} contested decisions' in source
     assert "conversations = [[" not in source[source.index("# Candidate IDs are deliberately"):]
     assert "model.generate(" not in source[source.index("# Candidate IDs are deliberately"):]
-    assert 'score_choices, norm=SCORE, batch_size=24, evidence_by_slot=evidence' in source
+    assert 'graph, score_choices, batch_size=24, evidence_by_slot=evidence' in source
     assert '"llm_selected_wer": None' in source
     assert '"llm_scored_shadow_wer"' in source
     assert 'thresholds = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0]' in source
@@ -239,3 +241,13 @@ def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():
     assert "evidence_by_slot=evidence" in source
     assert "phone evidence attached to" in source
     assert "lambda m, a: m.transcribe_full(a), \"PhoneticXeus\"" not in source
+
+
+def test_selector_threshold_curve_reuses_the_scored_graph_without_realignment():
+    source = _notebook_source()
+
+    assert "prepared.append((graph, evidence))" in source
+    assert "selector_module.assemble(graph, gated)" in source
+    assert "threshold variants reassembled from the existing graph" in source
+    threshold_loop = source[source.index("for threshold in thresholds:"):]
+    assert "select_transcript_with_chooser(" not in threshold_loop

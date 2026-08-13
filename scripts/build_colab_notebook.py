@@ -1016,7 +1016,7 @@ from rapidfuzz.distance import Levenshtein
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 import classroom_asr.selector as selector_module
 from classroom_asr.selector import (
-    build_decisions, format_batch, select_transcript_with_chooser,
+    build_decisions, format_batch, select_graph_with_chooser,
 )
 from classroom_asr.normalize import Normalizer
 SCORE = Normalizer(fold_numbers=True, fold_spelling=True)
@@ -1103,10 +1103,12 @@ for _letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
                            f"prefix={_token_probe_prefix[-4:]} answer={_with_answer[-5:]}")
     _letter_token[_letter] = _with_answer[-1]
 
-_stats = {"forward_batches": 0, "decode_steps": 0, "prompt_tokens": 0,
+_stats = {"prefill_attempts": 0, "forward_batches": 0, "decode_steps": 0,
+          "prompt_tokens": 0, "completed_decisions": 0,
           "oom_splits": 0, "overrides": 0, "evidenced_overrides": 0, "margins": []}
 _decision_scores = {}
 _debugged = False
+_total_decisions = 0
 
 def _score_once(decisions):
     # Put the whole batch in one conversation so decisions that share a 24-second phone window
@@ -1118,8 +1120,9 @@ def _score_once(decisions):
         conversations, add_generation_prompt=True, enable_thinking=False, tokenize=True,
         return_dict=True, return_tensors="pt").to(_dev)
     prompt_tokens = int(inputs["input_ids"].shape[-1])
-    batch_number = _stats["forward_batches"] + 1
-    print(f"selector batch {batch_number}: prefill {len(decisions)} decisions in "
+    _stats["prefill_attempts"] += 1
+    attempt_number = _stats["prefill_attempts"]
+    print(f"selector attempt {attempt_number}: prefill {len(decisions)} decisions in "
           f"{prompt_tokens} shared prompt tokens", file=sys.stderr, flush=True)
     with torch.inference_mode():
         # Prefill the shared evidence once, then keep its KV cache while emitting only the chosen
@@ -1172,7 +1175,9 @@ def _score_once(decisions):
                 logits = outputs.logits[0, -1, :].float()
                 cache = outputs.past_key_values
             _stats["decode_steps"] += 1
-    print(f"selector batch {batch_number}: complete ({len(decisions)} decisions)",
+    _stats["completed_decisions"] += len(decisions)
+    print(f"selector progress: {_stats['completed_decisions']}/{_total_decisions} decisions; "
+          f"successful batches={_stats['forward_batches']} OOM splits={_stats['oom_splits']}",
           file=sys.stderr, flush=True)
     return choices
 
@@ -1183,6 +1188,9 @@ def score_choices(decisions):
         if "out of memory" not in str(exc).lower() or len(decisions) <= 1:
             raise
         _stats["oom_splits"] += 1
+        print(f"selector OOM: splitting {len(decisions)} decisions into "
+              f"{len(decisions[:len(decisions)//2])}+{len(decisions[len(decisions)//2:])}",
+              file=sys.stderr, flush=True)
         torch.cuda.empty_cache()
         middle = len(decisions) // 2
         return {**score_choices(decisions[:middle]), **score_choices(decisions[middle:])}
@@ -1190,33 +1198,41 @@ def score_choices(decisions):
 thresholds = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0]
 selected = []; threshold_selected = {f"{threshold:g}": [] for threshold in thresholds}
 tot_dec = tot_chosen = tot_evidenced = 0
+prepared = []
 for branches, anchor_chunks, phone_chunks in zip(
         data["branch_transcripts"], data["anchor_chunks"], data["phone_evidence"]):
     active = [b for b in branches if b]
-    evidence, _graph = _evidence_by_slot(active, anchor_chunks, phone_chunks)
+    evidence, graph = _evidence_by_slot(active, anchor_chunks, phone_chunks)
+    prepared.append((graph, evidence))
+_total_decisions = sum(len(build_decisions(graph, evidence_by_slot=evidence))
+                       for graph, evidence in prepared)
+print(f"selector plan: {_total_decisions} contested decisions across {len(prepared)} interviews",
+      file=sys.stderr, flush=True)
+
+for interview_number, (graph, evidence) in enumerate(prepared, 1):
+    print(f"selector interview {interview_number}/{len(prepared)}: starting",
+          file=sys.stderr, flush=True)
     _decision_scores.clear()
-    text, nd, nc = select_transcript_with_chooser(
-        active, score_choices, norm=SCORE, batch_size=24, evidence_by_slot=evidence)
+    text, nd, nc = select_graph_with_chooser(
+        graph, score_choices, batch_size=24, evidence_by_slot=evidence)
     selected.append(text); tot_dec += nd; tot_chosen += nc; tot_evidenced += len(evidence)
     # Reassemble margin-gated shadow variants without another model forward pass. This produces a
     # promotion curve from the same scores; references are used only later for benchmark reporting.
     for threshold in thresholds:
-        def gated_choices(batch, _threshold=threshold):
-            return {decision.slot: (
-                _decision_scores[decision.slot][0]
-                if decision.slot in _decision_scores
-                and _decision_scores[decision.slot][1] >= _threshold
-                else decision.default)
-                for decision in batch}
-        gated_text, _n, _chosen = select_transcript_with_chooser(
-            active, gated_choices, norm=SCORE, batch_size=256, evidence_by_slot=evidence)
+        gated = {slot: token for slot, (token, margin) in _decision_scores.items()
+                 if margin >= threshold}
+        gated_text = " ".join(selector_module.assemble(graph, gated)).strip()
         threshold_selected[f"{threshold:g}"].append(gated_text)
+    print(f"selector interview {interview_number}/{len(prepared)}: complete; "
+          "threshold variants reassembled from the existing graph",
+          file=sys.stderr, flush=True)
 finite_margins = [m for m in _stats["margins"] if math.isfinite(m)]
 sorted_margins = sorted(finite_margins)
 def _quantile(values, fraction):
     return values[min(len(values) - 1, int(fraction * (len(values) - 1)))] if values else None
 stats = {"decisions": tot_dec, "scored": tot_chosen, "evidenced": tot_evidenced,
-         "overrides": _stats["overrides"], "forward_batches": _stats["forward_batches"],
+         "overrides": _stats["overrides"], "prefill_attempts": _stats["prefill_attempts"],
+         "forward_batches": _stats["forward_batches"],
          "decode_steps": _stats["decode_steps"], "prompt_tokens": _stats["prompt_tokens"],
          "evidenced_overrides": _stats["evidenced_overrides"],
          "oom_splits": _stats["oom_splits"],

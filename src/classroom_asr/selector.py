@@ -239,6 +239,29 @@ def select_transcript_with_chooser(
     """
     token_lists = [norm.tokens(t) for t in transcripts if t and t.strip()]
     graph = build_graph(token_lists)
+    return select_graph_with_chooser(
+        graph,
+        chooser_fn,
+        batch_size=batch_size,
+        context=context,
+        evidence_by_slot=evidence_by_slot,
+    )
+
+
+def select_graph_with_chooser(
+    graph: list[Slot],
+    chooser_fn: Callable[[list[Decision]], Mapping[int, object]],
+    *,
+    batch_size: int = 24,
+    context: int = 8,
+    evidence_by_slot: Mapping[int, Sequence[str]] | None = None,
+) -> tuple[str, int, int]:
+    """Select contested slots from an already-built graph.
+
+    This is equivalent to :func:`select_transcript_with_chooser`, but lets callers reuse an
+    expensive whole-recording confusion graph for diagnostic reassembly and threshold sweeps.
+    Candidate validation and the ROVER fallback are identical.
+    """
     decisions = build_decisions(graph, context=context, evidence_by_slot=evidence_by_slot)
     choices: dict[int, object] = {}
     for b in range(0, len(decisions), batch_size):
