@@ -257,6 +257,18 @@ def test_accuracy_shadow_uses_auto_language_known_good_qwen_windows_and_full_whi
     assert '("WhisperLargeV3", globals().get("hyp_A3"))' in source
 
 
+def test_window_batches_emit_progress_and_fail_independently():
+    source = _notebook_source()
+
+    assert 'progress = tqdm(total=len(shard), desc=f"{desc}:{pos}"' in source
+    assert "for offset in range(0, len(shard), batch_size):" in source
+    assert "backend returned {len(texts)} texts for {len(batch_tasks)} windows" in source
+    assert 'texts = [""] * len(batch_tasks)' in source
+    assert "progress.update(len(batch_tasks))" in source
+    assert '[Voxtral shared] FAILED:' in source
+    assert "if vmodels is not None: _free_models(vmodels)" in source
+
+
 def test_voxtral_verbatim_prompt_uses_aae_as_context_without_identity_guessing():
     source = (ROOT / "src" / "classroom_asr" / "backends" / "voxtral_asr.py").read_text(
         encoding="utf-8"

@@ -504,13 +504,26 @@ def window_pass(models, desc, *, chunk_s, batch_size):
     shards = [tasks[i::len(models)] for i in range(len(models))]
     results = {}
     def worker(model, shard, pos):
-        cks = [t[4] for t in shard]
-        if not cks: return
-        try:
-            texts = model.transcribe_chunk_list(cks, batch_size=batch_size)
-        except Exception as e:
-            print(desc, "failed:", repr(e)[:120]); texts = [""] * len(cks)
-        for (k, wi, _start, _end, _), txt in zip(shard, texts): results[(k, wi)] = txt
+        # Feed exactly the same mini-batches the backend used to construct internally, but keep
+        # the loop here so every completed batch emits a heartbeat. A malformed/failed batch now
+        # loses only its own windows instead of blanking this GPU's entire interview shard.
+        if not shard: return
+        progress = tqdm(total=len(shard), desc=f"{desc}:{pos}", position=pos, leave=True)
+        for offset in range(0, len(shard), batch_size):
+            batch_tasks = shard[offset:offset + batch_size]
+            cks = [t[4] for t in batch_tasks]
+            try:
+                texts = list(model.transcribe_chunk_list(cks, batch_size=batch_size))
+                if len(texts) != len(batch_tasks):
+                    raise RuntimeError(
+                        f"backend returned {len(texts)} texts for {len(batch_tasks)} windows")
+            except Exception as e:
+                print(desc, f"batch {offset // batch_size} failed:", repr(e)[:160], flush=True)
+                texts = [""] * len(batch_tasks)
+            for (k, wi, _start, _end, _), txt in zip(batch_tasks, texts):
+                results[(k, wi)] = txt
+            progress.update(len(batch_tasks))
+        progress.close()
     ts = [threading.Thread(target=worker, args=(models[i], shards[i], i)) for i in range(len(models))]
     for t in ts: t.start()
     for t in ts: t.join()
@@ -671,18 +684,30 @@ Both are scored so we see the clean vs verbatim oracle contribution side by side
 hyp_C = hyp_VV = None
 if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
     from classroom_asr.backends.voxtral_asr import VoxtralASR
-    with stage("Voxtral load (shared)"):            # one 9.5 GB load reused by both passes
-        vmodels = load_models(lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev))
-    def _vox_pass(mode, tag):                       # windows balanced across GPUs, one mode
-        for m in vmodels: m.mode = mode
-        t0 = time.time(); out = window_pass(
-            vmodels, tag, chunk_s=VOXTRAL_CHUNK_S, batch_size=12)
-        rec(tag, time.time() - t0); return out
-    if USE_VOXTRAL:
-        hyp_C = _vox_pass("transcription", "+Voxtral"); add_branch("+Voxtral", hyp_C)
-    if USE_VOXTRAL_VERBATIM:
-        hyp_VV = _vox_pass("verbatim", "+VoxtralVerbatim"); add_branch("+VoxtralVerbatim", hyp_VV)
-    _free_models(vmodels); vmodels = None; del vmodels
+    vmodels = None
+    try:
+        with stage("Voxtral load (shared)"):        # one 9.5 GB load reused by both passes
+            vmodels = load_models(
+                lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev))
+        def _vox_pass(mode, tag):                   # windows balanced across GPUs, one mode
+            for m in vmodels: m.mode = mode
+            t0 = time.time(); out = window_pass(
+                vmodels, tag, chunk_s=VOXTRAL_CHUNK_S, batch_size=12)
+            rec(tag, time.time() - t0); return out
+        if USE_VOXTRAL:
+            hyp_C = _vox_pass("transcription", "+Voxtral"); add_branch("+Voxtral", hyp_C)
+        if USE_VOXTRAL_VERBATIM:
+            hyp_VV = _vox_pass("verbatim", "+VoxtralVerbatim")
+            add_branch("+VoxtralVerbatim", hyp_VV)
+    except Exception as e:
+        # Voxtral is optional evidence. Preserve every earlier expensive result and make the
+        # failure conspicuous; the Qwen backbone and remaining graph stay honest.
+        print("[Voxtral shared] FAILED:", repr(e)[:500], flush=True)
+        if USE_VOXTRAL and hyp_C is None: hyp_C = [""] * len(interviews)
+        if USE_VOXTRAL_VERBATIM and hyp_VV is None: hyp_VV = [""] * len(interviews)
+    finally:
+        if vmodels is not None: _free_models(vmodels)
+        vmodels = None
 """),
     md("""## 9a. Branch CW / CWV — CrisperWhisper, independent + Qwen-conditioned
 The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts the clean
