@@ -81,7 +81,7 @@ torch.backends.cudnn.allow_tf32 = True
 # Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
 # loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
 # versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
-%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz hf_transfer virtualenv
+%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz hf_transfer virtualenv pyyaml typeguard
 %pip -q install "transformers==4.57.6" "accelerate==1.12.0" "git+https://github.com/{GITHUB_REPO}.git"
 # NOTE: CrisperWhisper is NOT installed here — its CT2 fork replaces the `ctranslate2`
 # module and would clobber faster-whisper (branch A). It runs in an isolated venv (§9a).
@@ -115,6 +115,10 @@ USE_CTC        = True;  CTC_MODEL      = "facebook/wav2vec2-large-960h-lv60-self
 USE_QWEN3ASR   = True;  QWEN3ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 USE_VOXTRAL    = True;  VOXTRAL_MODEL  = "mistralai/Voxtral-Mini-3B-2507"
 USE_PHONE      = True;  PHONE_MODEL    = "facebook/wav2vec2-lv-60-espeak-cv-ft"
+# PhoneticXeus (§7.3/§10): the design's named universal phone recognizer (XEUS + self-cond CTC,
+# SOTA accented-English IPA). Phone branches output realized IPA (unscored on CORAAL — no
+# phonetic reference); they feed the OOV/nonce recovery route (phone lattice -> P2G), not word WER.
+USE_PHONETIC_XEUS = True;  PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
 # Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
 USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbatim
@@ -532,22 +536,37 @@ json.dump(out, open(outp, "w"))
     rec("+CrisperWhisper", time.time() - _cw_t0)
     add_branch("+CrisperWhisper", hyp_CW)
 """),
-    md("""## 10. Phone branch — realized IPA (the pronunciation path)
+    md("""## 10. Phone branches — realized IPA (the pronunciation path)
 Not a word transcript: the phone branch's product is *pronunciation*. Scoring it needs a
 phonetic reference (PER/IPA-CER, §18.1), which CORAAL doesn't provide — so we show the
 realized IPA rather than force it through a naive P2G into a misleading word WER. It's a
-first-class part of the design (OOV/nonce recovery), just not exercised by this dataset."""),
+first-class part of the design (OOV/nonce recovery), just not exercised by this dataset.
+
+Two models: `wav2vec2-lv-60-espeak` (now decoded via a manual vocab CTC decoder — the
+`Wav2Vec2PhonemeCTCTokenizer` won't load on transformers 4.57.x, so the branch used to be
+skipped), and **PhoneticXeus** — the design's named universal recognizer (XEUS + self-conditioned
+CTC, SOTA accented-English IPA). Compare their IPA on the same audio."""),
     code(r"""
 if USE_PHONE:
     try:                                    # illustrative + unscored: never let it stop the run
         from classroom_asr.backends.wav2vec2_phone import Wav2Vec2Phone
         ipa = whole_rec(lambda dev: Wav2Vec2Phone(PHONE_MODEL, device=dev),
                         lambda m, a: m.transcribe_full(a), "phone")
-        print("realized IPA (first 300 chars of interview 0):")
+        print("wav2vec2-espeak realized IPA (first 300 chars of interview 0):")
         print(" ", (ipa[0] or "")[:300])
         print("\nreference words (for contrast):", refs[0][:200])
     except Exception as e:
         print("phone branch skipped:", repr(e)[:160])
+
+if USE_PHONETIC_XEUS:
+    try:                                    # the design's named phone model (SOTA IPA); unscored
+        from classroom_asr.backends.phonetic_xeus import PhoneticXeus
+        xipa = whole_rec(lambda dev: PhoneticXeus(PHONETIC_XEUS_MODEL, device=dev),
+                         lambda m, a: m.transcribe_full(a), "PhoneticXeus")
+        print("PhoneticXeus realized IPA (first 300 chars of interview 0):")
+        print(" ", (xipa[0] or "")[:300])
+    except Exception as e:
+        print("PhoneticXeus skipped:", repr(e)[:200])
 """),
     md("## 11. What specific mistakes — error analysis (branch A vs reference)"),
     code(r"""

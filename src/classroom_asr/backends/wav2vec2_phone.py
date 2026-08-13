@@ -23,6 +23,55 @@ from ..datamodel import PhonePath
 from ..pipeline.base import PhoneEncoder, SpeechSegment
 
 
+class _ManualPhonemeCTCDecoder:
+    """Greedy CTC phone decoder built from the model's ``vocab.json`` directly.
+
+    A drop-in for the (currently unloadable) ``Wav2Vec2PhonemeCTCTokenizer``: it exposes the
+    same ``batch_decode(pred_ids)`` the rest of the branch calls, so nothing else changes.
+    Greedy CTC = collapse runs of the same id, drop the blank/pad id, map the rest through the
+    vocab, join phones with spaces (the phoneme tokenizer's ``|`` word-delimiter becomes a
+    space). Exact tokenizer fidelity isn't needed — the phone branch's product is a realized-IPA
+    string, not word tokens."""
+
+    _SPECIAL = {"<pad>", "<s>", "</s>", "<unk>", "<mask>"}
+
+    def __init__(self, id_to_tok, blank_id, word_delim="|"):
+        self.id_to_tok = id_to_tok
+        self.blank_id = blank_id
+        self.word_delim = word_delim
+
+    @classmethod
+    def from_repo(cls, model_id):
+        import json
+        from huggingface_hub import hf_hub_download
+
+        with open(hf_hub_download(model_id, "vocab.json"), encoding="utf-8") as fh:
+            vocab = json.load(fh)                       # {phone: id}
+        id_to_tok = {int(i): t for t, i in vocab.items()}
+        blank_id = vocab.get("<pad>", 0)                # CTC blank == pad for wav2vec2
+        return cls(id_to_tok, blank_id)
+
+    def batch_decode(self, pred_ids, **_kw):
+        seqs = pred_ids.tolist() if hasattr(pred_ids, "tolist") else pred_ids
+        out = []
+        for seq in seqs:
+            phones, prev = [], None
+            for i in seq:
+                i = int(i)
+                if i == prev:                           # CTC: collapse repeats
+                    continue
+                prev = i
+                if i == self.blank_id:
+                    continue
+                tok = self.id_to_tok.get(i, "")
+                if tok == self.word_delim:
+                    phones.append(" ")                  # word boundary
+                elif tok and tok not in self._SPECIAL:
+                    phones.append(tok)
+            out.append(" ".join(phones).replace("   ", " ").strip())
+        return out
+
+
 class Wav2Vec2Phone(PhoneEncoder):
     def __init__(
         self,
@@ -53,18 +102,18 @@ class Wav2Vec2Phone(PhoneEncoder):
 
     @staticmethod
     def _load_fe_tok(model_id):
-        """Load the feature extractor and phoneme tokenizer **separately**.
+        """Load the feature extractor and a phoneme **decoder**.
 
         On transformers 4.57.x the combined ``Wav2Vec2Processor`` is broken for this
         phoneme model, and ``AutoTokenizer`` can even return a *bool* instead of a
-        tokenizer. So load the feature extractor and tokenizer directly, trying the
-        explicit phoneme-tokenizer class first and **validating** that we actually got a
-        decoder (``batch_decode``) — raising clearly if this build can't provide one."""
+        tokenizer. So load the feature extractor directly, try the explicit phoneme
+        tokenizer classes first (validating we actually got a ``batch_decode``), and if
+        none work, fall back to a manual greedy-CTC decoder built straight from the model's
+        ``vocab.json`` — so the branch always runs instead of being skipped."""
         from transformers import AutoFeatureExtractor
         import transformers as tf
 
         fe = AutoFeatureExtractor.from_pretrained(model_id)
-        tok = None
         loaders = [
             lambda: tf.Wav2Vec2PhonemeCTCTokenizer.from_pretrained(model_id),
             lambda: tf.AutoTokenizer.from_pretrained(model_id, use_fast=False),
@@ -76,12 +125,8 @@ class Wav2Vec2Phone(PhoneEncoder):
             except Exception:
                 continue
             if hasattr(cand, "batch_decode"):
-                tok = cand
-                break
-        if tok is None:
-            raise RuntimeError(
-                f"no usable phoneme tokenizer for {model_id} on this transformers build")
-        return fe, tok
+                return fe, cand
+        return fe, _ManualPhonemeCTCDecoder.from_repo(model_id)
 
     def recognize(self, segment: SpeechSegment, *, top_k: int) -> list[PhonePath]:
         if segment.waveform is None:
