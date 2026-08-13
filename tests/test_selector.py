@@ -1,7 +1,7 @@
 from classroom_asr.normalize import Normalizer
 from classroom_asr.rover import build_graph, NULL
 from classroom_asr.selector import (
-    build_decisions, format_batch, parse_batch, assemble, select_transcript,
+    build_decisions, format_batch, parse_batch, generated_token_ids, assemble, select_transcript,
 )
 
 N = Normalizer()
@@ -32,6 +32,28 @@ def test_prompt_and_parse_roundtrip():
     letter_for = {tok: L for L, tok in decs[0].options}
     choices = parse_batch(f"1:{letter_for['there']}", decs)
     assert choices == {decs[0].slot: "there"}
+
+
+def test_parser_accepts_bounded_markdown_and_json_variants():
+    g = _graph("their house", "there house", "they're house")
+    decs = build_decisions(g)
+    letter_for = {tok: letter for letter, tok in decs[0].options}
+    wanted = letter_for["there"]
+
+    variants = [
+        f"- 1: option {wanted}",
+        f"**answers**\n1 -> {wanted}",
+        '{"1": "' + wanted + '"}',
+        '[{"item": 1, "choice": "' + wanted + '"}]',
+    ]
+    for response in variants:
+        assert parse_batch(response, decs) == {decs[0].slot: "there"}
+
+
+def test_generated_token_ids_supports_full_sequence_and_completion_only():
+    prompt = [[10, 20, 30]]
+    assert generated_token_ids([[10, 20, 30, 40, 50]], prompt) == [40, 50]
+    assert generated_token_ids([[40, 50]], prompt) == [40, 50]
 
 
 def test_llm_choice_overrides_only_its_slot():

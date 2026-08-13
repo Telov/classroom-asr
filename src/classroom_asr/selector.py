@@ -21,6 +21,7 @@ only for OOV/nonce spans with strong phone/P2G support.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -28,7 +29,11 @@ from .normalize import DEFAULT, Normalizer
 from .rover import NULL, Slot, build_graph
 
 DROP = "∅"  # shown to the model as the "drop this word" candidate
-_ANSWER = re.compile(r"(\d+)\s*[:.\)]\s*([A-Za-z])")
+_ANSWER = re.compile(
+    r"^\s*(?:[-*]\s*)?[\"']?(\d+)[\"']?\s*(?:[:.)=\-]|->)\s*"
+    r"(?:[\"']?\s*)?(?:option\s+)?([A-Za-z])\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 @dataclass
@@ -92,17 +97,67 @@ def format_batch(decisions: list[Decision]) -> str:
 
 
 def parse_batch(text: str, decisions: list[Decision]) -> dict[int, object]:
-    """Map ``N:LETTER`` answers back to {slot_index: chosen_token}. Unknown/missing are skipped."""
+    """Map model answers back to ``{slot_index: chosen_token}``.
+
+    The requested wire format is ``N:LETTER``, but instruction-tuned models commonly wrap that
+    in Markdown or JSON, or spell it as ``N: option LETTER``.  Accept those harmless variations
+    while keeping the parser constrained to a numbered item and one of that item's advertised
+    letters.  Unknown, duplicated, and missing answers are skipped or overwritten by the last
+    valid answer for that item.
+    """
     choices: dict[int, object] = {}
-    for m in _ANSWER.finditer(text or ""):
-        n = int(m.group(1))
+    raw = text or ""
+    answers: list[tuple[object, object]] = []
+    try:
+        payload = json.loads(raw.strip())
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = None
+    if isinstance(payload, dict):
+        answers.extend(payload.items())
+    elif isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                number = item.get("item", item.get("number", item.get("n")))
+                letter = item.get("answer", item.get("choice", item.get("letter")))
+                answers.append((number, letter))
+    answers.extend((m.group(1), m.group(2)) for m in _ANSWER.finditer(raw))
+
+    for number, answer in answers:
+        try:
+            n = int(number)
+        except (TypeError, ValueError):
+            continue
         if 1 <= n <= len(decisions):
             d = decisions[n - 1]
             opts = dict(d.options)
-            letter = m.group(2).upper()
+            match = re.search(r"\b([A-Za-z])\b", str(answer or ""))
+            if not match:
+                continue
+            letter = match.group(1).upper()
             if letter in opts:
                 choices[d.slot] = opts[letter]
     return choices
+
+
+def generated_token_ids(generated_ids, input_ids) -> list[int]:
+    """Return only newly generated token IDs without depending on a Transformers convention.
+
+    Decoder-only ``generate`` normally returns ``prompt + completion``.  Some wrappers and
+    generation backends return only the completion.  Blindly slicing either form by the prompt
+    length can therefore turn a valid response into an empty string.  Inputs may be tensors or
+    ordinary (nested) sequences; the return value is always a plain list for easy decoding.
+    """
+    generated = generated_ids.tolist() if hasattr(generated_ids, "tolist") else generated_ids
+    prompt = input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids
+    if generated and isinstance(generated[0], (list, tuple)):
+        generated = generated[0]
+    if prompt and isinstance(prompt[0], (list, tuple)):
+        prompt = prompt[0]
+    generated = list(generated or [])
+    prompt = list(prompt or [])
+    if len(generated) >= len(prompt) and generated[:len(prompt)] == prompt:
+        return generated[len(prompt):]
+    return generated
 
 
 def assemble(graph: list[Slot], choices: dict[int, object]) -> list[str]:

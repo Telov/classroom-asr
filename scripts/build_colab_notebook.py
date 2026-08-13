@@ -62,7 +62,7 @@ Run All). If it ever still stops here, just click Run All once more."""),
     code(f"""
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"   # Rust parallel-chunk downloads (2-5x faster)
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"     # current high-throughput Hub/Xet downloads
 # Persist ONLY the small CrisperWhisper venv across Kaggle sessions (Settings -> Persistence
 # -> "Files only" keeps /kaggle/working). Model WEIGHTS are deliberately NOT persisted here:
 # the persisted dir is capped (~20 GB) but the full model set is ~26 GB, so redirecting the HF
@@ -81,7 +81,7 @@ torch.backends.cudnn.allow_tf32 = True
 # Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
 # loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
 # versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
-%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz hf_transfer virtualenv pyyaml typeguard
+%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz virtualenv pyyaml typeguard
 %pip -q install "transformers==4.57.6" "accelerate==1.12.0" "git+https://github.com/{GITHUB_REPO}.git"
 # NOTE: CrisperWhisper is NOT installed here — its CT2 fork replaces the `ctranslate2`
 # module and would clobber faster-whisper (branch A). It runs in an isolated venv (§9a).
@@ -127,6 +127,10 @@ USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbat
 # branch baseline toward the oracle floor. Qwen3.5-9B = design's "default first judge" (§14.2);
 # runs isolated (own venv, newer transformers) in fp16 across both freed T4s. NEW hatch off (§14.5).
 USE_LLM_SELECTOR = True;  SELECTOR_MODEL = "Qwen/Qwen3.5-9B"
+# Pin the selector-only environment independently from qwen-asr's older main-kernel stack.
+# These are the versions validated by this notebook; the fingerprint in §2a upgrades a persisted
+# selector venv whenever either pin changes instead of silently reusing stale packages.
+SELECTOR_TRANSFORMERS = "5.15.0"; SELECTOR_ACCELERATE = "1.14.0"
 
 # Speed (all quality-neutral): the LLM branches auto-pick fp16 on T4 (Turing has no bf16
 # tensor cores — that was most of the slowness; fp16 is the same inference path Whisper
@@ -193,7 +197,7 @@ def _cw_prewarm():
         subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", CW_VENV],
                        check=True)
         subprocess.run([os.path.join(CW_VENV, "bin", "pip"), "-q", "install",
-                        "crisperwhisper[ct2]", "hf_transfer"], check=True)  # fast venv downloads
+                        "crisperwhisper[ct2]"], check=True)
         open(CW_READY, "w").close()               # mark usable only now
     except Exception as e:
         _cw["err"] = e
@@ -209,23 +213,30 @@ SEL_WORK = os.path.join(os.environ.get("ASR_PERSIST", os.path.abspath(".")), "se
 os.makedirs(SEL_WORK, exist_ok=True)
 SEL_VENV = os.path.join(SEL_WORK, "venv"); SEL_VENV_PY = os.path.join(SEL_VENV, "bin", "python")
 SEL_READY = os.path.join(SEL_WORK, ".venv_ready")
+SEL_ENV_SPEC = f"transformers=={SELECTOR_TRANSFORMERS}|accelerate=={SELECTOR_ACCELERATE}"
 _sel = {"thread": None, "err": None}
 def _sel_prewarm():
     try:
-        if _reusable(SEL_READY, SEL_VENV_PY, SEL_VENV):
+        try:
+            _ready_spec = open(SEL_READY).read().strip()
+        except OSError:
+            _ready_spec = ""
+        if _reusable(SEL_READY, SEL_VENV_PY, SEL_VENV) and _ready_spec == SEL_ENV_SPEC:
             print("selector venv: reusing persisted build", flush=True); return
-        subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", SEL_VENV],
-                       check=True)
+        if not _venv_ok(SEL_VENV_PY):
+            subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", SEL_VENV],
+                           check=True)
         subprocess.run([os.path.join(SEL_VENV, "bin", "pip"), "-q", "install", "-U",
-                        "transformers", "accelerate", "hf_transfer"], check=True)   # fp16, no bnb
-        open(SEL_READY, "w").close()
+                        f"transformers=={SELECTOR_TRANSFORMERS}",
+                        f"accelerate=={SELECTOR_ACCELERATE}"], check=True)   # fp16, no bnb
+        with open(SEL_READY, "w") as f: f.write(SEL_ENV_SPEC)
     except Exception as e:
         _sel["err"] = e
 if USE_LLM_SELECTOR:
     _sel["thread"] = threading.Thread(target=_sel_prewarm, daemon=True); _sel["thread"].start()
     print("selector venv prewarm: started")
 
-# (b) Prefetch model weights (hf_transfer-accelerated) so the heavy Voxtral/Qwen downloads
+# (b) Prefetch model weights (high-performance Xet) so the heavy Voxtral/Qwen downloads
 # overlap earlier branches instead of blocking their cells. Best-effort; branches re-fetch
 # lazily if a prefetch fails.
 def _prefetch():
@@ -773,48 +784,52 @@ if USE_LLM_SELECTOR:
         if _sel.get("err") is not None: raise _sel["err"]
         with open(SEL_WORKER, "w") as f:
             f.write('''
-import sys, json, torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from classroom_asr.selector import select_transcript
+import sys, json, torch, transformers
+from transformers import AutoModelForMultimodalLM, AutoProcessor
+from classroom_asr.selector import generated_token_ids, select_transcript
 from classroom_asr.normalize import Normalizer
 SCORE = Normalizer(fold_numbers=True, fold_spelling=True)
 model_id, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 data = json.load(open(inp))
-tok = AutoTokenizer.from_pretrained(model_id)
-if tok.pad_token_id is None: tok.pad_token = tok.eos_token
+processor = AutoProcessor.from_pretrained(model_id)
 # Full fp16, sharded across BOTH T4s (acoustic models are unloaded -> 32 GB free; 9B fp16 ~18 GB).
 # No quantization: the design wants the judge validated at full precision first (§21). fp16 (not
 # bf16) because T4/Turing has fp16 tensor cores but no bf16 path.
 try:
-    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float16, device_map="auto").eval()
+    model = AutoModelForMultimodalLM.from_pretrained(
+        model_id, dtype=torch.float16, device_map="auto").eval()
 except TypeError:
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16, device_map="auto").eval()
+    model = AutoModelForMultimodalLM.from_pretrained(
+        model_id, torch_dtype=torch.float16, device_map="auto").eval()
 _dev = next(model.parameters()).device            # feed inputs to the shard holding the embeddings
 _dbg = {"n": 0}
+print(f"selector runtime: transformers={transformers.__version__} model={type(model).__name__}",
+      file=sys.stderr)
 def llm_fn(prompt):
-    # Qwen3.5 is a reasoning model; unchecked "thinking" eats the whole budget before any answer.
-    # Belt AND suspenders: enable_thinking=False on the template + the "/no_think" soft switch.
-    msgs = [{"role": "user", "content": prompt + " /no_think"}]
-    try:
-        ids = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, return_tensors="pt")
-    except TypeError:
-        ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
-    ids = ids.to(_dev)
+    # Follow Qwen3.5's official AutoProcessor + multimodal-model interface even for text-only
+    # input. Hard-disable thinking in the chat template so it cannot consume the answer budget.
+    msgs = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    inputs = processor.apply_chat_template(
+        msgs, add_generation_prompt=True, enable_thinking=False, tokenize=True,
+        return_dict=True, return_tensors="pt").to(_dev)
     with torch.inference_mode():
-        out = model.generate(ids, max_new_tokens=1024, do_sample=False, pad_token_id=tok.pad_token_id)
-    resp = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+        out = model.generate(**inputs, max_new_tokens=512, do_sample=False)
+    completion = generated_token_ids(out, inputs["input_ids"])
+    resp = processor.decode(completion, skip_special_tokens=True)
     if _dbg["n"] < 1:                              # surface the first raw exchange so we can see
         _dbg["n"] += 1                             # the real output format and fix parsing if needed
         print("=== SAMPLE SELECTOR PROMPT (head) ===", file=sys.stderr)
         print(prompt[:700], file=sys.stderr)
         print("=== SAMPLE SELECTOR RESPONSE ===", file=sys.stderr)
-        print(repr(resp[:1500]), file=sys.stderr)
+        print(f"generated_tokens={len(completion)} response={resp[:1500]!r}", file=sys.stderr)
     return resp
 selected = []; tot_dec = tot_chosen = 0
 for branches in data["branch_transcripts"]:
     text, nd, nc = select_transcript([b for b in branches if b], llm_fn, norm=SCORE, batch_size=24)
     selected.append(text); tot_dec += nd; tot_chosen += nc
 print(f"selector decided {tot_chosen}/{tot_dec} contested slots", file=sys.stderr)
+if tot_dec and not tot_chosen:
+    raise RuntimeError("selector parsed zero answers; inspect SAMPLE SELECTOR RESPONSE above")
 json.dump({"selected": selected}, open(outp, "w"))
 ''')
         _wb2 = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
