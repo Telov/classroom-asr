@@ -4,6 +4,7 @@ import pytest
 
 from classroom_asr.candidate_graph import (
     NULL,
+    _realizable_oracle_distance_python,
     build_graph,
     realizable_oracle_distance,
     realizable_oracle_tokens,
@@ -160,6 +161,7 @@ def test_exact_oracle_matches_exhaustive_paths_on_small_graphs():
                     for path in _offered_paths(graph)
                 )
                 assert realizable_oracle_distance(graph, reference) == brute
+                assert _realizable_oracle_distance_python(graph, reference) == brute
 
 
 def test_empty_graph():

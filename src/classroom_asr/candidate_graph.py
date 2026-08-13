@@ -17,8 +17,9 @@ branches to **each other**, then chooses. This module is that substrate:
   inspection. It is realizable, but local alignment ties mean it must not be used as the exact
   oracle score.
 
-Pure stdlib + the package's own aligner (an ``opcodes`` argument lets the notebook feed a fast
-rapidfuzz alignment for whole-recording inputs).
+The graph builder remains pure stdlib + the package's own aligner (an ``opcodes`` argument lets
+the notebook feed a fast RapidFuzz alignment for whole-recording inputs). Exact lattice scoring
+uses NumPy when available and an equivalent dependency-free dynamic program otherwise.
 """
 
 from __future__ import annotations

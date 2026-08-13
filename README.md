@@ -38,8 +38,8 @@ What runs now:
 - real Qwen3-ASR, faster-whisper, wav2vec2 CTC/phone, Voxtral, CrisperWhisper,
   and PhoneticXEUS backend adapters;
 - a reproducible Kaggle CORAAL benchmark with exact branch error counts,
-  Qwen-anchored candidate graphs, realizable-oracle WER, leave-one-out overlap,
-  and an exhaustive accuracy/runtime branch-subset frontier.
+  Qwen-anchored candidate graphs, exact lattice realizable-oracle WER, architecture-aware
+  leave-one-out overlap, per-interview error shapes, and marginal runtime attribution.
 
 What remains research/integration work: robust lattice-aware P2G, calibrated
 confidence, the production whole-lesson constrained selector, learned multi-encoder
@@ -55,6 +55,7 @@ intentionally excluded from the current English benchmark.
 | `src/classroom_asr/datamodel.py` | immutable evidence model, candidate record (§1.2, §22) |
 | `src/classroom_asr/lexicon.py` | session/persistent lexicon, phonetic RAG (§10.4–10.5) |
 | `src/classroom_asr/candidates.py` | candidate-graph builder, MBR/consensus (§12) |
+| `src/classroom_asr/candidate_graph.py` | Qwen-pivoted whole-transcript lattice + exact oracle (§12, §18) |
 | `src/classroom_asr/metrics.py` | WER, deletion slices, candidate-oracle WER (§18) |
 | `src/classroom_asr/config.py` | frozen model/param choices as config (§26) |
 | `src/classroom_asr/io.py` | lesson-package on-disk layout (§22.1) |
@@ -105,11 +106,12 @@ are:
 - independent CrisperWhisper and Qwen-conditioned Crisper Verbatimize.
 
 The selector and its phone/IPA inputs are temporarily paused while upstream branches
-undergo exact overlap and subset-oracle analysis. The final JSON includes branch WER
-and S/D/I, deletion rates, model/runtime fingerprints, cached Hub revision inventory,
-leave-one-out and pairwise overlap, and a runtime-aware Pareto frontier across all
-Qwen-anchored branch subsets. Read the Qwen→realizable-oracle gap and deletion slices,
-not just absolute WER (§18).
+undergo exact overlap and leave-one-out oracle analysis. The final JSON includes corpus and
+per-interview S/D/I, deletion rates, model/runtime fingerprints, cached Hub revision inventory,
+unique recovered-word categories, pairwise overlap, exact optional-branch leave-one-out oracle
+deltas, and the marginal runtime each removal would actually save after shared loads are accounted
+for. Qwen remains the required graph pivot rather than being presented as a removable peer. Read
+the Qwen→realizable-oracle gap and deletion slices, not just absolute WER (§18).
 
 ## Non-goals (§2)
 

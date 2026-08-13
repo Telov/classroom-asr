@@ -36,7 +36,8 @@
   benchmark demonstrates otherwise.
 - Evaluate non-destructive VAD behavior as a separate turbo-Whisper shadow while reusing the same
   loaded checkpoint. Keep the existing VAD transcript as the baseline until exact S/D/I and
-  branch-subset oracle evidence shows whether quiet-word recovery outweighs silence hallucination.
+  optional-branch leave-one-out oracle evidence shows whether quiet-word recovery outweighs
+  silence hallucination.
 - In the CORAAL Voxtral verbatim prompt, describe the material as predominantly African American
   English while explicitly forbidding identity-based guessing or dialect normalization.
 - A 90-second Qwen window with a 1024-token budget regressed English CORAAL WER from about 0.157

@@ -424,7 +424,7 @@ _GRAPH_OPCODE_CACHE = {}
 _HYP_TOKEN_CACHE = {"": []}
 
 def hyp_tokens(text):
-    # All subset/leave-one-out analyses reuse the same transcript strings. Normalize each unique
+    # All repeated leave-one-out analyses reuse the same transcript strings. Normalize each unique
     # hypothesis once in memory; no transcript or token cache is persisted across runs.
     value = text or ""
     if value not in _HYP_TOKEN_CACHE:
@@ -434,7 +434,7 @@ def hyp_tokens(text):
 def fast_graph_opcodes(pivot, hypothesis):
     # Cached compiled alignment for repeated whole-interview candidate-graph builds.
     # The cache value retains both lists, so Python cannot recycle their ids into a false hit.
-    # This avoids rebuilding and hashing two multi-thousand-word tuples on every subset.
+    # This avoids rebuilding and hashing two multi-thousand-word tuples on every graph rebuild.
     key = (id(pivot), id(hypothesis))
     entry = _GRAPH_OPCODE_CACHE.get(key)
     if entry is None or entry[0] is not pivot or entry[1] is not hypothesis:
@@ -708,7 +708,7 @@ try:
     hyp_A = _turbo_pass(WHISPER_VAD, "A whisper")
     if USE_WHISPER_NO_VAD_SHADOW:
         # Same weights/decode, no second model load. This is a candidate-only experiment: no-VAD
-        # may recover quiet words and may hallucinate in silence; exact S/D/I and subset-oracle
+        # may recover quiet words and may hallucinate in silence; exact S/D/I and leave-one-out
         # metrics decide whether it survives. It never silently replaces the VAD baseline.
         hyp_ANV = _turbo_pass(False, "Whisper no-VAD shadow")
 except Exception as e:
