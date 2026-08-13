@@ -24,6 +24,10 @@
 - Feed the selector compact candidate-local phonetic evidence: expected pronunciation in local
   context, accent-aware match scores, and localized realized-phone excerpts. Do not place entire
   multi-second IPA windows in the LLM prompt.
+- Current benchmark mode pauses the LLM selector while measuring word-branch overlap. Because the
+  phone branches currently feed only that selector, skip them as well in this mode. Use exact
+  leave-one-branch-out reference coverage before proposing removal of any word branch; do not
+  equate high overlap alone with unchanged realizable-oracle WER.
 
 ## Document reading and project notes
 

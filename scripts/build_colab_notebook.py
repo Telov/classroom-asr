@@ -45,8 +45,8 @@ Branches (each a different architecture → complementary errors, §8):
 * **C** Voxtral Mini 3B (audio-LLM)
 * **CW** CrisperWhisper 2.0 — a **verbatim**-tuned Whisper (keeps um/uh/false starts)
 * **VV** Voxtral, **verbatim-prompted** (instruct mode, told to keep disfluencies)
-* **phone** wav2vec2 phoneme CTC + PhoneticXEUS → timestamped **realized-IPA evidence**
-  retrieved into the LLM judge prompt (not forced into word WER; CORAAL has no phone reference)
+* **phone** wav2vec2 phoneme CTC + PhoneticXEUS → timestamped **realized-IPA evidence** when
+  the selector is enabled (currently paused during word-branch overlap analysis)
 
 **Kaggle:** Settings → Accelerator → **GPU T4 x2**, Internet **ON**. Uses both T4s.
 
@@ -118,11 +118,15 @@ WHISPER_VAD    = True      # skip silence (less hallucination); off = keep quiet
 USE_CTC        = True;  CTC_MODEL      = "facebook/wav2vec2-large-960h-lv60-self"
 USE_QWEN3ASR   = True;  QWEN3ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 USE_VOXTRAL    = True;  VOXTRAL_MODEL  = "mistralai/Voxtral-Mini-3B-2507"
-USE_PHONE      = True;  PHONE_MODEL    = "facebook/wav2vec2-lv-60-espeak-cv-ft"
+# Selector paused while the word branches undergo leave-one-out overlap analysis. Phone/IPA is
+# selector input in this benchmark, so skip both phone models too rather than compute unused data.
+USE_LLM_SELECTOR = False; SELECTOR_MODEL = "Qwen/Qwen3.5-9B"
+USE_PHONE      = USE_LLM_SELECTOR; PHONE_MODEL = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 # PhoneticXeus (§7.3/§10): the design's named universal phone recognizer (XEUS + self-cond CTC,
 # SOTA accented-English IPA). Phone branches output timestamped realized-IPA evidence (unscored
 # on CORAAL — no phonetic reference) that is retrieved into the selector prompt, not merely printed.
-USE_PHONETIC_XEUS = True;  PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
+USE_PHONETIC_XEUS = USE_LLM_SELECTOR
+PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
 # Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
 CRISPER_VERSION      = "2.0.2"  # exact CT2 runtime validated by the notebook integration
@@ -131,7 +135,6 @@ USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbat
 # the contested slots (confident spans frozen, §12.5), driving the final transcript from the
 # branch baseline toward the oracle floor. Qwen3.5-9B = design's "default first judge" (§14.2);
 # runs isolated (own venv, newer transformers) in fp16 across both freed T4s. NEW hatch off (§14.5).
-USE_LLM_SELECTOR = True;  SELECTOR_MODEL = "Qwen/Qwen3.5-9B"
 # Pin the selector-only environment independently from qwen-asr's older main-kernel stack.
 # These are the versions validated by this notebook; the fingerprint in §2a upgrades a persisted
 # selector venv whenever either pin changes instead of silently reusing stale packages.
@@ -770,7 +773,7 @@ json.dump(out, open(outp, "w"))
     rec("+CrisperWhisper", time.time() - _cw_t0)
     add_branch("+CrisperWhisper", hyp_CW)
 """),
-    md("""## 10. Phone branches — timestamped acoustic evidence for the LLM
+    md("""## 10. Phone branches — timestamped acoustic evidence for the LLM (paused with selector)
 The phone path is *pronunciation evidence*, not a word transcript. CORAAL has no phonetic
 reference, so PER/IPA-CER cannot be reported here and IPA is never forced into word WER.
 However, it is no longer diagnostic-only: both phone streams are kept in timestamped ~24 s
@@ -780,7 +783,9 @@ windows and the selector retrieves the windows overlapping each uncertain word r
 Two independent phone candidates are preserved: `wav2vec2-lv-60-espeak` (manual vocab CTC
 decoder for transformers 4.57.x compatibility) and **PhoneticXeus**, the design's default
 accented-English/multilingual phone recognizer. The backends currently expose one path each;
-true within-model N-best/posterior lattices and robust P2G remain the next upstream milestone."""),
+true within-model N-best/posterior lattices and robust P2G remain the next upstream milestone.
+While `USE_LLM_SELECTOR=False`, both phone flags follow it and this section performs no model
+download or inference; the implementation remains ready for the selector's return."""),
     code(r"""
 phone_evidence = [[] for _ in interviews]
 
@@ -965,7 +970,7 @@ from classroom_asr.selector import build_decisions
 # anchored to it. Phone branches are IPA evidence, not word candidates.
 _wb_named = [("Qwen3-ASR", globals().get("hyp_Z")),
              ("Whisper", globals().get("hyp_A")),
-             ("GigaAM", globals().get("hyp_B")),
+             ("wav2vec2 CTC", globals().get("hyp_B")),
              ("Voxtral", globals().get("hyp_C")),
              ("VoxtralVerbatim", globals().get("hyp_VV")),
              ("CrisperWhisper", globals().get("hyp_CW"))]
@@ -991,8 +996,66 @@ print(f"[BACKBONE       ] {backbone_name} WER={canonical_wer:.3f}"
       f"  (recall floor={recall_floor(pool):.3f})")
 print(f"selector decisions: {_decisions}/{_total} aligned slots "
       f"({100*_decisions/max(_total,1):.1f}%); every unselected slot keeps the backbone token")
+
+# Cheap, exact leave-one-branch-out analysis for the candidate recall floor. Each branch is
+# aligned to the reference once with RapidFuzz; a reference occurrence is "unique" when this is
+# the only word branch that recovered it. Removing that branch raises the recall floor by exactly
+# unique/R. This screens for overlap without rerunning ASR or rebuilding the expensive graph six
+# times. It does NOT prove equal realizable-oracle WER, so branch removal still waits for evidence.
+_R = sum(len(rt) for rt in _reftok)
+_branch_hits = []
+for _name, _hyps in _wb_named:
+    _hits = set()
+    for _k, (_rt, _hyp) in enumerate(zip(_reftok, _hyps)):
+        for _tag, _i0, _i1, _j0, _j1 in Levenshtein.opcodes(
+                _rt, SCORE.tokens(_hyp or "")).as_list():
+            if _tag == "equal":
+                _hits.update((_k, _ri) for _ri in range(_i0, _i1))
+    _branch_hits.append(_hits)
+_all_hits = set().union(*_branch_hits) if _branch_hits else set()
+_timing_by_name = {name: dt for name, dt in TIMINGS}
+_stage_for_branch = {"Qwen3-ASR": "A+B+Qwen3", "Whisper": "A whisper",
+                     "wav2vec2 CTC": "A+B", "Voxtral": "+Voxtral",
+                     "VoxtralVerbatim": "+VoxtralVerbatim",
+                     "CrisperWhisper": "+CrisperWhisper"}
+branch_overlap_ablation = []
+print("\n=== word-branch overlap: exact leave-one-out recall-floor effect ===")
+print("branch                 WER   ref_hits  unique  overlap  floor_without  stage_s")
+for _bi, ((_name, _hyps), _hits) in enumerate(zip(_wb_named, _branch_hits)):
+    _other_hits = set().union(*(_branch_hits[:_bi] + _branch_hits[_bi + 1:]))
+    _unique = _hits - _other_hits
+    _overlap = len(_hits & _other_hits) / max(len(_hits), 1)
+    _floor_without = (_R - len(_other_hits)) / max(_R, 1)
+    _stage_s = _timing_by_name.get(_stage_for_branch.get(_name, ""))
+    _row = {"branch": _name, "wer": round(wer_of(_hyps), 4),
+            "reference_hits": len(_hits), "unique_reference_hits": len(_unique),
+            "hit_overlap_fraction": round(_overlap, 4),
+            "recall_floor_without": round(_floor_without, 4),
+            "recall_floor_increase_if_removed": round(len(_unique) / max(_R, 1), 4),
+            "stage_seconds": round(_stage_s, 1) if _stage_s is not None else None}
+    branch_overlap_ablation.append(_row)
+    print(f"{_name:22s} {_row['wer']:.3f} {len(_hits):9d} {len(_unique):7d} "
+          f"{100*_overlap:7.1f}% {_floor_without:14.3f} "
+          f"{_stage_s if _stage_s is not None else float('nan'):8.1f}")
+print(f"full-pool recall floor: {(_R-len(_all_hits))/max(_R,1):.3f}")
+branch_pair_overlap = []
+print("\n=== pairwise overlap of correctly recovered reference occurrences ===")
+print("branch pair                                      shared  smaller-covered")
+for _left in range(len(_wb_named)):
+    for _right in range(_left + 1, len(_wb_named)):
+        _shared = len(_branch_hits[_left] & _branch_hits[_right])
+        _smaller_covered = _shared / max(
+            min(len(_branch_hits[_left]), len(_branch_hits[_right])), 1)
+        _pair = {"left": _wb_named[_left][0], "right": _wb_named[_right][0],
+                 "shared_reference_hits": _shared,
+                 "smaller_hit_set_covered_fraction": round(_smaller_covered, 4)}
+        branch_pair_overlap.append(_pair)
+        print(f"{_pair['left'] + ' / ' + _pair['right']:48s} {_shared:7d} "
+              f"{100*_smaller_covered:14.1f}%")
+print("A zero/small unique count identifies overlap worth investigating; it is not by itself "
+      "authorization to remove a branch because oracle placement and selector evidence may differ.")
 """),
-    md("""## 11.7 Acoustic-evidence-aware local judge (Qwen3.5-9B) — first §14 slice
+    md("""## 11.7 Acoustic-evidence-aware local judge (Qwen3.5-9B) — currently paused
 **Scope, honestly:** this is still not the complete §14–15 whole-lesson selector. It receives
 local word context plus the timestamp-overlapping wav2vec2/PhoneticXEUS realized-IPA paths for
 each contested region. Evidence blocks are retrieved through a Qwen/Voxtral/Whisper timestamped
@@ -1408,6 +1471,10 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
            "llm_selector_stats": selector_stats if "selector_stats" in dir() else None,
            "llm_selector_margin_wer": (selector_threshold_wer
                                        if "selector_threshold_wer" in dir() else None),
+           "branch_overlap_ablation": (branch_overlap_ablation
+                                       if "branch_overlap_ablation" in dir() else None),
+           "branch_pair_overlap": (branch_pair_overlap
+                                   if "branch_pair_overlap" in dir() else None),
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
 try:   # recall-floor breakdown from §11.5 (defined only if the pool had branches)
     summary["recall_floor_by_category"] = dict(bycat.most_common())

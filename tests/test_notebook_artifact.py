@@ -232,6 +232,27 @@ def test_prefetch_excludes_unused_framework_weights_and_prioritizes_first_branch
     )
 
 
+def test_overlap_mode_skips_selector_and_its_now_unused_phone_branches():
+    source = _notebook_source()
+
+    assert 'USE_LLM_SELECTOR = False; SELECTOR_MODEL = "Qwen/Qwen3.5-9B"' in source
+    assert "USE_PHONE      = USE_LLM_SELECTOR" in source
+    assert "USE_PHONETIC_XEUS = USE_LLM_SELECTOR" in source
+    assert "(SELECTOR_MODEL, USE_LLM_SELECTOR)" in source
+
+
+def test_word_branch_overlap_ablation_is_reported_without_rerunning_asr():
+    source = _notebook_source()
+
+    assert "=== word-branch overlap: exact leave-one-out recall-floor effect ===" in source
+    assert '"unique_reference_hits": len(_unique)' in source
+    assert '"recall_floor_increase_if_removed"' in source
+    assert '"branch_overlap_ablation"' in source
+    assert "=== pairwise overlap of correctly recovered reference occurrences ===" in source
+    assert '"smaller_hit_set_covered_fraction"' in source
+    assert '"branch_pair_overlap"' in source
+
+
 def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():
     source = _notebook_source()
 
