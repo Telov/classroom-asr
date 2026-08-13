@@ -47,16 +47,18 @@ def test_llm_choice_overrides_only_its_slot():
 def test_bad_llm_output_falls_back_to_rover():
     # llm returns garbage -> abstain -> ROVER majority ("went" 2/3) stands
     g_texts = ["i went home now", "i want home now", "i went home now"]
-    out, n = select_transcript(g_texts, lambda p: "no idea", norm=N)
+    out, n, nc = select_transcript(g_texts, lambda p: "no idea", norm=N)
     assert out == "i went home now"                     # unchanged by the useless judge
+    assert nc == 0                                       # nothing parsed -> nothing decided
 
     # a working judge flips a genuinely contested slot
     def judge(prompt):
         # answer "A" for every item; option A is the top-voted token, so this is a no-op-ish
         import re
         return "\n".join(f"{m}:A" for m in re.findall(r"^(\d+)\.", prompt, re.M))
-    out2, n2 = select_transcript(["a b c", "a x c", "a y c"], judge, norm=N)
+    out2, n2, nc2 = select_transcript(["a b c", "a x c", "a y c"], judge, norm=N)
     assert out2.split()[0] == "a" and out2.split()[-1] == "c"
+    assert nc2 >= 1                                      # the working judge decided the contested slot
 
 
 def test_drop_candidate_is_offered_when_branches_delete():

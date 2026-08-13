@@ -120,12 +120,12 @@ def select_transcript(
     norm: Normalizer = DEFAULT,
     batch_size: int = 24,
     context: int = 8,
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     """Fuse branch transcripts with the LLM judge over contested slots.
 
-    ``llm_fn(prompt) -> str`` runs the model. Returns ``(transcript, n_decisions)``. Any batch
-    that raises or returns garbage simply leaves its slots to the ROVER default, so the result
-    is never worse than :func:`classroom_asr.rover.fuse`.
+    ``llm_fn(prompt) -> str`` runs the model. Returns ``(transcript, n_decisions, n_chosen)`` —
+    ``n_chosen`` is how many contested slots the LLM actually decided (the rest fell back to the
+    ROVER vote, so the result is never worse than :func:`classroom_asr.rover.fuse`).
     """
     token_lists = [norm.tokens(t) for t in transcripts if t and t.strip()]
     graph = build_graph(token_lists)
@@ -137,4 +137,4 @@ def select_transcript(
             choices.update(parse_batch(llm_fn(format_batch(batch)), batch))
         except Exception:
             pass                                # abstain -> ROVER default for those slots
-    return " ".join(assemble(graph, choices)).strip(), len(decisions)
+    return " ".join(assemble(graph, choices)).strip(), len(decisions), len(choices)

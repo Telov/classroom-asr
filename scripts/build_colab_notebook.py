@@ -154,7 +154,27 @@ exceeds the ~20 GB persisted-dir cap, so caching them there fills the disk mid-r
 in the roomy default cache and re-download each session (overlapped with compute by the
 prefetch below). Transcription always runs fresh."""),
     code(r"""
-import os, sys, subprocess, threading
+import os, sys, subprocess, threading, shutil
+# A persisted venv can come back from a previous Kaggle session with bin/python stripped of its
+# execute bit (persistence doesn't preserve +x) -> PermissionError at run time. So before reusing
+# one, prove its python actually runs; if not, chmod, then wipe-and-rebuild as a last resort.
+def _venv_ok(py):
+    try:
+        return subprocess.run([py, "-c", ""], capture_output=True, timeout=60).returncode == 0
+    except Exception:
+        return False
+def _reusable(ready, py, venvdir):
+    if not (os.path.exists(ready) and os.path.exists(py)):
+        return False
+    if _venv_ok(py):
+        return True
+    subprocess.run(["chmod", "-R", "u+rwx", os.path.join(venvdir, "bin")], capture_output=True)
+    if _venv_ok(py):
+        return True
+    shutil.rmtree(venvdir, ignore_errors=True)          # broken beyond a chmod -> force a rebuild
+    try: os.remove(ready)
+    except OSError: pass
+    return False
 # (a) CrisperWhisper CT2 venv — built in the background; §9a just joins this thread. Lives under
 # the persisted dir (§1), so once built it's reused next session instead of rebuilt every run.
 CW_WORK = os.path.join(os.environ.get("ASR_PERSIST", os.path.abspath(".")), "cw_iso")
@@ -164,10 +184,9 @@ CW_READY = os.path.join(CW_WORK, ".venv_ready")   # sentinel: written only after
 _cw = {"thread": None, "err": None}
 def _cw_prewarm():
     try:
-        # Reuse only a FULLY-built venv. Checking the python binary alone is not enough: a run
-        # that ran out of disk mid-install leaves the venv dir but no crisperwhisper -> the
-        # sentinel guards against falsely "reusing" a broken build.
-        if os.path.exists(CW_READY) and os.path.exists(CW_VENV_PY):
+        # Reuse only a fully-built, actually-runnable venv (sentinel guards a mid-install crash;
+        # _reusable guards a persisted venv whose python lost +x).
+        if _reusable(CW_READY, CW_VENV_PY, CW_VENV):
             print("CrisperWhisper venv: reusing persisted build", flush=True); return
         # virtualenv (not venv): seeds pip from bundled wheels, so it avoids the
         # ensurepip failure `python -m venv` hits on Kaggle. Reuses system torch.
@@ -193,7 +212,7 @@ SEL_READY = os.path.join(SEL_WORK, ".venv_ready")
 _sel = {"thread": None, "err": None}
 def _sel_prewarm():
     try:
-        if os.path.exists(SEL_READY) and os.path.exists(SEL_VENV_PY):
+        if _reusable(SEL_READY, SEL_VENV_PY, SEL_VENV):
             print("selector venv: reusing persisted build", flush=True); return
         subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", SEL_VENV],
                        check=True)
@@ -548,13 +567,16 @@ json.dump(out, open(outp, "w"))
         def _cw_run(gi, gpu, shard):
             if not shard:
                 return
-            inp = os.path.join(CW_WORK, f"in_{gi}.json"); outp = os.path.join(CW_WORK, f"out_{gi}.json")
-            json.dump(shard, open(inp, "w"))
-            env = dict(os.environ)
-            if gpu is not None:
-                env["CUDA_VISIBLE_DEVICES"] = str(gpu)      # each subprocess sees exactly one GPU
-            subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE, inp, outp], check=True, env=env)
-            res.update(json.load(open(outp)))               # disjoint keys per shard -> safe
+            try:
+                inp = os.path.join(CW_WORK, f"in_{gi}.json"); outp = os.path.join(CW_WORK, f"out_{gi}.json")
+                json.dump(shard, open(inp, "w"))
+                env = dict(os.environ)
+                if gpu is not None:
+                    env["CUDA_VISIBLE_DEVICES"] = str(gpu)  # each subprocess sees exactly one GPU
+                subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE, inp, outp], check=True, env=env)
+                res.update(json.load(open(outp)))           # disjoint keys per shard -> safe
+            except Exception as e:                          # don't crash the thread; skip cleanly
+                print(f"CrisperWhisper GPU{gpu} worker failed: {repr(e)[:160]}", flush=True)
         _cw_ts = [threading.Thread(target=_cw_run, args=(gi, gpus[gi], shards[gi]))
                   for gi in range(len(gpus))]
         for t in _cw_ts: t.start()
@@ -739,20 +761,31 @@ try:
 except TypeError:
     model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16, device_map="auto").eval()
 _dev = next(model.parameters()).device            # feed inputs to the shard holding the embeddings
+_dbg = {"n": 0}
 def llm_fn(prompt):
-    msgs = [{"role": "user", "content": prompt}]
+    # Qwen3.5 is a reasoning model; unchecked "thinking" eats the whole budget before any answer.
+    # Belt AND suspenders: enable_thinking=False on the template + the "/no_think" soft switch.
+    msgs = [{"role": "user", "content": prompt + " /no_think"}]
     try:
         ids = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, return_tensors="pt")
     except TypeError:
         ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
     ids = ids.to(_dev)
     with torch.inference_mode():
-        out = model.generate(ids, max_new_tokens=512, do_sample=False, pad_token_id=tok.pad_token_id)
-    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
-selected = []
+        out = model.generate(ids, max_new_tokens=1024, do_sample=False, pad_token_id=tok.pad_token_id)
+    resp = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+    if _dbg["n"] < 1:                              # surface the first raw exchange so we can see
+        _dbg["n"] += 1                             # the real output format and fix parsing if needed
+        print("=== SAMPLE SELECTOR PROMPT (head) ===", file=sys.stderr)
+        print(prompt[:700], file=sys.stderr)
+        print("=== SAMPLE SELECTOR RESPONSE ===", file=sys.stderr)
+        print(repr(resp[:1500]), file=sys.stderr)
+    return resp
+selected = []; tot_dec = tot_chosen = 0
 for branches in data["branch_transcripts"]:
-    text, n = select_transcript([b for b in branches if b], llm_fn, norm=SCORE, batch_size=24)
-    selected.append(text)
+    text, nd, nc = select_transcript([b for b in branches if b], llm_fn, norm=SCORE, batch_size=24)
+    selected.append(text); tot_dec += nd; tot_chosen += nc
+print(f"selector decided {tot_chosen}/{tot_dec} contested slots", file=sys.stderr)
 json.dump({"selected": selected}, open(outp, "w"))
 ''')
         _wb2 = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
