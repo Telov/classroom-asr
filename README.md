@@ -107,7 +107,8 @@ are:
 
 The selector and its phone/IPA inputs are temporarily paused while upstream branches
 undergo exact overlap and leave-one-out oracle analysis. The final JSON includes corpus and
-per-interview S/D/I, deletion rates, model/runtime fingerprints, cached Hub revision inventory,
+per-interview S/D/I, deletion rates, model/runtime fingerprints, observed loaded Hub revisions
+plus a separately labeled cache inventory,
 unique recovered-word categories, pairwise overlap, exact optional-branch leave-one-out oracle
 deltas, and the marginal runtime each removal would actually save after shared loads are accounted
 for. Qwen remains the required graph pivot rather than being presented as a removable peer. Read

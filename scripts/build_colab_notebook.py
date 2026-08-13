@@ -483,6 +483,21 @@ def _free():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+_LOADED_HF_REVISIONS = {}  # model id -> exact commit hashes observed on live model configs
+def _record_loaded_revision(wrapper):
+    model_id = getattr(wrapper, "model_id", None)
+    if not model_id: return
+    node = wrapper
+    seen = set()
+    for _depth in range(5):
+        if node is None or id(node) in seen: break
+        seen.add(id(node))
+        revision = getattr(getattr(node, "config", None), "_commit_hash", None)
+        if revision:
+            _LOADED_HF_REVISIONS.setdefault(model_id, set()).add(str(revision))
+            return
+        node = getattr(node, "model", None)
+
 # Construct one model per GPU. This is SERIAL on purpose: transformers' from_pretrained
 # mutates torch's *global* default dtype while materializing weights and restores it in a
 # `finally`. Two loads in parallel threads race — one thread's restore fires mid-way through
@@ -495,7 +510,9 @@ def load_models(make_model):
         for index, g in enumerate(GPUS):
             device = "cpu" if g is None else f"cuda:{g}"
             print(f"model load {index + 1}/{len(GPUS)} on {device}: started", flush=True)
-            models.append(make_model(device))
+            model = make_model(device)
+            _record_loaded_revision(model)
+            models.append(model)
             print(f"model load {index + 1}/{len(GPUS)} on {device}: ready", flush=True)
         return models
     except Exception:
@@ -1871,6 +1888,10 @@ run_fingerprint = {
     },
     # Cache inventory, not a claim that every listed revision was loaded when multiple are present.
     "cached_hf_revisions": _cached_hf_revisions,
+    # Exact revisions exposed by live Hugging Face model configs. Backends that do not surface a
+    # config commit (for example CTranslate2 wrappers) are absent rather than inferred from cache.
+    "loaded_hf_revisions": {model_id: sorted(revisions)
+                            for model_id, revisions in _LOADED_HF_REVISIONS.items()},
 }
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",

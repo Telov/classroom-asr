@@ -330,7 +330,8 @@ def test_partial_multi_gpu_loads_are_released_and_crisper_emits_heartbeats():
     load_models = source[source.index("def load_models(make_model):"):source.index(
         "def whole_rec", source.index("def load_models(make_model):")
     )]
-    assert "models.append(make_model(device))" in load_models
+    assert "model = make_model(device)" in load_models
+    assert "models.append(model)" in load_models
     assert 'model load {index + 1}/{len(GPUS)} on {device}: started' in load_models
     assert "for model in models:" in load_models
     assert "with torch.cuda.device(g): torch.cuda.empty_cache()" in load_models
@@ -429,6 +430,10 @@ def test_summary_identifies_run_and_reports_each_branch_error_shape():
     assert '"overall_wall_seconds"' in source
     assert '"cached_hf_revisions"' in source
     assert "not a claim that every listed revision was loaded" in source
+    assert "def _record_loaded_revision(wrapper):" in source
+    assert "_record_loaded_revision(model)" in source
+    assert '"loaded_hf_revisions"' in source
+    assert "are absent rather than inferred from cache" in source
     assert '"branch_metrics": branch_metrics' in source
     assert "def per_interview_error_counts(hyps):" in source
     assert 'branch_metrics[name]["per_interview"]' in source
