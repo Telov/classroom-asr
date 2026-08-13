@@ -355,8 +355,11 @@ def test_all_qwen_anchored_branch_subsets_emit_an_accuracy_runtime_pareto_fronti
 def test_whole_recording_candidate_graphs_use_cached_compiled_alignment():
     source = _notebook_source()
 
+    assert "def hyp_tokens(text):" in source
+    assert "_HYP_TOKEN_CACHE[value] = SCORE.tokens(value)" in source
     assert "def fast_graph_opcodes(pivot, hypothesis):" in source
-    assert "_GRAPH_OPCODE_CACHE[key] = Levenshtein.opcodes(pivot, hypothesis).as_list()" in source
+    assert "key = (id(pivot), id(hypothesis))" in source
+    assert "entry = (pivot, hypothesis, Levenshtein.opcodes(pivot, hypothesis).as_list())" in source
     assert "g = _bg(tls, pivot_index=0, opcodes_fn=fast_graph_opcodes)" in source
     assert "opcodes_fn=fast_graph_opcodes" in source
     assert "opcodes_fn=lambda pivot, hyp: Levenshtein.opcodes(pivot, hyp).as_list()" in source

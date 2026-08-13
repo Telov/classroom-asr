@@ -417,13 +417,26 @@ from rapidfuzz.distance import Levenshtein
 from classroom_asr.normalize import Normalizer
 SCORE = Normalizer(fold_numbers=True, fold_spelling=True)   # keep fillers; fold formatting
 _GRAPH_OPCODE_CACHE = {}
+_HYP_TOKEN_CACHE = {"": []}
+
+def hyp_tokens(text):
+    # All subset/leave-one-out analyses reuse the same transcript strings. Normalize each unique
+    # hypothesis once in memory; no transcript or token cache is persisted across runs.
+    value = text or ""
+    if value not in _HYP_TOKEN_CACHE:
+        _HYP_TOKEN_CACHE[value] = SCORE.tokens(value)
+    return _HYP_TOKEN_CACHE[value]
 
 def fast_graph_opcodes(pivot, hypothesis):
     # Cached compiled alignment for repeated whole-interview candidate-graph builds.
-    key = (tuple(pivot), tuple(hypothesis))
-    if key not in _GRAPH_OPCODE_CACHE:
-        _GRAPH_OPCODE_CACHE[key] = Levenshtein.opcodes(pivot, hypothesis).as_list()
-    return _GRAPH_OPCODE_CACHE[key]
+    # The cache value retains both lists, so Python cannot recycle their ids into a false hit.
+    # This avoids rebuilding and hashing two multi-thousand-word tuples on every subset.
+    key = (id(pivot), id(hypothesis))
+    entry = _GRAPH_OPCODE_CACHE.get(key)
+    if entry is None or entry[0] is not pivot or entry[1] is not hypothesis:
+        entry = (pivot, hypothesis, Levenshtein.opcodes(pivot, hypothesis).as_list())
+        _GRAPH_OPCODE_CACHE[key] = entry
+    return entry[2]
 
 def _free():
     gc.collect()
@@ -585,7 +598,7 @@ _reftok = [SCORE.tokens(r) for r in refs]
 def wer_of(hyps):
     E = R = 0
     for rt, h in zip(_reftok, hyps):
-        E += Levenshtein.distance(rt, SCORE.tokens(h or "")); R += len(rt)
+        E += Levenshtein.distance(rt, hyp_tokens(h)); R += len(rt)
     return E / R if R else 0.0
 
 def error_counts_of(hyps):
@@ -596,7 +609,7 @@ def error_counts_of(hyps):
     for rt, h in zip(_reftok, hyps):
         R += len(rt)
         for tag, _src_pos, _dest_pos in Levenshtein.editops(
-                rt, SCORE.tokens(h or "")).as_list():
+                rt, hyp_tokens(h)).as_list():
             if tag == "replace": S += 1
             elif tag == "delete": D += 1
             elif tag == "insert": I += 1
@@ -614,7 +627,8 @@ def recall_floor(pool):
     for i, rt in enumerate(_reftok):
         hit = set()
         for hyps in pool:
-            for tag, i0, i1, j0, j1 in Levenshtein.opcodes(rt, SCORE.tokens(hyps[i] or "")).as_list():
+            for tag, i0, i1, j0, j1 in Levenshtein.opcodes(
+                    rt, hyp_tokens(hyps[i])).as_list():
                 if tag == "equal": hit.update(range(i0, i1))
         unrec += len(rt) - len(hit); R += len(rt)
     return unrec / R if R else 0.0
@@ -626,7 +640,7 @@ def realizable_oracle_wer(pool):
     from classroom_asr.candidate_graph import build_graph as _bg, realizable_oracle_tokens as _roracle
     E = R = 0
     for i, rt in enumerate(_reftok):
-        tls = [t for t in (SCORE.tokens(h[i] or "") for h in pool) if t]
+        tls = [t for t in (hyp_tokens(h[i]) for h in pool) if t]
         # ``pool`` is ordered with the primary Qwen transcript first.  Anchor the graph to that
         # transcript so the oracle measures the exact candidate graph seen by the selector.
         g = _bg(tls, pivot_index=0, opcodes_fn=fast_graph_opcodes)
@@ -1176,7 +1190,7 @@ canonical_wer = wer_of(canonical)
 r_oracle = realizable_oracle_wer(_wb)
 _decisions = _total = 0
 for k in range(len(interviews)):
-    graph = build_graph([SCORE.tokens(h[k]) for h in _wb if h[k]], pivot_index=0,
+    graph = build_graph([hyp_tokens(h[k]) for h in _wb if h[k]], pivot_index=0,
                         opcodes_fn=fast_graph_opcodes)
     _total += len(graph); _decisions += len(build_decisions(graph))
 print(f"Qwen-anchored graph from {len(_wb)} word branches: "
@@ -1199,7 +1213,7 @@ for _name, _hyps in _wb_named:
     _hits = set()
     for _k, (_rt, _hyp) in enumerate(zip(_reftok, _hyps)):
         for _tag, _i0, _i1, _j0, _j1 in Levenshtein.opcodes(
-                _rt, SCORE.tokens(_hyp or "")).as_list():
+                _rt, hyp_tokens(_hyp)).as_list():
             if _tag == "equal":
                 _hits.update((_k, _ri) for _ri in range(_i0, _i1))
     _branch_hits.append(_hits)
