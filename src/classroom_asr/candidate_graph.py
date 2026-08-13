@@ -9,12 +9,13 @@ branches to **each other**, then chooses. This module is that substrate:
   for every gap between them. A word another branch heard where the pivot didn't lands in the
   adjacent ``"ins"`` slot, so it stays selectable (it is not silently discarded). ``NULL`` (emit
   nothing) is a candidate in every slot.
-* :func:`realizable_oracle_tokens` — the **honest** ceiling: for a given reference it builds an
-  actual transcript by choosing, per slot, the candidate that best matches the reference
-  (including emitting an ``"ins"`` candidate to recover a word the pivot dropped, or ``NULL`` to
-  drop a spurious pivot word). It is a real transcript scored by ordinary WER, so — unlike a
-  "fraction of reference words some branch matched" recall count — it *includes insertions* and
-  never understates the achievable error.
+* :func:`realizable_oracle_distance` — the **honest** ceiling: exact token edit distance between
+  the reference and the best complete path through the graph. It jointly chooses one offered
+  candidate per slot, so alignment ties cannot turn a selectable better path into a worse score.
+  Unlike a "fraction of reference words some branch matched" recall count, it includes insertions.
+* :func:`realizable_oracle_tokens` — a fast alignment-conditioned witness path retained for
+  inspection. It is realizable, but local alignment ties mean it must not be used as the exact
+  oracle score.
 
 Pure stdlib + the package's own aligner (an ``opcodes`` argument lets the notebook feed a fast
 rapidfuzz alignment for whole-recording inputs).
@@ -121,7 +122,7 @@ def build_graph(
 
 
 # --------------------------------------------------------------------------- #
-# Realizable oracle — the honest ceiling for a selector over this network      #
+# Realizable paths and exact oracle distance                                    #
 # --------------------------------------------------------------------------- #
 def _ref_maps(pivot: list[str], ref: list[str], opcodes=None):
     """Return ``(ref_at, gap_refs)``: the reference word aligned to each pivot slot (or None if
@@ -151,9 +152,12 @@ def _ref_maps(pivot: list[str], ref: list[str], opcodes=None):
 
 
 def realizable_oracle_tokens(graph: list[Slot], ref: list[str], *, opcodes=None) -> list[str]:
-    """Best transcript actually assemblable from the network for this reference (the honest
-    ceiling). Recovers a reference word only where some slot's candidate provides it, drops a
-    spurious pivot word only where ``NULL`` is available — everything else is a real error."""
+    """Build a fast, alignment-conditioned transcript from offered graph candidates.
+
+    The result is always realizable, but it is not necessarily the globally minimum-edit path:
+    a pivot/reference alignment tie can assign a reference word to the adjacent gap instead of a
+    word slot that offers it. Use :func:`realizable_oracle_distance` for the exact oracle score.
+    """
     pivot = [s.pivot for s in graph if s.kind == "word"]
     ref_at, gap_refs = _ref_maps(pivot, ref, opcodes)
     out: list[str] = []
@@ -183,6 +187,119 @@ def realizable_oracle_tokens(graph: list[Slot], ref: list[str], *, opcodes=None)
                 out.append(s.pivot)                   # nobody did -> unavoidable substitution
             wi += 1
     return out
+
+
+def _slot_sequences(slot: Slot) -> tuple[tuple[str, ...], ...]:
+    """Every complete token sequence a selector may emit for one atomic slot."""
+    return tuple(
+        () if candidate is NULL else tuple(str(candidate).split())
+        for candidate in slot.votes
+    )
+
+
+def realizable_oracle_distance(graph: list[Slot], ref: list[str]) -> int:
+    """Exact edit distance from ``ref`` to the best complete path through ``graph``.
+
+    This is Levenshtein dynamic programming over an acyclic word lattice. ``previous[j]`` is the
+    best cost after all prior slots and the first ``j`` reference tokens. For each new slot we
+    advance that row through every *whole* offered sequence, then take the elementwise minimum.
+    Therefore alternatives remain mutually exclusive and candidate selection and alignment are
+    optimized jointly.
+
+    NumPy is an optional acceleration only; the package remains dependency-free and uses the
+    equivalent stdlib implementation when NumPy is absent. Multiple one-token alternatives share
+    one row update because scalar edit distance only needs to know whether *any* offered token
+    matches each reference position.
+    """
+    if not graph:
+        return len(ref)
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover - exercised in dependency-minimal installations
+        return _realizable_oracle_distance_python(graph, ref)
+
+    token_ids = {token: index for index, token in enumerate(dict.fromkeys(ref))}
+    reference = np.asarray([token_ids[token] for token in ref], dtype=np.int32)
+    positions = np.arange(len(ref) + 1, dtype=np.int32)
+    previous = positions.copy()
+    max_output = sum(
+        max((len(sequence) for sequence in _slot_sequences(slot)), default=0)
+        for slot in graph
+    )
+    infinity = np.int32(len(ref) + max_output + 1)
+
+    def advance(row, accepted_ids):
+        if len(accepted_ids) == 1:
+            matches = reference == accepted_ids[0]
+        else:
+            matches = np.zeros(len(ref), dtype=bool)
+            for token_id in accepted_ids:
+                if token_id >= 0:
+                    matches |= reference == token_id
+        base = np.empty(len(ref) + 1, dtype=np.int32)
+        base[0] = row[0] + 1
+        base[1:] = np.minimum(row[1:] + 1, row[:-1] + np.logical_not(matches))
+        # Close over any number of reference deletions: min_k(base[k] + j-k).
+        return positions + np.minimum.accumulate(base - positions)
+
+    for slot in graph:
+        sequences = _slot_sequences(slot)
+        if len(sequences) == 1:
+            row = previous
+            for token in sequences[0]:
+                row = advance(row, (token_ids.get(token, -1),))
+            previous = row
+            continue
+
+        best = previous.copy() if () in sequences else np.full(
+            len(ref) + 1, infinity, dtype=np.int32
+        )
+        single_ids = tuple(
+            dict.fromkeys(token_ids.get(sequence[0], -1)
+                          for sequence in sequences if len(sequence) == 1)
+        )
+        if single_ids:
+            np.minimum(best, advance(previous, single_ids), out=best)
+        for sequence in sequences:
+            if len(sequence) <= 1:
+                continue
+            row = previous
+            for token in sequence:
+                row = advance(row, (token_ids.get(token, -1),))
+            np.minimum(best, row, out=best)
+        previous = best
+    return int(previous[-1])
+
+
+def _realizable_oracle_distance_python(graph: list[Slot], ref: list[str]) -> int:
+    """Dependency-free counterpart of :func:`realizable_oracle_distance`."""
+    previous = list(range(len(ref) + 1))
+
+    def advance(row: list[int], accepted: set[str]) -> list[int]:
+        current = [row[0] + 1]
+        for j, target in enumerate(ref, 1):
+            current.append(min(
+                row[j] + 1,
+                current[j - 1] + 1,
+                row[j - 1] + (target not in accepted),
+            ))
+        return current
+
+    for slot in graph:
+        sequences = _slot_sequences(slot)
+        best = previous.copy() if () in sequences else [10**18] * (len(ref) + 1)
+        singles = {sequence[0] for sequence in sequences if len(sequence) == 1}
+        if singles:
+            best = [min(left, right) for left, right in zip(best, advance(previous, singles))]
+        for sequence in sequences:
+            if len(sequence) <= 1:
+                continue
+            row = previous
+            for token in sequence:
+                row = advance(row, {token})
+            best = [min(left, right) for left, right in zip(best, row)]
+        previous = best
+    return previous[-1]
 
 
 def _edit_distance(left: list[str], right: list[str]) -> int:

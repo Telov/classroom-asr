@@ -1,6 +1,13 @@
+from itertools import product
+
 import pytest
 
-from classroom_asr.candidate_graph import build_graph, realizable_oracle_tokens, NULL
+from classroom_asr.candidate_graph import (
+    NULL,
+    build_graph,
+    realizable_oracle_distance,
+    realizable_oracle_tokens,
+)
 from classroom_asr.normalize import Normalizer
 from classroom_asr.metrics import score
 
@@ -117,12 +124,42 @@ def test_adding_a_branch_cannot_worsen_the_realizable_oracle():
 
     smaller = build_graph([pivot, first_alternative], pivot_index=0)
     larger = build_graph([pivot, first_alternative, second_alternative], pivot_index=0)
-    smaller_text = " ".join(realizable_oracle_tokens(smaller, ref))
-    larger_text = " ".join(realizable_oracle_tokens(larger, ref))
+    assert realizable_oracle_distance(larger, ref) <= realizable_oracle_distance(smaller, ref)
 
-    assert score(" ".join(ref), larger_text, norm=N).wer <= score(
-        " ".join(ref), smaller_text, norm=N
-    ).wer
+
+def _offered_paths(graph):
+    choices = [
+        [() if candidate is NULL else tuple(str(candidate).split()) for candidate in slot.votes]
+        for slot in graph
+    ]
+    for selected in product(*choices):
+        yield [token for sequence in selected for token in sequence]
+
+
+def test_exact_oracle_optimizes_candidate_choice_and_alignment_jointly():
+    # Pivot/reference edit alignment has two equal-cost choices here. The old local oracle maps
+    # reference "b" into the preceding gap, then emits pivot "a" (2 errors), even though the
+    # word slot explicitly offers "b" and that realizable path has only one deletion.
+    graph = build_graph([["a"], ["b"]], pivot_index=0)
+
+    assert realizable_oracle_tokens(graph, ["b", "c"]) == ["a"]
+    assert realizable_oracle_distance(graph, ["b", "c"]) == 1
+
+
+def test_exact_oracle_matches_exhaustive_paths_on_small_graphs():
+    sequences = [list(words) for length in (1, 2)
+                 for words in product(("a", "b"), repeat=length)]
+    references = [[]] + sequences
+
+    for pivot in sequences:
+        for alternative in sequences:
+            graph = build_graph([pivot, alternative], pivot_index=0)
+            for reference in references:
+                brute = min(
+                    score(" ".join(reference), " ".join(path), norm=N).errors
+                    for path in _offered_paths(graph)
+                )
+                assert realizable_oracle_distance(graph, reference) == brute
 
 
 def test_empty_graph():

@@ -287,7 +287,7 @@ def test_no_vad_whisper_shadow_reuses_baseline_models_and_stays_a_separate_branc
     assert 'hyp_ANV = _turbo_pass(False, "Whisper no-VAD shadow")' in source
     assert 'add_branch("+WhisperNoVAD", hyp_ANV)' in source
     assert '("WhisperNoVAD", globals().get("hyp_ANV"))' in source
-    assert '"WhisperNoVAD": ("Whisper turbo load (shared)",' in source
+    assert '"WhisperNoVAD": "Whisper no-VAD shadow"' in source
     assert '"ANV_whisper_turbo_no_vad"' in source
 
 
@@ -351,18 +351,16 @@ def test_word_branch_overlap_ablation_is_reported_without_rerunning_asr():
     assert '"branch_pair_overlap"' in source
 
 
-def test_all_qwen_anchored_branch_subsets_emit_an_accuracy_runtime_pareto_frontier():
+def test_oracle_uses_exact_lattice_distance_and_bounds_subset_analysis():
     source = _notebook_source()
 
-    assert "_optional_indices = list(range(1, len(_wb_named)))" in source
-    assert "for _chosen_optional in combinations(_optional_indices, _count):" in source
-    assert '"Qwen3-ASR": ("A+B+Qwen3",)' in source
-    assert '"Voxtral": ("Voxtral load (shared)", "+Voxtral")' in source
-    assert '"CrisperQwenVerbatize": ("+CrisperWhisper",)' in source
-    assert '"realizable_oracle_wer": realizable_oracle_wer(_subset_pool)' in source
-    assert 'round(_candidate["realizable_oracle_wer"], 4)' in source
-    assert "branch_subset_pareto.append({" in source
-    assert '"branch_subset_pareto"' in source
+    assert "realizable_oracle_distance as _oracle_distance" in source
+    assert "E += _oracle_distance(g, rt)" in source
+    assert "realizable_oracle_tokens as _roracle" not in source
+    # Exact lattice scoring is deliberately limited to the full pool and leave-one-out graphs.
+    # Exhaustively rescoring all 2^N subsets would add many minutes to every Kaggle iteration.
+    assert "for _chosen_optional in combinations" not in source
+    assert '"branch_subset_pareto"' not in source
 
 
 def test_whole_recording_candidate_graphs_use_cached_compiled_alignment():

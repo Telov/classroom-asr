@@ -638,19 +638,18 @@ def recall_floor(pool):
     return unrec / R if R else 0.0
 
 def realizable_oracle_wer(pool):
-    # Honest ceiling: per interview build the confusion network from all branches, then pick the
-    # per-slot candidate that best matches the reference -> a REAL transcript, scored with full WER
-    # (insertions included). This is what a perfect selector over this candidate graph could reach.
-    from classroom_asr.candidate_graph import build_graph as _bg, realizable_oracle_tokens as _roracle
+    # Honest ceiling: exact edit distance between the reference and the best complete path through
+    # the candidate graph. Candidate choice and alignment are optimized jointly, so a pivot/ref
+    # alignment tie cannot hide a better selectable transcript. Insertions remain atomic choices.
+    from classroom_asr.candidate_graph import (
+        build_graph as _bg, realizable_oracle_distance as _oracle_distance)
     E = R = 0
     for i, rt in enumerate(_reftok):
         tls = [t for t in (hyp_tokens(h[i]) for h in pool) if t]
         # ``pool`` is ordered with the primary Qwen transcript first.  Anchor the graph to that
         # transcript so the oracle measures the exact candidate graph seen by the selector.
         g = _bg(tls, pivot_index=0, opcodes_fn=fast_graph_opcodes)
-        pivot = [s.pivot for s in g if s.kind == "word"]
-        ops = Levenshtein.opcodes(pivot, rt).as_list()      # fast rapidfuzz pivot<->ref alignment
-        E += Levenshtein.distance(rt, _roracle(g, rt, opcodes=ops)); R += len(rt)
+        E += _oracle_distance(g, rt); R += len(rt)
     return E / R if R else 0.0
 
 def add_branch(tag, hyps):
@@ -1272,68 +1271,6 @@ for _left in range(len(_wb_named)):
               f"{100*_smaller_covered:14.1f}%")
 print("A zero/small unique count identifies overlap worth investigating; it is not by itself "
       "authorization to remove a branch because oracle placement and selector evidence may differ.")
-
-# Exhaustive Qwen-anchored subset frontier. With at most eight optional word branches this is
-# only 2^8=256 inexpensive text-graph evaluations and requires no ASR rerun. Runtime accounting
-# deduplicates shared stages: either Voxtral mode pays the shared load once; either Crisper output
-# pays the combined worker once. Keep a subset only when no cheaper/equal-cost subset has an equal
-# or lower realizable-oracle WER.
-from itertools import combinations
-_stage_groups = {
-    "Qwen3-ASR": ("A+B+Qwen3",),
-    "Whisper": ("Whisper turbo load (shared)", "A whisper"),
-    "WhisperNoVAD": ("Whisper turbo load (shared)", "Whisper no-VAD shadow"),
-    "WhisperLargeV3": ("Whisper large-v3 quality",),
-    "wav2vec2 CTC": ("A+B",),
-    "Voxtral": ("Voxtral load (shared)", "+Voxtral"),
-    "VoxtralVerbatim": ("Voxtral load (shared)", "+VoxtralVerbatim"),
-    "CrisperWhisper": ("+CrisperWhisper",),
-    "CrisperQwenVerbatize": ("+CrisperWhisper",),
-}
-_timing_by_stage = {name: dt for name, dt in TIMINGS}
-branch_subset_results = []
-_optional_indices = list(range(1, len(_wb_named)))  # Qwen at index 0 is always the pivot
-for _count in range(len(_optional_indices) + 1):
-    for _chosen_optional in combinations(_optional_indices, _count):
-        _chosen = (0,) + _chosen_optional
-        _names = [_wb_named[i][0] for i in _chosen]
-        _subset_pool = [_wb[i] for i in _chosen]
-        _subset_hits = set().union(*(_branch_hits[i] for i in _chosen))
-        _stages = {stage for name in _names for stage in _stage_groups.get(name, ())}
-        _cost = sum(_timing_by_stage.get(stage, 0.0) for stage in _stages)
-        branch_subset_results.append({
-            "branches": _names,
-            "branch_count": len(_names),
-            # Keep full precision for Pareto dominance. Rounding before comparison can erase a
-            # real small WER gain or make two nearly equal runtimes dominate one another by typo.
-            "realizable_oracle_wer": realizable_oracle_wer(_subset_pool),
-            "recall_floor": (_R - len(_subset_hits)) / max(_R, 1),
-            "estimated_stage_seconds": _cost,
-        })
-
-branch_subset_pareto = []
-for _candidate in sorted(branch_subset_results,
-                         key=lambda row: (row["estimated_stage_seconds"],
-                                          row["realizable_oracle_wer"], row["branch_count"])):
-    _dominated = any(
-        other["estimated_stage_seconds"] <= _candidate["estimated_stage_seconds"]
-        and other["realizable_oracle_wer"] <= _candidate["realizable_oracle_wer"]
-        and (other["estimated_stage_seconds"] < _candidate["estimated_stage_seconds"]
-             or other["realizable_oracle_wer"] < _candidate["realizable_oracle_wer"])
-        for other in branch_subset_results
-    )
-    if not _dominated:
-        branch_subset_pareto.append({
-            **_candidate,
-            "realizable_oracle_wer": round(_candidate["realizable_oracle_wer"], 4),
-            "recall_floor": round(_candidate["recall_floor"], 4),
-            "estimated_stage_seconds": round(_candidate["estimated_stage_seconds"], 1),
-        })
-print("\n=== Qwen-anchored accuracy/runtime Pareto frontier (all branch subsets) ===")
-print("stage_s  oracle  floor  branches")
-for _row in branch_subset_pareto:
-    print(f"{_row['estimated_stage_seconds']:7.1f}  {_row['realizable_oracle_wer']:.3f}  "
-          f"{_row['recall_floor']:.3f}  {', '.join(_row['branches'])}")
 """),
     md("""## 11.7 Acoustic-evidence-aware local judge (Qwen3.5-9B) — currently paused
 **Scope, honestly:** this is still not the complete §14–15 whole-lesson selector. It receives
@@ -1846,8 +1783,6 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
                                        if "branch_overlap_ablation" in dir() else None),
            "branch_pair_overlap": (branch_pair_overlap
                                    if "branch_pair_overlap" in dir() else None),
-           "branch_subset_pareto": (branch_subset_pareto
-                                     if "branch_subset_pareto" in dir() else None),
            "run_fingerprint": run_fingerprint,
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
 try:   # recall-floor breakdown from §11.5 (defined only if the pool had branches)
