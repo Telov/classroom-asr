@@ -164,7 +164,7 @@ QWEN_CHUNK_S = 30
 QWEN_MAX_NEW_TOKENS = 512
 VOXTRAL_CHUNK_S = 30
 
-BASE = f"http://lingtools.uoregon.edu/coraal/{COMPONENT}/{VERSION}"
+BASE = f"https://lingtools.uoregon.edu/coraal/{COMPONENT}/{VERSION}"
 COMP = COMPONENT.upper()
 """),
     md("""## 2a. Prewarm in the background (overlap setup with compute)
@@ -357,7 +357,7 @@ print("model prefetch: started in background")
 """),
     md("## 3. Download + extract CORAAL"),
     code(r"""
-import os, tarfile, urllib.request, ssl
+import os, shutil, tarfile, urllib.request
 from pathlib import Path
 _dl0 = _time.time()
 os.makedirs("coraal/txt", exist_ok=True); os.makedirs("coraal/audio", exist_ok=True)
@@ -365,15 +365,43 @@ os.makedirs("coraal/txt", exist_ok=True); os.makedirs("coraal/audio", exist_ok=T
 def fetch(url, dest):
     if os.path.exists(dest): print("cached", dest); return
     print("downloading", url)
-    ctx = ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
-    with urllib.request.urlopen(url, context=ctx) as r, open(dest, "wb") as f: f.write(r.read())
+    partial = dest + ".part"
+    try:
+        with urllib.request.urlopen(url) as r, open(partial, "wb") as f:
+            shutil.copyfileobj(r, f, length=8 * 1024 * 1024)
+        os.replace(partial, dest)  # atomic: a cancelled session never creates a fake cache hit
+    finally:
+        try: os.remove(partial)
+        except OSError: pass
     print("  ->", os.path.getsize(dest)//1_000_000, "MB")
 
-fetch(f"{BASE}/{COMP}_textfiles_{VERSION}.tar.gz", "coraal/txt.tar.gz")
-fetch(f"{BASE}/{COMP}_audio_{AUDIO_PART}_{VERSION}.tar.gz", "coraal/audio.tar.gz")
-for tarball, dest in [("coraal/txt.tar.gz","coraal/txt"), ("coraal/audio.tar.gz","coraal/audio")]:
-    if any(Path(dest).iterdir()): continue
-    with tarfile.open(tarball) as t: t.extractall(dest, filter="data")
+_sources = [
+    (f"{BASE}/{COMP}_textfiles_{VERSION}.tar.gz", "coraal/txt.tar.gz", "coraal/txt"),
+    (f"{BASE}/{COMP}_audio_{AUDIO_PART}_{VERSION}.tar.gz", "coraal/audio.tar.gz", "coraal/audio"),
+]
+for url, tarball, _dest in _sources: fetch(url, tarball)
+
+def extract_complete(url, tarball, dest):
+    marker = os.path.join(dest, ".extract_complete")
+    if os.path.isfile(marker): return
+    # A nonempty directory without the marker is a cancelled/legacy partial extraction, not a
+    # cache hit. Retry once from a clean redownload if the cached tar itself is truncated.
+    for attempt in range(2):
+        shutil.rmtree(dest, ignore_errors=True); os.makedirs(dest, exist_ok=True)
+        try:
+            with tarfile.open(tarball) as archive:
+                archive.extractall(dest, filter="data")
+            Path(marker).write_text("ok\n")
+            return
+        except (tarfile.TarError, EOFError):
+            shutil.rmtree(dest, ignore_errors=True)
+            if attempt:
+                raise
+            try: os.remove(tarball)
+            except OSError: pass
+            fetch(url, tarball)
+
+for url, tarball, dest in _sources: extract_complete(url, tarball, dest)
 print("transcripts:", len(list(Path('coraal/txt').rglob('*.txt'))),
       "| wavs:", len(list(Path('coraal/audio').rglob('*.wav'))))
 rec("download+extract CORAAL", _time.time() - _dl0)

@@ -46,6 +46,19 @@ def test_payload_does_not_persist_derived_summary_or_inference_results():
     assert "print(json.dumps(summary, indent=2))" in source
 
 
+def test_coraal_download_is_atomic_verified_https_and_recovers_partial_extraction():
+    source = _notebook_source()
+
+    assert 'BASE = f"https://lingtools.uoregon.edu/coraal/' in source
+    assert 'partial = dest + ".part"' in source
+    assert "os.replace(partial, dest)" in source
+    assert 'marker = os.path.join(dest, ".extract_complete")' in source
+    assert "for attempt in range(2):" in source
+    assert "shutil.rmtree(dest, ignore_errors=True)" in source
+    assert "CERT_NONE" not in source
+    assert "check_hostname=False" not in source
+
+
 def test_launcher_control_state_survives_payload_variable_collision():
     source, = _code_sources(LAUNCHER_NOTEBOOK)
     downloaded = {
