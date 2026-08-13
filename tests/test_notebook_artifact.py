@@ -336,6 +336,18 @@ def test_overlap_mode_skips_selector_and_its_now_unused_phone_branches():
     assert "(SELECTOR_MODEL, USE_LLM_SELECTOR, None)" in source
 
 
+def test_partial_qwen_failure_uses_visible_per_interview_canonical_fallbacks():
+    source = _notebook_source()
+
+    assert "for name, hyps in _wb_named if hyps[_k]" in source
+    assert '("none", "")' in source
+    assert 'if _source != "Qwen3-ASR"' in source
+    assert 'print("Qwen3-ASR per-interview fallbacks:", _fallback_counts)' in source
+    assert '"effective_backbone"' in source
+    assert '"fallback_backbone_wer"' in source
+    assert '"backbone_fallbacks"' in source
+
+
 def test_word_branch_overlap_ablation_is_reported_without_rerunning_asr():
     source = _notebook_source()
 

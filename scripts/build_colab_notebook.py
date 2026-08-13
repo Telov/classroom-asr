@@ -1184,9 +1184,28 @@ _wb_named = [("Qwen3-ASR", globals().get("hyp_Z")),
 _wb_named = [(name, h) for name, h in _wb_named if h and any(h)]
 if not _wb_named:
     raise RuntimeError("no word-recognition branch produced a candidate transcript")
-backbone_name, backbone_hyps = _wb_named[0]
-if backbone_name != "Qwen3-ASR":
-    print(f"Qwen3-ASR unavailable; emergency backbone is {backbone_name}")
+# One optional backend failure should not turn a complete interview into an empty canonical
+# transcript. Preserve Qwen whenever it produced text; for only the missing interviews, use the
+# first available branch in the same stable order the graph uses. Report every fallback below.
+backbone_hyps = []
+backbone_sources = []
+for _k in range(len(interviews)):
+    _source, _text = next(
+        ((name, hyps[_k]) for name, hyps in _wb_named if hyps[_k]), ("none", ""))
+    backbone_sources.append(_source); backbone_hyps.append(_text)
+_fallback_counts = {}
+for _source in backbone_sources:
+    if _source != "Qwen3-ASR":
+        _fallback_counts[_source] = _fallback_counts.get(_source, 0) + 1
+_fallback_total = sum(_fallback_counts.values())
+backbone_name = (
+    "Qwen3-ASR" if not _fallback_counts
+    else "per-interview emergency backbone (Qwen3-ASR unavailable)"
+    if _fallback_total == len(interviews)
+    else "Qwen3-ASR with per-interview fallback"
+)
+if _fallback_counts:
+    print("Qwen3-ASR per-interview fallbacks:", _fallback_counts)
 _wb = [h for _, h in _wb_named]
 canonical = list(backbone_hyps)
 canonical_source = backbone_name
@@ -1197,7 +1216,8 @@ for k in range(len(interviews)):
     graph = build_graph([hyp_tokens(h[k]) for h in _wb if h[k]], pivot_index=0,
                         opcodes_fn=fast_graph_opcodes)
     _total += len(graph); _decisions += len(build_decisions(graph))
-print(f"Qwen-anchored graph from {len(_wb)} word branches: "
+print(f"Qwen-first graph from {len(_wb)} word branches "
+      "(first available branch only where Qwen is missing): "
       + ", ".join(name for name, _ in _wb_named))
 print(f"[BACKBONE       ] {backbone_name} WER={canonical_wer:.3f}"
       f"   vs baseline A={wer_of(hyp_A):.3f}  vs realizable oracle={r_oracle:.3f}"
@@ -1620,8 +1640,9 @@ json.dump({"selected": selected, "threshold_selected": threshold_selected, "stat
             ("A+B", hyp_B)] if hyps and any(hyps) and key in WINDOW_PARTS), None)
         _anchors = WINDOW_PARTS.get(_anchor_key, [[] for _ in interviews])
         _selector_input = {
-            # _wb is already Qwen-first. The worker preserves this order and anchors its graph to
-            # branch 0, so abstentions and non-decisions retain Qwen rather than a majority vote.
+            # _wb is already Qwen-first. The worker removes empty results per interview without
+            # reordering, so abstentions retain Qwen when present and the first available emergency
+            # branch only when Qwen failed -- never a majority vote.
             "branch_transcripts": [[h[k] for h in _wb] for k in range(len(interviews))],
             "anchor_chunks": _anchors,
             "phone_evidence": phone_evidence,
@@ -1642,12 +1663,12 @@ json.dump({"selected": selected, "threshold_selected": threshold_selected, "stat
         canonical_source = "constrained LLM selector"
         canonical_wer = llm_selected_wer
         print(f"[LLM SELECTED   ] canonical WER={llm_selected_wer:.3f}"
-              f"   vs Qwen backbone={wer_of(backbone_hyps):.3f}"
+              f"   vs effective backbone={wer_of(backbone_hyps):.3f}"
               f"  vs baseline A={wer_of(hyp_A):.3f}"
               f"  vs realizable oracle={r_oracle:.3f}")
         gap = wer_of(hyp_A) - r_oracle
         print(f"selector captured {100*(wer_of(hyp_A)-llm_selected_wer)/max(gap,1e-9):.0f}% "
-              f"of the baseline->realizable-oracle gap; delta vs Qwen backbone: "
+              f"of the baseline->realizable-oracle gap; delta vs effective backbone: "
               f"{llm_selected_wer-wer_of(backbone_hyps):+.3f}")
         print("selector stats:", json.dumps(selector_stats, sort_keys=True))
         print("diagnostic backbone-override margin curve (threshold -> WER):",
@@ -1768,9 +1789,14 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
            # the Qwen-anchored candidate graph could reach (a real transcript).
            "candidate_recall_floor": round(recall_floor(pool), 4),
            "realizable_oracle_wer": round(r_oracle, 4) if "r_oracle" in dir() else None,
-           "primary_backbone": backbone_name if "backbone_name" in dir() else None,
-           "qwen_backbone_wer": (round(wer_of(backbone_hyps), 4)
-                                  if "backbone_hyps" in dir() else None),
+           "primary_backbone": "Qwen3-ASR",
+           "effective_backbone": backbone_name if "backbone_name" in dir() else None,
+           "qwen_backbone_wer": (round(wer_of(hyp_Z), 4)
+                                  if hyp_Z and any(hyp_Z) else None),
+           "fallback_backbone_wer": (round(wer_of(backbone_hyps), 4)
+                                      if "backbone_hyps" in dir() else None),
+           "backbone_fallbacks": (_fallback_counts
+                                  if "_fallback_counts" in dir() else None),
            "canonical_source": canonical_source if "canonical_source" in dir() else None,
            "canonical_wer": round(canonical_wer, 4) if "canonical_wer" in dir() else None,
            "llm_selected_wer": (round(llm_selected_wer, 4)
