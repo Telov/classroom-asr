@@ -63,7 +63,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
 os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"     # current high-throughput Hub/Xet downloads
 ASR_GIT_REF = os.environ.get("CLASSROOM_ASR_GIT_REF", "main")
-# Persist the CrisperWhisper venv and its bounded converted CT2 main/draft models across Kaggle
+# Persist the CrisperWhisper venv and its bounded converted CT2 main model across Kaggle
 # sessions (Settings -> Persistence -> "Files only" keeps /kaggle/working). The full ensemble's
 # source model WEIGHTS are deliberately NOT persisted here:
 # the persisted dir is capped (~20 GB) but the full model set is ~26 GB, so redirecting the HF
@@ -125,8 +125,7 @@ USE_PHONE      = True;  PHONE_MODEL    = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 USE_PHONETIC_XEUS = True;  PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
 # Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
-CRISPER_SPECULATIVE  = True;  CRISPER_DRAFT_SIZE = "turbo"  # lossless CT2 speculative decoding
-CRISPER_VERSION      = "2.0.2"  # first stable release used by this speculative/cache integration
+CRISPER_VERSION      = "2.0.2"  # exact CT2 runtime validated by the notebook integration
 USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbatim
 # Conversation-LLM selector (§14): the design's judge over the candidate graph. Overrides only
 # the contested slots (confident spans frozen, §12.5), driving the final transcript from the
@@ -158,13 +157,13 @@ Two serial blockers moved off the critical path: the isolated CrisperWhisper **v
 now, so they finish *while* the A→Qwen branches compute. Pure overlap — no GPU used here.
 
 **Reused across runs:** with Kaggle **Settings → Persistence → "Files only"**, the small
-CrisperWhisper **venv** and its converted CT2 main/draft pair (under `/kaggle/working/cw_iso`)
+CrisperWhisper **venv** and its converted CT2 main model (under `/kaggle/working/cw_iso`)
 survive between sessions. Source model **weights are NOT persisted** — the full ensemble exceeds
 the persisted-dir cap, so those live in the roomy default cache and re-download each session
 (overlapped with compute by the prefetch below). No transcript, timestamp, IPA, phone, selector,
 or other derived inference output is cached; transcription always runs fresh."""),
     code(r"""
-import os, sys, subprocess, threading, shutil
+import os, sys, subprocess, threading, shutil, glob
 # A persisted venv can come back from a previous Kaggle session with bin/python stripped of its
 # execute bit (persistence doesn't preserve +x) -> PermissionError at run time. So before reusing
 # one, prove its python actually runs; if not, chmod, then wipe-and-rebuild as a last resort.
@@ -194,13 +193,20 @@ CW_READY = os.path.join(CW_WORK, ".venv_ready")   # stores the exact validated e
 CW_ENV_SPEC = f"crisperwhisper[ct2]=={CRISPER_VERSION}"
 CW_CT2_CACHE = os.path.join(CW_WORK, "ct2_models")
 os.makedirs(CW_CT2_CACHE, exist_ok=True)
+# Remove derived handoff files left by payloads before they were moved to session-temporary storage.
+# These exact non-recursive targets never include the reusable venv or converted model cache.
+for _legacy in ([os.path.join(CW_WORK, "cw_worker.py"),
+                 os.path.join(CW_WORK, "ct2_model_init.lock")]
+                + glob.glob(os.path.join(CW_WORK, "in_*.json"))
+                + glob.glob(os.path.join(CW_WORK, "out_*.json"))):
+    try: os.remove(_legacy)
+    except OSError: pass
 _cw = {"thread": None, "err": None}
 def _cw_runtime_ok():
     probe = (
         "import importlib.metadata; from crisperwhisper import CrisperWhisperModel; "
         f"assert importlib.metadata.version('crisperwhisper') == '{CRISPER_VERSION}'; "
-        "assert 'draft_model' in CrisperWhisperModel.__init__.__annotations__ or "
-        "'draft_model' in __import__('inspect').signature(CrisperWhisperModel).parameters"
+        "assert 'cache_dir' in __import__('inspect').signature(CrisperWhisperModel).parameters"
     )
     try:
         return subprocess.run([CW_VENV_PY, "-c", probe], capture_output=True, timeout=60).returncode == 0
@@ -240,21 +246,31 @@ SEL_WORK = os.path.join(os.environ.get("ASR_PERSIST", os.path.abspath(".")), "se
 os.makedirs(SEL_WORK, exist_ok=True)
 SEL_VENV = os.path.join(SEL_WORK, "venv"); SEL_VENV_PY = os.path.join(SEL_VENV, "bin", "python")
 SEL_READY = os.path.join(SEL_WORK, ".venv_ready")
+for _legacy_name in ("sel_worker.py", "in.json", "out.json"):
+    try: os.remove(os.path.join(SEL_WORK, _legacy_name))
+    except OSError: pass
 SEL_ENV_SPEC = f"transformers=={SELECTOR_TRANSFORMERS}|accelerate=={SELECTOR_ACCELERATE}"
 _sel = {"thread": None, "err": None}
 def _sel_runtime_ok():
     # A matching sentinel is insufficient if persistence restored a partial/corrupt environment.
-    # Import the exact load-bearing API before accepting the venv or marking it ready.
+    # Import the exact load-bearing API before accepting the venv or marking it ready. Cold imports
+    # of torch + Transformers can exceed a minute while model prefetch is saturating Kaggle I/O, so
+    # do not turn a slow-but-valid import into a permanent selector failure.
     probe = (
-        "import accelerate, transformers; "
+        "import accelerate, torch, transformers; "
         "from transformers import AutoModelForMultimodalLM, AutoProcessor; "
+        "from transformers.utils import is_torch_available; assert is_torch_available(); "
         f"assert transformers.__version__ == '{SELECTOR_TRANSFORMERS}'; "
         f"assert accelerate.__version__ == '{SELECTOR_ACCELERATE}'"
     )
     try:
-        return subprocess.run([SEL_VENV_PY, "-c", probe], capture_output=True, timeout=60).returncode == 0
-    except Exception:
-        return False
+        result = subprocess.run([SEL_VENV_PY, "-c", probe], capture_output=True,
+                                text=True, timeout=300)
+        if result.returncode == 0:
+            return None
+        return (result.stderr or result.stdout or f"exit {result.returncode}").strip()[-2400:]
+    except Exception as exc:
+        return repr(exc)
 def _sel_prewarm():
     try:
         try:
@@ -262,7 +278,7 @@ def _sel_prewarm():
         except OSError:
             _ready_spec = ""
         if (_reusable(SEL_READY, SEL_VENV_PY, SEL_VENV)
-                and _ready_spec == SEL_ENV_SPEC and _sel_runtime_ok()):
+                and _ready_spec == SEL_ENV_SPEC and _sel_runtime_ok() is None):
             print("selector venv: reusing persisted build", flush=True); return
         if not _venv_ok(SEL_VENV_PY):
             subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", SEL_VENV],
@@ -270,11 +286,14 @@ def _sel_prewarm():
         subprocess.run([os.path.join(SEL_VENV, "bin", "pip"), "-q", "install", "-U",
                         f"transformers=={SELECTOR_TRANSFORMERS}",
                         f"accelerate=={SELECTOR_ACCELERATE}"], check=True)   # fp16, no bnb
-        if not _sel_runtime_ok():
-            raise RuntimeError(f"selector runtime smoke check failed: {SEL_ENV_SPEC}")
+        _runtime_problem = _sel_runtime_ok()
+        if _runtime_problem is not None:
+            raise RuntimeError(f"selector runtime smoke check failed: {SEL_ENV_SPEC}: "
+                               f"{_runtime_problem}")
         with open(SEL_READY, "w") as f: f.write(SEL_ENV_SPEC)
     except Exception as e:
         _sel["err"] = e
+        print("selector venv prewarm failed:", repr(e)[:1600], flush=True)
 if USE_LLM_SELECTOR:
     _sel["thread"] = threading.Thread(target=_sel_prewarm, daemon=True); _sel["thread"].start()
     print("selector venv prewarm: started")
@@ -293,8 +312,6 @@ def _prefetch():
         (FW_MODEL, True), (CTC_MODEL, USE_CTC), (QWEN3ASR_MODEL, USE_QWEN3ASR),
         (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM),
         (f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}", USE_CRISPER),   # venv reads same HF cache
-        (f"nyralabs/CrisperWhisper2.0_{CRISPER_DRAFT_SIZE}",
-         USE_CRISPER and CRISPER_SPECULATIVE and CRISPER_DRAFT_SIZE != CRISPER_SIZE),
         (PHONE_MODEL, USE_PHONE), (PHONETIC_XEUS_MODEL, USE_PHONETIC_XEUS),
         (SELECTOR_MODEL, USE_LLM_SELECTOR)] if on]
     for r in repos:
@@ -609,9 +626,12 @@ it got — `ct2 (fast)` or the `transformers (SLOW)` fallback — so a slow run 
     code(r"""
 hyp_CW = None
 if USE_CRISPER:
-    import os, sys, json, subprocess, threading
+    import os, sys, json, subprocess, threading, tempfile
     _cw_t0 = time.time()
-    WORKER = os.path.join(CW_WORK, "cw_worker.py")
+    # Worker source and audio-derived handoff JSON are session-temporary. Only the venv and
+    # converted CT2 model belong in the Files-only persisted CW_WORK directory.
+    CW_RUN = tempfile.mkdtemp(prefix="classroom_asr_cw_")
+    WORKER = os.path.join(CW_RUN, "cw_worker.py")
     try:
         if _cw["thread"] is not None:
             _cw["thread"].join()                 # wait for the background venv build (§2a)
@@ -634,7 +654,7 @@ class _DropTorchDtype(logging.Filter):
 _flt = _DropTorchDtype()
 for _name in ("transformers", "transformers.modeling_utils"):
     logging.getLogger(_name).addFilter(_flt)
-size, draft_size, cache_dir, inp, outp, init_lock = sys.argv[1:7]
+size, cache_dir, inp, outp, init_lock = sys.argv[1:6]
 paths = json.load(open(inp))
 
 def _official_model(name):
@@ -659,11 +679,8 @@ with open(init_lock, "w") as _lock_file:
     fcntl.flock(_lock_file, fcntl.LOCK_EX)
     try:
         main_arg = _cached_model_arg(size)
-        draft_arg = _cached_model_arg(draft_size) if draft_size else None
-        m = CrisperWhisperModel(main_arg, backend="ct2", draft_model=draft_arg,
-                                speculative_k="auto", cache_dir=cache_dir)
-        print("CW backend: ct2 speculative (fast)" if draft_arg else "CW backend: ct2 (fast)",
-              flush=True)
+        m = CrisperWhisperModel(main_arg, backend="ct2", cache_dir=cache_dir)
+        print("CW backend: ct2 (fast)", flush=True)
     except Exception as e:
         print("CW backend: transformers (SLOW) -- ct2 failed:", repr(e)[:200], flush=True)
         m = CrisperWhisperModel(size, backend="transformers")
@@ -672,10 +689,7 @@ with open(init_lock, "w") as _lock_file:
 out = {}
 for p in paths:
     try:
-        kwargs = {"language": "en"}
-        if draft_size and getattr(m, "backend", None) == "ct2":
-            kwargs["speculative_decoding"] = True
-        r = m.transcribe(p, **kwargs); out[p] = getattr(r, "text", "") or ""
+        r = m.transcribe(p, language="en"); out[p] = getattr(r, "text", "") or ""
     except Exception as e:
         out[p] = ""; print("fail", p, repr(e)[:120], file=sys.stderr)
 json.dump(out, open(outp, "w"))
@@ -688,19 +702,17 @@ json.dump(out, open(outp, "w"))
         gpus = [g for g in GPUS if g is not None] or [None]
         shards = [paths[i::len(gpus)] for i in range(len(gpus))]
         res = {}
-        init_lock = os.path.join(CW_WORK, "ct2_model_init.lock")
-        draft_size = (CRISPER_DRAFT_SIZE if CRISPER_SPECULATIVE
-                      and CRISPER_DRAFT_SIZE != CRISPER_SIZE else "")
+        init_lock = os.path.join(CW_RUN, "ct2_model_init.lock")
         def _cw_run(gi, gpu, shard):
             if not shard:
                 return
             try:
-                inp = os.path.join(CW_WORK, f"in_{gi}.json"); outp = os.path.join(CW_WORK, f"out_{gi}.json")
+                inp = os.path.join(CW_RUN, f"in_{gi}.json"); outp = os.path.join(CW_RUN, f"out_{gi}.json")
                 json.dump(shard, open(inp, "w"))
                 env = dict(os.environ)
                 if gpu is not None:
                     env["CUDA_VISIBLE_DEVICES"] = str(gpu)  # each subprocess sees exactly one GPU
-                subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE, draft_size, CW_CT2_CACHE,
+                subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE, CW_CT2_CACHE,
                                 inp, outp, init_lock],
                                check=True, env=env)
                 res.update(json.load(open(outp)))           # disjoint keys per shard -> safe
@@ -940,8 +952,12 @@ against fusion, not assumed to beat it. It runs in its own venv at full fp16 acr
 (§21). This is the final transcript WER."""),
     code(r"""
 if USE_LLM_SELECTOR:
-    import os, json, subprocess, time
-    _sel_t0 = time.time(); SEL_WORKER = os.path.join(SEL_WORK, "sel_worker.py")
+    import os, json, subprocess, tempfile, time
+    _sel_t0 = time.time()
+    # Keep only the reusable venv in SEL_WORK. Transcripts, phone evidence, decisions, worker
+    # source, and selected output are derived per run and live in the ephemeral session temp dir.
+    SEL_RUN = tempfile.mkdtemp(prefix="classroom_asr_selector_")
+    SEL_WORKER = os.path.join(SEL_RUN, "sel_worker.py")
     llm_sel, sel_wer = fused, fused_wer          # default: fall back to the ROVER fusion
     try:
         if _sel.get("thread") is not None: _sel["thread"].join()   # wait for the venv build (§2a)
@@ -1144,10 +1160,10 @@ json.dump({"selected": selected}, open(outp, "w"))
         }
         print(f"selector retrieval anchor: {_anchor_key or 'none'}; "
               f"phone windows={sum(len(rows) for rows in phone_evidence)}")
-        json.dump(_selector_input, open(os.path.join(SEL_WORK, "in.json"), "w"))
+        json.dump(_selector_input, open(os.path.join(SEL_RUN, "in.json"), "w"))
         subprocess.run([SEL_VENV_PY, SEL_WORKER, SELECTOR_MODEL,
-                        os.path.join(SEL_WORK, "in.json"), os.path.join(SEL_WORK, "out.json")], check=True)
-        llm_sel = json.load(open(os.path.join(SEL_WORK, "out.json")))["selected"]
+                        os.path.join(SEL_RUN, "in.json"), os.path.join(SEL_RUN, "out.json")], check=True)
+        llm_sel = json.load(open(os.path.join(SEL_RUN, "out.json")))["selected"]
         sel_wer = wer_of(llm_sel)
         print(f"[LLM SELECTED   ] final WER={sel_wer:.3f}"
               f"   vs fused(ROVER)={fused_wer:.3f}  vs baseline A={wer_of(hyp_A):.3f}"

@@ -130,25 +130,48 @@ def test_crisper_workers_serialize_shared_ct2_cache_initialization():
     source = _notebook_source()
 
     assert "fcntl.flock(_lock_file, fcntl.LOCK_EX)" in source
-    assert 'init_lock = os.path.join(CW_WORK, "ct2_model_init.lock")' in source
+    assert 'init_lock = os.path.join(CW_RUN, "ct2_model_init.lock")' in source
     assert "inp, outp, init_lock]" in source
 
 
-def test_crisper_uses_lossless_speculative_ct2_and_persists_only_converted_models():
+def test_crisper_uses_validated_non_speculative_ct2_and_persists_only_converted_model():
     source = _notebook_source()
 
-    assert 'CRISPER_SPECULATIVE  = True;  CRISPER_DRAFT_SIZE = "turbo"' in source
     assert 'CRISPER_VERSION      = "2.0.2"' in source
     assert 'CW_ENV_SPEC = f"crisperwhisper[ct2]=={CRISPER_VERSION}"' in source
     assert "CrisperWhisper runtime smoke check failed" in source
     assert 'CW_CT2_CACHE = os.path.join(CW_WORK, "ct2_models")' in source
-    assert 'draft_model=draft_arg' in source
-    assert 'speculative_k="auto"' in source
-    assert 'kwargs["speculative_decoding"] = True' in source
+    assert "CRISPER_SPECULATIVE" not in source
+    assert "CRISPER_DRAFT_SIZE" not in source
+    assert "draft_model=" not in source
+    assert "speculative_decoding" not in source
+    assert 'm = CrisperWhisperModel(main_arg, backend="ct2", cache_dir=cache_dir)' in source
     assert 'os.path.isfile(os.path.join(candidate, ".conversion_complete"))' in source
     assert '"transcript"' not in source[source.index("def _cached_model_arg"):source.index(
         "# The first CT2 load", source.index("def _cached_model_arg")
     )]
+
+
+def test_audio_derived_worker_handoffs_are_session_temporary_not_persisted():
+    source = _notebook_source()
+
+    assert 'CW_RUN = tempfile.mkdtemp(prefix="classroom_asr_cw_")' in source
+    assert 'SEL_RUN = tempfile.mkdtemp(prefix="classroom_asr_selector_")' in source
+    assert 'os.path.join(CW_RUN, f"in_{gi}.json")' in source
+    assert 'os.path.join(SEL_RUN, "in.json")' in source
+    assert 'os.path.join(CW_WORK, f"in_{gi}.json")' not in source
+    assert 'os.path.join(SEL_WORK, "in.json")' not in source
+    assert 'glob.glob(os.path.join(CW_WORK, "in_*.json"))' in source
+    assert 'for _legacy_name in ("sel_worker.py", "in.json", "out.json")' in source
+
+
+def test_selector_probe_allows_slow_cold_imports_and_surfaces_the_real_failure():
+    source = _notebook_source()
+
+    assert 'text=True, timeout=300' in source
+    assert 'result.stderr or result.stdout' in source
+    assert '[-2400:]' in source
+    assert 'selector venv prewarm failed:' in source
 
 
 def test_prefetch_excludes_unused_framework_weights_and_prioritizes_first_branch():
