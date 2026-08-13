@@ -32,3 +32,14 @@ def test_folding_removes_formatting_only_errors():
 def test_fillers_are_preserved():
     # crucial: we do NOT drop fillers — deletion of them is a real metric.
     assert SCORE.tokens("um i like uh it") == ["um", "i", "like", "uh", "it"]
+
+
+def test_oh_interjection_not_folded_to_zero():
+    # standalone "oh" is the interjection, not the number zero — keep it as a word so a
+    # dropped "oh" scores as a filler deletion, not a phantom "0".
+    assert SCORE.tokens("oh really") == ["oh", "really"]
+    assert SCORE.tokens("oh oh no") == ["oh", "oh", "no"]
+    # real cardinals are unaffected (they never contain "oh")
+    assert SCORE.tokens("twenty five") == ["25"]
+    # a genuine spoken zero still folds
+    assert SCORE.tokens("zero") == ["0"]

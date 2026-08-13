@@ -99,8 +99,16 @@ def fold(tokens: list[str], *, numbers: bool = True, spelling: bool = True) -> l
             j = i
             while j < len(tokens) and tokens[j] in _NUMWORDS:
                 j += 1
-            val = _parse_cardinal(tokens[i:j])
-            out.append(str(val) if val is not None else " ".join(tokens[i:j]))
+            run = tokens[i:j]
+            # "oh" is the digit zero only inside a number ("four oh one" -> 401). A standalone
+            # "oh" (or a run of only "oh") is the interjection, so leave it as a word — otherwise
+            # a dropped "oh" is scored as a phantom "0" and mislabeled a number, not the filler
+            # deletion it actually is.
+            if all(t == "oh" for t in run):
+                out.extend(run)
+            else:
+                val = _parse_cardinal(run)
+                out.append(str(val) if val is not None else " ".join(run))
             i = j
         else:
             out.append(tokens[i])
