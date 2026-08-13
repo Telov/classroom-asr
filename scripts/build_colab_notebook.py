@@ -255,21 +255,27 @@ if USE_LLM_SELECTOR:
     _sel["thread"] = threading.Thread(target=_sel_prewarm, daemon=True); _sel["thread"].start()
     print("selector venv prewarm: started")
 
-# (b) Prefetch model weights (high-performance Xet) so the heavy Voxtral/Qwen downloads
-# overlap earlier branches instead of blocking their cells. Best-effort; branches re-fetch
-# lazily if a prefetch fails.
+# (b) Prefetch model weights (high-performance Xet) so downloads overlap compute instead of
+# blocking branch cells. This caches model files only, never transcripts or derived evidence.
+# Best-effort; branches re-fetch lazily if a prefetch fails.
 def _prefetch():
     try:
         from huggingface_hub import snapshot_download
     except Exception:
         return
+    # Fetch in first-use order so A/B/Z do not wait behind the largest late-stage models. The
+    # selector remains far enough ahead of §11.7 because all acoustic inference runs before it.
     repos = [m for m, on in [
-        (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM), (QWEN3ASR_MODEL, USE_QWEN3ASR),
+        (FW_MODEL, True), (CTC_MODEL, USE_CTC), (QWEN3ASR_MODEL, USE_QWEN3ASR),
+        (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM),
         (f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}", USE_CRISPER),   # venv reads same HF cache
-        (SELECTOR_MODEL, USE_LLM_SELECTOR),                            # §14 LLM judge (big, prefetch early)
-        (FW_MODEL, True), (CTC_MODEL, USE_CTC), (PHONE_MODEL, USE_PHONE)] if on]
-    for r in repos:                                   # biggest first (Voxtral) for max overlap
-        try: snapshot_download(r)
+        (PHONE_MODEL, USE_PHONE), (PHONETIC_XEUS_MODEL, USE_PHONETIC_XEUS),
+        (SELECTOR_MODEL, USE_LLM_SELECTOR)] if on]
+    for r in repos:
+        try:
+            # The runtime is PyTorch-only. Several wav2vec2 repositories also contain complete
+            # TensorFlow and Flax copies (2.52 GB combined for branch B); never download them.
+            snapshot_download(r, ignore_patterns=["*.h5", "*.msgpack"])
         except Exception as e: print("prefetch skip", r, repr(e)[:80])
 threading.Thread(target=_prefetch, daemon=True).start()
 print("model prefetch: started in background")

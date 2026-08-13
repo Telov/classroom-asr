@@ -115,6 +115,16 @@ def test_crisper_workers_serialize_shared_ct2_cache_initialization():
     assert "inp, outp, init_lock]" in source
 
 
+def test_prefetch_excludes_unused_framework_weights_and_prioritizes_first_branch():
+    source = _notebook_source()
+
+    assert 'snapshot_download(r, ignore_patterns=["*.h5", "*.msgpack"])' in source
+    prefetch_repos = source.index("repos = [m for m, on in [")
+    assert source.index("(FW_MODEL, True)", prefetch_repos) < source.index(
+        "(VOXTRAL_MODEL, USE_VOXTRAL", prefetch_repos
+    )
+
+
 def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():
     source = _notebook_source()
 

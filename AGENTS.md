@@ -48,6 +48,9 @@
 - Do not introduce user parameters, manual artifact transfer, intermediate-save workflows, or
   repeated setup steps without prior approval. The intended Kaggle workflow is zero-touch after
   starting the notebook, and the user turns sessions off after runs.
+- Do not persist or reuse transcripts, branch hypotheses, timestamps, IPA/phone outputs, selector
+  inputs, or other derived inference results across runs. Dependency environments and model files
+  may be cached; transcription and phonetic evidence must be regenerated from audio every run.
 - Optimize execution and iteration time without silently removing design-required evidence or
   lowering the intended acceptance test.
 
