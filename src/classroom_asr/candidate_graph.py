@@ -152,14 +152,21 @@ def realizable_oracle_tokens(graph: list[Slot], ref: list[str], *, opcodes=None)
     out: list[str] = []
     wi = gi = 0
     for s in graph:
-        cand_words = {w for c in s.votes if c is not NULL for w in str(c).split()}
         if s.kind == "ins":
-            for w in gap_refs[gi]:                    # recover pivot-dropped words a branch caught
-                if w in cand_words:
-                    out.append(w)
+            target = gap_refs[gi]
+            # An insertion-slot candidate is atomic: if branches offered "a b" and "a c", a
+            # selector may choose [], [a,b], or [a,c] -- never the synthetic [a,b,c] union. Pick
+            # the whole offered sequence with the smallest local edit distance to this reference
+            # gap. Counter preserves branch order, so ties deterministically prefer the anchor
+            # (NULL) and then earlier branches.
+            choices = [([] if candidate is NULL else str(candidate).split())
+                       for candidate in s.votes]
+            chosen = min(choices, key=lambda words: _edit_distance(words, target), default=[])
+            out.extend(chosen)
             gi += 1
         else:
             target = ref_at[wi]
+            cand_words = {c for c in s.votes if c is not NULL}
             if target is None:                        # pivot word spurious vs ref
                 if NULL not in s.votes:
                     out.append(s.pivot)               # can't drop it -> forced insertion (an error)
@@ -169,3 +176,8 @@ def realizable_oracle_tokens(graph: list[Slot], ref: list[str], *, opcodes=None)
                 out.append(s.pivot)                   # nobody did -> unavoidable substitution
             wi += 1
     return out
+
+
+def _edit_distance(left: list[str], right: list[str]) -> int:
+    """Dependency-free token edit distance for the tiny alternatives inside one graph slot."""
+    return sum(operation.op is not Op.MATCH for operation in align(left, right))

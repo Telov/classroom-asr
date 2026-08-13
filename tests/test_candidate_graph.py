@@ -78,5 +78,24 @@ def test_oracle_recovers_a_pivot_deletion_from_an_insertion_slot():
     assert oracle == "i really do"
 
 
+def test_oracle_cannot_union_parts_of_mutually_exclusive_insertion_candidates():
+    # Every branch is aligned against pivot "x". The graph therefore offers one insertion slot
+    # with exactly [], [a,b], or [a,c]. A word-union implementation incorrectly emitted [a,b,c]
+    # and claimed a perfect, but unassemblable, oracle transcript.
+    graph = build_graph(
+        [N.tokens("x"), N.tokens("a b x"), N.tokens("a c x")], pivot_index=0
+    )
+
+    oracle = realizable_oracle_tokens(graph, N.tokens("a b c x"))
+
+    assert oracle == N.tokens("a b x")
+    offered = {
+        tuple([] if candidate is NULL else candidate.split())
+        for slot in graph if slot.kind == "ins" for candidate in slot.votes
+    }
+    assert tuple(oracle[:-1]) in offered
+    assert score("a b c x", " ".join(oracle), norm=N).wer == 0.25
+
+
 def test_empty_graph():
     assert build_graph([]) == []
