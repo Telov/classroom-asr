@@ -287,7 +287,7 @@ def test_no_vad_whisper_shadow_reuses_baseline_models_and_stays_a_separate_branc
     assert 'hyp_ANV = _turbo_pass(False, "Whisper no-VAD shadow")' in source
     assert 'add_branch("+WhisperNoVAD", hyp_ANV)' in source
     assert '("WhisperNoVAD", globals().get("hyp_ANV"))' in source
-    assert '"WhisperNoVAD": "Whisper no-VAD shadow"' in source
+    assert '("WhisperNoVAD", "Whisper", "Whisper no-VAD shadow",' in source
     assert '"ANV_whisper_turbo_no_vad"' in source
 
 
@@ -356,7 +356,12 @@ def test_word_branch_overlap_ablation_is_reported_without_rerunning_asr():
     assert '"recall_floor_increase_if_removed"' in source
     assert '"realizable_oracle_without"' in source
     assert '"realizable_oracle_increase_if_removed"' in source
+    assert '"marginal_stage_seconds_if_removed"' in source
     assert "_oracle_without = realizable_oracle_wer(_other_branches)" in source
+    assert 'crisper_phase_seconds.get("independent_s")' in source
+    assert 'crisper_phase_seconds.get("verbatize_s")' in source
+    assert '_sibling not in _present_names' in source
+    assert 'rec("candidate graph analysis", time.time() - _analysis_t0)' in source
     assert '"branch_overlap_ablation"' in source
     assert "=== pairwise overlap of correctly recovered reference occurrences ===" in source
     assert '"smaller_hit_set_covered_fraction"' in source

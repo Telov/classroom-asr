@@ -793,6 +793,7 @@ interview. Both outputs are scored independently. The worker prints which backen
 `ct2 (fast)` or the `transformers (SLOW)` fallback — so a slow run is visible."""),
     code(r"""
 hyp_CW = hyp_CWV = None
+crisper_phase_seconds = {}
 if USE_CRISPER:
     import os, sys, json, subprocess, threading, tempfile, shutil
     _cw_t0 = time.time()
@@ -962,9 +963,13 @@ json.dump({"independent": independent, "verbatized": verbatized,
                 CrisperWhisperV2._clean(part) for part in verb_res.get(p, []) if part
             ).strip() for p in paths]
         if worker_timings:
+            crisper_phase_seconds = {
+                key: max(float(t.get(key, 0.0)) for t in worker_timings)
+                for key in ("independent_s", "verbatize_s")
+            }
             print("Crisper worker phase maxima:",
-                  {key: round(max(float(t.get(key, 0.0)) for t in worker_timings), 1)
-                   for key in ("independent_s", "verbatize_s")}, flush=True)
+                  {key: round(value, 1) for key, value in crisper_phase_seconds.items()},
+                  flush=True)
     except Exception as e:
         print("CrisperWhisper isolation failed:", repr(e)[:200])
         hyp_CW = hyp_CWV = [""] * len(interviews)
@@ -1170,6 +1175,7 @@ variant or an acceptance target."""),
     code(r"""
 from classroom_asr.candidate_graph import build_graph
 from classroom_asr.selector import build_decisions
+_analysis_t0 = time.time()
 # Qwen is deliberately first: build_graph(..., pivot_index=0) and every selector fallback are
 # anchored to it. Phone branches are IPA evidence, not word candidates.
 _wb_named = [("Qwen3-ASR", globals().get("hyp_Z")),
@@ -1243,16 +1249,34 @@ for _name, _hyps in _wb_named:
     _branch_hits.append(_hits)
 _all_hits = set().union(*_branch_hits) if _branch_hits else set()
 _timing_by_name = {name: dt for name, dt in TIMINGS}
-_stage_for_branch = {"Qwen3-ASR": "A+B+Qwen3", "Whisper": "A whisper",
-                     "WhisperNoVAD": "Whisper no-VAD shadow",
-                     "WhisperLargeV3": "Whisper large-v3 quality",
-                     "wav2vec2 CTC": "A+B", "Voxtral": "+Voxtral",
-                     "VoxtralVerbatim": "+VoxtralVerbatim",
-                     "CrisperWhisper": "+CrisperWhisper",
-                     "CrisperQwenVerbatize": "+CrisperWhisper"}
+_present_names = {name for name, _hyps in _wb_named}
+_marginal_seconds = {
+    "Qwen3-ASR": _timing_by_name.get("A+B+Qwen3"),
+    "WhisperLargeV3": _timing_by_name.get("Whisper large-v3 quality"),
+    "wav2vec2 CTC": _timing_by_name.get("A+B"),
+}
+# If both outputs share one model load, removing either saves only its own decode pass. If its
+# sibling is absent, removing the final output also removes the shared load.
+for _name, _sibling, _pass_stage, _load_stage in [
+        ("Whisper", "WhisperNoVAD", "A whisper", "Whisper turbo load (shared)"),
+        ("WhisperNoVAD", "Whisper", "Whisper no-VAD shadow", "Whisper turbo load (shared)"),
+        ("Voxtral", "VoxtralVerbatim", "+Voxtral", "Voxtral load (shared)"),
+        ("VoxtralVerbatim", "Voxtral", "+VoxtralVerbatim", "Voxtral load (shared)"),
+]:
+    _seconds = _timing_by_name.get(_pass_stage)
+    if _seconds is not None and _sibling not in _present_names:
+        _seconds += _timing_by_name.get(_load_stage, 0.0)
+    _marginal_seconds[_name] = _seconds
+if {"CrisperWhisper", "CrisperQwenVerbatize"} <= _present_names:
+    _marginal_seconds["CrisperWhisper"] = crisper_phase_seconds.get("independent_s")
+    _marginal_seconds["CrisperQwenVerbatize"] = crisper_phase_seconds.get("verbatize_s")
+else:
+    for _name in ("CrisperWhisper", "CrisperQwenVerbatize"):
+        if _name in _present_names:
+            _marginal_seconds[_name] = _timing_by_name.get("+CrisperWhisper")
 branch_overlap_ablation = []
 print("\n=== word-branch overlap: exact leave-one-out floor + graph-oracle effect ===")
-print("branch                 WER   unique  floor_without  oracle_without  oracle_delta  stage_s")
+print("branch                 WER   unique  floor_without  oracle_without  oracle_delta  marginal_s")
 for _bi, ((_name, _hyps), _hits) in enumerate(zip(_wb_named, _branch_hits)):
     _other_hits = set().union(*(_branch_hits[:_bi] + _branch_hits[_bi + 1:]))
     _unique = _hits - _other_hits
@@ -1261,7 +1285,7 @@ for _bi, ((_name, _hyps), _hits) in enumerate(zip(_wb_named, _branch_hits)):
     _other_branches = _wb[:_bi] + _wb[_bi + 1:]
     _oracle_without = realizable_oracle_wer(_other_branches)
     _oracle_delta = _oracle_without - r_oracle
-    _stage_s = _timing_by_name.get(_stage_for_branch.get(_name, ""))
+    _stage_s = _marginal_seconds.get(_name)
     _row = {"branch": _name, "wer": round(wer_of(_hyps), 4),
             "reference_hits": len(_hits), "unique_reference_hits": len(_unique),
             "hit_overlap_fraction": round(_overlap, 4),
@@ -1269,7 +1293,8 @@ for _bi, ((_name, _hyps), _hits) in enumerate(zip(_wb_named, _branch_hits)):
             "recall_floor_increase_if_removed": round(len(_unique) / max(_R, 1), 4),
             "realizable_oracle_without": round(_oracle_without, 4),
             "realizable_oracle_increase_if_removed": round(_oracle_delta, 4),
-            "stage_seconds": round(_stage_s, 1) if _stage_s is not None else None}
+            "marginal_stage_seconds_if_removed": (round(_stage_s, 1)
+                                                   if _stage_s is not None else None)}
     branch_overlap_ablation.append(_row)
     print(f"{_name:22s} {_row['wer']:.3f} {len(_unique):7d} "
           f"{_floor_without:14.3f} {_oracle_without:15.3f} {_oracle_delta:+12.3f} "
@@ -1291,6 +1316,7 @@ for _left in range(len(_wb_named)):
               f"{100*_smaller_covered:14.1f}%")
 print("A zero/small unique count identifies overlap worth investigating; it is not by itself "
       "authorization to remove a branch because oracle placement and selector evidence may differ.")
+rec("candidate graph analysis", time.time() - _analysis_t0)
 """),
     md("""## 11.7 Acoustic-evidence-aware local judge (Qwen3.5-9B) — currently paused
 **Scope, honestly:** this is still not the complete §14–15 whole-lesson selector. It receives
