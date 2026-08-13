@@ -289,6 +289,9 @@ def test_accuracy_shadow_uses_auto_language_known_good_qwen_windows_and_full_whi
     source = _notebook_source()
 
     assert 'QWEN_CHUNK_S = 30' in source
+    assert 'QWEN_ASR_VERSION = "0.0.6"' in source
+    assert '"qwen-asr==0.0.6"' in source
+    assert '_bootstrap_metadata.version("qwen-asr") == QWEN_ASR_VERSION' in source
     assert 'QWEN_MAX_NEW_TOKENS = 512' in source
     assert 'VOXTRAL_CHUNK_S = 30' in source
     assert 'Qwen3ASR(\n                            QWEN3ASR_MODEL, language=None' in source
@@ -424,6 +427,7 @@ def test_summary_identifies_run_and_reports_each_branch_error_shape():
     assert '"substitutions": S, "deletions": D, "insertions": I' in source
     assert '"interviews_with_text"' in source
     assert '"source_git_ref": ASR_GIT_REF' in source
+    assert '"main_environment_spec"' in source
     assert '"overall_wall_seconds"' in source
     assert '"cached_hf_revisions"' in source
     assert "not a claim that every listed revision was loaded" in source

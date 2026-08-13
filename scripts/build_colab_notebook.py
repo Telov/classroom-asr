@@ -86,7 +86,8 @@ torch.backends.cudnn.allow_tf32 = True
 # Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
 # loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
 # versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
-%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz virtualenv pyyaml typeguard
+QWEN_ASR_VERSION = "0.0.6"  # exact wrapper/API validated by the current Kaggle integration
+%pip -q install "mistral-common[audio]" phonemizer faster-whisper "qwen-asr==0.0.6" soundfile rapidfuzz virtualenv pyyaml typeguard
 import subprocess, sys
 subprocess.run([sys.executable, "-m", "pip", "install", "-q",
                 "transformers==4.57.6", "accelerate==1.12.0",
@@ -94,6 +95,8 @@ subprocess.run([sys.executable, "-m", "pip", "install", "-q",
 # NOTE: CrisperWhisper is NOT installed here — its CT2 fork replaces the `ctranslate2`
 # module and would clobber faster-whisper (branch A). It runs in an isolated venv (§9a).
 import classroom_asr, os
+import importlib.metadata as _bootstrap_metadata
+assert _bootstrap_metadata.version("qwen-asr") == QWEN_ASR_VERSION
 if os.environ.get("HF_TOKEN"):
     from huggingface_hub import login; login(os.environ["HF_TOKEN"])
 GPUS = list(range(torch.cuda.device_count())) or [None]
@@ -1833,6 +1836,8 @@ run_fingerprint = {
     "tracked_stage_seconds": round(sum(dt for _, dt in TIMINGS), 1),
     "python": sys.version.split()[0],
     "packages": _packages,
+    "main_environment_spec": {"qwen-asr": QWEN_ASR_VERSION,
+                              "transformers": "4.57.6", "accelerate": "1.12.0"},
     "hardware": {"gpu_count": torch.cuda.device_count(),
                  "gpu_names": [torch.cuda.get_device_name(i)
                                for i in range(torch.cuda.device_count())],
