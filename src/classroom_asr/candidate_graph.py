@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Callable, Iterable
 
 from .metrics import Op, align
 
@@ -46,11 +47,24 @@ class Slot:
         return self.pivot if self.kind == "word" else NULL
 
 
-def build_graph(token_lists: list[list[str]], *, pivot_index: int | None = None) -> list[Slot]:
+Opcode = tuple[str, int, int, int, int]
+
+
+def build_graph(
+    token_lists: list[list[str]],
+    *,
+    pivot_index: int | None = None,
+    opcodes_fn: Callable[[list[str], list[str]], Iterable[Opcode]] | None = None,
+) -> list[Slot]:
     """Interleaved candidate graph.
 
     ``pivot_index`` anchors the graph to a designated primary backbone (Qwen in the production
     path). When omitted, the legacy longest-hypothesis behavior is retained for generic callers.
+
+    ``opcodes_fn`` optionally supplies a fast sequence aligner such as
+    ``rapidfuzz.distance.Levenshtein.opcodes(...).as_list()``. The dependency-free default keeps
+    using :func:`classroom_asr.metrics.align`; whole-recording callers can opt into the compiled
+    path without making RapidFuzz a core dependency.
     """
     lists = [t for t in token_lists if t]
     if not lists:
@@ -65,6 +79,20 @@ def build_graph(token_lists: list[list[str]], *, pivot_index: int | None = None)
         p = 0                                          # pivot tokens consumed so far -> current gap
         if h is pivot:
             aligned = list(pivot)
+        elif opcodes_fn is not None:
+            for tag, i0, i1, j0, j1 in opcodes_fn(pivot, h):
+                if tag in ("equal", "replace"):
+                    paired = min(i1 - i0, j1 - j0)
+                    for offset in range(paired):
+                        aligned[i0 + offset] = h[j0 + offset]
+                    # An unequal replacement tail is an insertion after its paired prefix;
+                    # unmatched pivot words stay NULL by construction.
+                    if j0 + paired < j1:
+                        inserts[i0 + paired].extend(h[j0 + paired:j1])
+                elif tag == "insert":
+                    inserts[i0].extend(h[j0:j1])
+                elif tag != "delete":
+                    raise ValueError(f"unsupported alignment opcode: {tag!r}")
         else:
             for op in align(pivot, h):
                 if op.op in (Op.MATCH, Op.SUB):

@@ -15,6 +15,28 @@ def test_designated_backbone_is_the_graph_pivot():
     assert [slot.pivot for slot in graph if slot.kind == "word"] == ["qwen", "short"]
 
 
+def test_fast_opcode_path_preserves_replacements_and_insertions():
+    pivot = ["we", "went", "home"]
+    other = ["we", "uh", "go", "home"]
+
+    def opcodes(ref, hyp):
+        assert ref == pivot and hyp == other
+        return [
+            ("equal", 0, 1, 0, 1),
+            ("insert", 1, 1, 1, 2),
+            ("replace", 1, 2, 2, 3),
+            ("equal", 2, 3, 3, 4),
+        ]
+
+    graph = build_graph([pivot, other], pivot_index=0, opcodes_fn=opcodes)
+    insertion_slots = [slot for slot in graph if slot.kind == "ins"]
+    word_slots = [slot for slot in graph if slot.kind == "word"]
+
+    assert insertion_slots[1].votes["uh"] == 1
+    assert word_slots[1].votes["go"] == 1
+    assert word_slots[2].votes["home"] == 2
+
+
 def test_anchor_is_backbone_word_or_no_insertion():
     graph = build_graph(
         [N.tokens("i went home"), N.tokens("i really want home")], pivot_index=0)
