@@ -69,7 +69,14 @@ def build_graph(
     lists = [t for t in token_lists if t]
     if not lists:
         return []
-    pivot = (lists[pivot_index] if pivot_index is not None else max(lists, key=len))
+    if pivot_index is not None:
+        if not 0 <= pivot_index < len(token_lists):
+            raise IndexError(f"pivot_index {pivot_index} outside {len(token_lists)} token lists")
+        pivot = token_lists[pivot_index]
+        if not pivot:
+            raise ValueError("designated pivot transcript is empty")
+    else:
+        pivot = max(lists, key=len)
     P = len(pivot)
     word_votes = [Counter() for _ in range(P)]
     ins_votes = [Counter() for _ in range(P + 1)]

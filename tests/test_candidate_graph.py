@@ -1,3 +1,5 @@
+import pytest
+
 from classroom_asr.candidate_graph import build_graph, realizable_oracle_tokens, NULL
 from classroom_asr.normalize import Normalizer
 from classroom_asr.metrics import score
@@ -13,6 +15,16 @@ def test_designated_backbone_is_the_graph_pivot():
     graph = build_graph(
         [N.tokens("qwen short"), N.tokens("another much longer transcript")], pivot_index=0)
     assert [slot.pivot for slot in graph if slot.kind == "word"] == ["qwen", "short"]
+
+
+def test_designated_pivot_index_is_not_shifted_when_another_branch_is_empty():
+    graph = build_graph(
+        [[], N.tokens("qwen backbone"), N.tokens("other words")], pivot_index=1
+    )
+    assert [slot.pivot for slot in graph if slot.kind == "word"] == ["qwen", "backbone"]
+
+    with pytest.raises(ValueError, match="designated pivot transcript is empty"):
+        build_graph([[], N.tokens("fallback must not silently win")], pivot_index=0)
 
 
 def test_fast_opcode_path_preserves_replacements_and_insertions():
