@@ -205,6 +205,14 @@ def _reusable(ready, py, venvdir):
     try: os.remove(ready)
     except OSError: pass
     return False
+def _fresh_isolated_venv(ready, venvdir):
+    # Reinstalling into a stale persisted environment can leave shadow packages/API fragments.
+    # Replace only the dependency venv; reusable model caches live in sibling directories.
+    try: os.remove(ready)
+    except OSError: pass
+    shutil.rmtree(venvdir, ignore_errors=True)
+    subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", venvdir],
+                   check=True)
 # (a) CrisperWhisper CT2 venv — built in the background; §9a just joins this thread. Lives under
 # the persisted dir (§1), so once built it's reused next session instead of rebuilt every run.
 CW_WORK = os.path.join(os.environ.get("ASR_PERSIST", os.path.abspath(".")), "cw_iso")
@@ -255,8 +263,7 @@ def _cw_prewarm():
             print("CrisperWhisper venv: reusing persisted build", flush=True); return
         # virtualenv (not venv): seeds pip from bundled wheels, so it avoids the
         # ensurepip failure `python -m venv` hits on Kaggle. Reuses system torch.
-        subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", CW_VENV],
-                       check=True)
+        _fresh_isolated_venv(CW_READY, CW_VENV)
         subprocess.run([os.path.join(CW_VENV, "bin", "pip"), "-q", "install", "-U",
                         CW_ENV_SPEC], check=True)
         if not _cw_runtime_ok():
@@ -288,6 +295,8 @@ def _sel_runtime_ok():
     # do not turn a slow-but-valid import into a permanent selector failure.
     probe = (
         "import accelerate, torch, transformers; "
+        "from classroom_asr.selector import generated_token_ids, select_graph_with_chooser; "
+        "assert callable(generated_token_ids) and callable(select_graph_with_chooser); "
         "from transformers import AutoModelForMultimodalLM, AutoProcessor; "
         "from transformers.utils import is_torch_available; assert is_torch_available(); "
         f"assert transformers.__version__ == '{SELECTOR_TRANSFORMERS}'; "
@@ -310,9 +319,7 @@ def _sel_prewarm():
         if (_reusable(SEL_READY, SEL_VENV_PY, SEL_VENV)
                 and _ready_spec == SEL_ENV_SPEC and _sel_runtime_ok() is None):
             print("selector venv: reusing persisted build", flush=True); return
-        if not _venv_ok(SEL_VENV_PY):
-            subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", SEL_VENV],
-                           check=True)
+        _fresh_isolated_venv(SEL_READY, SEL_VENV)
         subprocess.run([os.path.join(SEL_VENV, "bin", "pip"), "-q", "install", "-U",
                         f"transformers=={SELECTOR_TRANSFORMERS}",
                         f"accelerate=={SELECTOR_ACCELERATE}"], check=True)   # fp16, no bnb

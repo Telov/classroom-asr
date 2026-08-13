@@ -260,6 +260,11 @@ def test_selector_probe_allows_slow_cold_imports_and_surfaces_the_real_failure()
     assert 'result.stderr or result.stdout' in source
     assert '[-2400:]' in source
     assert 'selector venv prewarm failed:' in source
+    assert "from classroom_asr.selector import generated_token_ids, select_graph_with_chooser" in source
+    assert "def _fresh_isolated_venv(ready, venvdir):" in source
+    assert "_fresh_isolated_venv(CW_READY, CW_VENV)" in source
+    assert "_fresh_isolated_venv(SEL_READY, SEL_VENV)" in source
+    assert "shutil.rmtree(venvdir, ignore_errors=True)" in source
 
 
 def test_prefetch_excludes_unused_framework_weights_and_prioritizes_first_branch():
