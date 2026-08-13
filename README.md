@@ -21,11 +21,10 @@ This is **not** a streaming ASR product. It is an offline pipeline that:
 
 ## Status of this repository
 
-**Stage 0 foundation** (design-doc §20 step 1–3, §24.1, §28). The core is
-implemented and tested with **zero ML dependencies** so the data model, metrics,
-candidate graph, and orchestration are runnable today. Real acoustic/LLM models
-plug in behind the interfaces in `pipeline/base.py` — the doc treats model names
-as replaceable and the architecture as modular.
+The dependency-free core remains usable with **zero ML dependencies**, while the
+Kaggle benchmark now exercises real acoustic backends behind the same interfaces.
+The architecture is deliberately modular: benchmark branches measure candidate
+quality and complementarity before any model is promoted into the production stack.
 
 What runs now:
 
@@ -35,11 +34,17 @@ What runs now:
 - session / persistent lexicon with a pronunciation index + phonetic RAG (§10.4);
 - candidate-graph builder incl. MBR/consensus candidate (§12);
 - pluggable pipeline stages with reference **stub** backends;
-- whole-lesson global→local→global orchestrator (§15) end-to-end on synthetic data.
+- whole-lesson global→local→global orchestrator (§15) end-to-end on synthetic data;
+- real Qwen3-ASR, faster-whisper, wav2vec2 CTC/phone, Voxtral, CrisperWhisper,
+  and PhoneticXEUS backend adapters;
+- a reproducible Kaggle CORAAL benchmark with exact branch error counts,
+  Qwen-anchored candidate graphs, realizable-oracle WER, leave-one-out overlap,
+  and an exhaustive accuracy/runtime branch-subset frontier.
 
-What is stubbed (interfaces defined, real models TODO): Qwen3-ASR backbone,
-GigaAM-v3-SSL, PhoneticXEUS phone encoder, robust P2G, the 9B/12B conversation
-selector, and the fusion/adapter training (§7, §8, §14, §17).
+What remains research/integration work: robust lattice-aware P2G, calibrated
+confidence, the production whole-lesson constrained selector, learned multi-encoder
+fusion/adapters, and training on the actual RU↔EN classroom distribution. GigaAM is
+intentionally excluded from the current English benchmark.
 
 ## Layout → design-doc section map
 
@@ -65,7 +70,7 @@ python -m pip install -e .            # core only, no ML deps
 python scripts/run_demo.py            # run the stub pipeline end-to-end
 python -m classroom_asr demo          # same, via the installed package
 python -m classroom_asr demo --json   # machine-readable output
-python -m pytest                      # run the test suite (40 tests)
+python -m pytest                      # run the full test suite
 ```
 
 (The `classroom-asr` console script is also installed; it needs your Python
@@ -74,28 +79,37 @@ python -m pytest                      # run the test suite (40 tests)
 To wire real models later: `python -m pip install -e ".[ml,data]"` and implement
 the `pipeline/base.py` interfaces against the chosen checkpoints.
 
-## Real-data oracle run (Colab, CORAAL)
+## Real-data oracle run (Kaggle, CORAAL)
 
-`colab/CORAAL_candidate_oracle.ipynb` runs the **candidate-oracle WER gate (§18.2)**
-on ~1 h of professionally transcribed, verbatim, real-world conversation
-([CORAAL](https://oraal.uoregon.edu/coraal)) using a **real Whisper backend**
-([backends/whisper_asr.py](src/classroom_asr/backends/whisper_asr.py)) behind our
-`AcousticModel` interface — the candidate graph and oracle metric are our code, only
-the fictional 2026 backbone is swapped for an existing open model. Branch A is
-Whisper (attention seq2seq) and branch B is a **wav2vec2 CTC** model — a different
-architecture that fails differently — so the A→A+B headroom measures genuine
-complementary evidence, not just beam diversity (the multi-encoder bet, §8).
+Import [`colab/CORAAL_candidate_oracle.ipynb`](colab/CORAAL_candidate_oracle.ipynb)
+into Kaggle once and keep using that same notebook. It is a small persistent launcher:
+every **Run All** resolves the current `main` commit, downloads the canonical payload
+from that immutable revision, pins the package install to the same revision, and runs
+all payload cells. Do not create a new Kaggle notebook or copy cells after project
+updates.
 
-Runs on **Colab or Kaggle** (Kaggle 2×T4 recommended — the notebook shards across
-all GPUs). The wheel is **embedded in the notebook** (base64), so there is no upload
-step; regenerate with `python scripts/build_colab_notebook.py` after rebuilding the
-wheel. Active overlap-benchmark branches: Whisper turbo (A, baseline), full Whisper
-large-v3 (A3, FP16 beam-5 shadow), wav2vec2 CTC (B), **Qwen3-ASR-1.7B (Z, the
-design's real backbone)**, Voxtral Mini clean and AAE-aware verbatim variants, and
-CrisperWhisper. The selector and its phone/IPA inputs are paused in this mode.
-Includes an **error-analysis** section (S/D/I, most-deleted words, worst utterances).
-CORAAL is spontaneous **English**, so read the baseline→oracle *gap*, not absolute
-WER (§1.3, §18).
+Recommended Kaggle settings are **GPU T4 ×2**, Internet **On**, and file persistence
+**On**. Persistence reuses only dependency environments, downloaded CORAAL archives,
+and the bounded Crisper CT2 conversion; transcripts, timestamps, IPA/phone evidence,
+selector inputs, and other inference products are regenerated every run.
+
+The benchmark evaluates roughly one hour of professionally transcribed, spontaneous
+English conversation from [CORAAL](https://oraal.uoregon.edu/coraal). Active branches
+are:
+
+- Whisper large-v3-turbo with VAD (baseline) and a same-load no-VAD quiet-word shadow;
+- full Whisper large-v3 FP16 beam-5 quality shadow;
+- wav2vec2 CTC;
+- **Qwen3-ASR-1.7B**, the primary multilingual backbone, with automatic language detection;
+- Voxtral Mini clean and AAE-aware verbatim modes on one shared model load;
+- independent CrisperWhisper and Qwen-conditioned Crisper Verbatimize.
+
+The selector and its phone/IPA inputs are temporarily paused while upstream branches
+undergo exact overlap and subset-oracle analysis. The final JSON includes branch WER
+and S/D/I, deletion rates, model/runtime fingerprints, resolved Hub revisions,
+leave-one-out and pairwise overlap, and a runtime-aware Pareto frontier across all
+Qwen-anchored branch subsets. Read the Qwen→realizable-oracle gap and deletion slices,
+not just absolute WER (§18).
 
 ## Non-goals (§2)
 
