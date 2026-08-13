@@ -45,9 +45,8 @@ Branches (each a different architecture → complementary errors, §8):
 * **C** Voxtral Mini 3B (audio-LLM)
 * **CW** CrisperWhisper 2.0 — a **verbatim**-tuned Whisper (keeps um/uh/false starts)
 * **VV** Voxtral, **verbatim-prompted** (instruct mode, told to keep disfluencies)
-* **phone** wav2vec2 phoneme CTC → **realized IPA** (the pronunciation path; its
-  value is OOV/nonce recovery + PER, which CORAAL can't score — reported, not forced
-  into word WER)
+* **phone** wav2vec2 phoneme CTC + PhoneticXEUS → timestamped **realized-IPA evidence**
+  retrieved into the LLM judge prompt (not forced into word WER; CORAAL has no phone reference)
 
 **Kaggle:** Settings → Accelerator → **GPU T4 x2**, Internet **ON**. Uses both T4s.
 
@@ -116,8 +115,8 @@ USE_QWEN3ASR   = True;  QWEN3ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 USE_VOXTRAL    = True;  VOXTRAL_MODEL  = "mistralai/Voxtral-Mini-3B-2507"
 USE_PHONE      = True;  PHONE_MODEL    = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 # PhoneticXeus (§7.3/§10): the design's named universal phone recognizer (XEUS + self-cond CTC,
-# SOTA accented-English IPA). Phone branches output realized IPA (unscored on CORAAL — no
-# phonetic reference); they feed the OOV/nonce recovery route (phone lattice -> P2G), not word WER.
+# SOTA accented-English IPA). Phone branches output timestamped realized-IPA evidence (unscored
+# on CORAAL — no phonetic reference) that is retrieved into the selector prompt, not merely printed.
 USE_PHONETIC_XEUS = True;  PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
 # Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
@@ -390,35 +389,48 @@ def _free_models(models):
             if g is not None:
                 with torch.cuda.device(g): torch.cuda.empty_cache()
 
-def _windows_of(k, chunk_s):
+WINDOW_PARTS = {}   # desc -> per-interview timestamped text windows; selector retrieval anchor
+
+def _window_records_of(k, chunk_s):
     from classroom_asr.backends import iter_silence_chunks
     wav = load_16k(interviews[k][0])
-    return [c for _, c in iter_silence_chunks(wav, 16000, chunk_s) if len(c) >= 400]
+    return [(start / 16000, (start + len(c)) / 16000, c)
+            for start, c in iter_silence_chunks(wav, 16000, chunk_s) if len(c) >= 400]
+
+def _windows_of(k, chunk_s):
+    return [c for _start, _end, c in _window_records_of(k, chunk_s)]
 
 # Balance ALL ~chunk_s windows from ALL interviews evenly across the GPUs (so no GPU idles
 # on the 2+1 interview split), transcribe, then reassemble each transcript in order. Output
 # is identical to per-interview transcription (pure utilization win). `models` are preloaded
 # (one per GPU) and NOT unloaded here (the caller owns them).
 def window_pass(models, desc, *, chunk_s, batch_size):
-    iv_chunks = [_windows_of(k, chunk_s) for k in range(len(interviews))]
-    tasks = [(k, wi, c) for k, cs in enumerate(iv_chunks) for wi, c in enumerate(cs)]
+    iv_records = [_window_records_of(k, chunk_s) for k in range(len(interviews))]
+    tasks = [(k, wi, start, end, c) for k, rows in enumerate(iv_records)
+             for wi, (start, end, c) in enumerate(rows)]
     shards = [tasks[i::len(models)] for i in range(len(models))]
     results = {}
     def worker(model, shard, pos):
-        cks = [t[2] for t in shard]
+        cks = [t[4] for t in shard]
         if not cks: return
         try:
             texts = model.transcribe_chunk_list(cks, batch_size=batch_size)
         except Exception as e:
             print(desc, "failed:", repr(e)[:120]); texts = [""] * len(cks)
-        for (k, wi, _), txt in zip(shard, texts): results[(k, wi)] = txt
+        for (k, wi, _start, _end, _), txt in zip(shard, texts): results[(k, wi)] = txt
     ts = [threading.Thread(target=worker, args=(models[i], shards[i], i)) for i in range(len(models))]
     for t in ts: t.start()
     for t in ts: t.join()
     out = []
-    for k, cs in enumerate(iv_chunks):
-        parts = [results.get((k, wi), "") for wi in range(len(cs))]
+    timed_parts = []
+    for k, rows in enumerate(iv_records):
+        parts = [results.get((k, wi), "") for wi in range(len(rows))]
         out.append(" ".join(p for p in parts if p).strip())
+        timed_parts.append([
+            {"start_s": round(start, 3), "end_s": round(end, 3), "text": parts[wi]}
+            for wi, (start, end, _c) in enumerate(rows)
+        ])
+    WINDOW_PARTS[desc] = timed_parts
     return out
 
 # window_pass with its own model load/unload + per-branch error guard + timing.
@@ -634,37 +646,100 @@ json.dump(out, open(outp, "w"))
     rec("+CrisperWhisper", time.time() - _cw_t0)
     add_branch("+CrisperWhisper", hyp_CW)
 """),
-    md("""## 10. Phone branches — realized IPA (the pronunciation path)
-Not a word transcript: the phone branch's product is *pronunciation*. Scoring it needs a
-phonetic reference (PER/IPA-CER, §18.1), which CORAAL doesn't provide — so we show the
-realized IPA rather than force it through a naive P2G into a misleading word WER. It's a
-first-class part of the design (OOV/nonce recovery), just not exercised by this dataset.
+    md("""## 10. Phone branches — timestamped acoustic evidence for the LLM
+The phone path is *pronunciation evidence*, not a word transcript. CORAAL has no phonetic
+reference, so PER/IPA-CER cannot be reported here and IPA is never forced into word WER.
+However, it is no longer diagnostic-only: both phone streams are kept in timestamped ~24 s
+windows and the selector retrieves the windows overlapping each uncertain word region (§10,
+§14.4, §15.4). Repeated evidence blocks are deduplicated inside each selector batch.
 
-Two models: `wav2vec2-lv-60-espeak` (now decoded via a manual vocab CTC decoder — the
-`Wav2Vec2PhonemeCTCTokenizer` won't load on transformers 4.57.x, so the branch used to be
-skipped), and **PhoneticXeus** — the design's named universal recognizer (XEUS + self-conditioned
-CTC, SOTA accented-English IPA). Compare their IPA on the same audio."""),
+Two independent phone candidates are preserved: `wav2vec2-lv-60-espeak` (manual vocab CTC
+decoder for transformers 4.57.x compatibility) and **PhoneticXeus**, the design's default
+accented-English/multilingual phone recognizer. The backends currently expose one path each;
+true within-model N-best/posterior lattices and robust P2G remain the next upstream milestone."""),
     code(r"""
-if USE_PHONE:
-    try:                                    # illustrative + unscored: never let it stop the run
-        from classroom_asr.backends.wav2vec2_phone import Wav2Vec2Phone
-        ipa = whole_rec(lambda dev: Wav2Vec2Phone(PHONE_MODEL, device=dev),
-                        lambda m, a: m.transcribe_full(a), "phone")
-        print("wav2vec2-espeak realized IPA (first 300 chars of interview 0):")
-        print(" ", (ipa[0] or "")[:300])
-        print("\nreference words (for contrast):", refs[0][:200])
+phone_evidence = [[] for _ in interviews]
+
+def phone_window_pass(desc, make_model, *, batch_size):
+    # Timestamped PhonePath records, balanced by ~24 s window across all GPUs.
+    t0 = time.time()
+    try:
+        models = load_models(make_model)
     except Exception as e:
-        print("phone branch skipped:", repr(e)[:160])
+        print(f"[{desc}] load FAILED: {repr(e)[:160]}"); _free(); return [[] for _ in interviews]
+    tload = time.time() - t0
+    records = [_window_records_of(k, 24.0) for k in range(len(interviews))]
+    tasks = [(k, wi, start, end, c) for k, rows in enumerate(records)
+             for wi, (start, end, c) in enumerate(rows)]
+    shards = [tasks[i::len(models)] for i in range(len(models))]
+    results = {}
+    def worker(model, shard, pos):
+        i, bs = 0, batch_size
+        pbar = tqdm(total=len(shard), desc=f"{desc}:{pos}", position=pos, leave=True)
+        while i < len(shard):
+            batch = shard[i:i + bs]
+            try:
+                paths = model.recognize_batch([row[4] for row in batch], top_k=3)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and bs > 1:
+                    torch.cuda.empty_cache(); bs = max(1, bs // 2); continue
+                raise
+            for (k, wi, _start, _end, _c), found in zip(batch, paths):
+                results[(k, wi)] = [
+                    {"id": f"{desc}:{p.id}", "source": desc, "ipa": p.ipa, "p": float(p.prob)}
+                    for p in found if p.ipa
+                ]
+            i += len(batch); pbar.update(len(batch))
+        pbar.close()
+    try:
+        t1 = time.time()
+        ts = [threading.Thread(target=worker, args=(models[i], shards[i], i))
+              for i in range(len(models))]
+        for t in ts: t.start()
+        for t in ts: t.join()
+        out = [[{"start_s": round(start, 3), "end_s": round(end, 3),
+                 "paths": results.get((k, wi), [])}
+                for wi, (start, end, _c) in enumerate(rows)]
+               for k, rows in enumerate(records)]
+        print(f"   {desc}: load {tload:.1f}s + transcribe {time.time()-t1:.1f}s", flush=True)
+        return out
+    finally:
+        _free_models(models)
+        rec(desc, time.time() - t0)
+
+_phone_sources = []
+if USE_PHONE:
+    try:
+        from classroom_asr.backends.wav2vec2_phone import Wav2Vec2Phone
+        _phone_sources.append(phone_window_pass(
+            "wav2vec2-phone", lambda dev: Wav2Vec2Phone(PHONE_MODEL, device=dev), batch_size=8))
+    except Exception as e:
+        print("phone branch skipped:", repr(e)[:200])
 
 if USE_PHONETIC_XEUS:
-    try:                                    # the design's named phone model (SOTA IPA); unscored
+    try:
         from classroom_asr.backends.phonetic_xeus import PhoneticXeus
-        xipa = whole_rec(lambda dev: PhoneticXeus(PHONETIC_XEUS_MODEL, device=dev),
-                         lambda m, a: m.transcribe_full(a), "PhoneticXeus")
-        print("PhoneticXeus realized IPA (first 300 chars of interview 0):")
-        print(" ", (xipa[0] or "")[:300])
+        _phone_sources.append(phone_window_pass(
+            "PhoneticXeus", lambda dev: PhoneticXeus(PHONETIC_XEUS_MODEL, device=dev), batch_size=1))
     except Exception as e:
         print("PhoneticXeus skipped:", repr(e)[:200])
+
+# Both sources use the same deterministic silence-snapped 24 s boundaries. Merge their paths
+# into one immutable evidence record per time window; a failed source simply contributes none.
+for k in range(len(interviews)):
+    merged = {}
+    for source_rows in _phone_sources:
+        for row in source_rows[k]:
+            key = (row["start_s"], row["end_s"])
+            merged.setdefault(key, []).extend(row["paths"])
+    phone_evidence[k] = [
+        {"start_s": start, "end_s": end, "paths": paths}
+        for (start, end), paths in sorted(merged.items()) if paths
+    ]
+print(f"phone evidence windows: {sum(len(rows) for rows in phone_evidence)}; "
+      f"paths: {sum(len(row['paths']) for rows in phone_evidence for row in rows)}")
+if phone_evidence and phone_evidence[0]:
+    print("retrievable phone evidence example:", phone_evidence[0][0])
 """),
     md("## 11. What specific mistakes — error analysis (branch A vs reference)"),
     code(r"""
@@ -780,16 +855,18 @@ print(f"headroom captured by deterministic vote: "
 print(f"uncertain slots (what the LLM judge would see): {_disagree}/{_total} "
       f"({100*_disagree/max(_total,1):.0f}%); the rest are frozen-confident (§12.5)")
 """),
-    md("""## 11.7 A local contextual word-judge (Qwen3.5-9B over the graph) — a first cut at §14
-**Scope, honestly:** this is *not yet* the design's §14–15 whole-lesson selector. It gets only a
-few words of local context per contested slot — **no** teacher/student roles, turn/timeline
-boundaries, overlap metadata, lesson vocabulary, or phone/P2G/RAG evidence, and it runs per
-interview independently. It's a local contextual word-judge over the ROVER graph, a first step
-toward §14. It picks among each contested slot's branch candidates (`needs_novel_candidate`/NEW
-off, §14.5); a slot it *fails to parse* falls back to the ROVER vote — but a **parseable-but-wrong
-pick can raise WER**, so this is measured against the fusion, not assumed to beat it. Runs in its
-own venv (Qwen3.5 needs newer transformers than the pinned 4.57.6) at full fp16 across both freed
-T4s (§21). This is the final transcript WER."""),
+    md("""## 11.7 Acoustic-evidence-aware local judge (Qwen3.5-9B) — first §14 slice
+**Scope, honestly:** this is still not the complete §14–15 whole-lesson selector. It receives
+local word context plus the timestamp-overlapping wav2vec2/PhoneticXEUS realized-IPA paths for
+each contested region. Evidence blocks are retrieved through a Qwen/Voxtral/Whisper timestamped
+text anchor and deduplicated per prompt batch. CORAAL's single mixed-speaker recording does not
+provide the production system's separate teacher/student channels, so role, overlap, lesson
+vocabulary, phonetic RAG, and robust P2G are still absent here.
+
+The judge picks only among branch candidate IDs (`needs_novel_candidate`/NEW off, §14.5); a slot
+it fails to parse falls back to ROVER. A parseable-but-wrong pick can raise WER, so this is measured
+against fusion, not assumed to beat it. It runs in its own venv at full fp16 across both freed T4s
+(§21). This is the final transcript WER."""),
     code(r"""
 if USE_LLM_SELECTOR:
     import os, json, subprocess, time
@@ -801,6 +878,7 @@ if USE_LLM_SELECTOR:
         with open(SEL_WORKER, "w") as f:
             f.write('''
 import sys, json, re, torch, transformers
+from rapidfuzz.distance import Levenshtein
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 import classroom_asr.selector as selector_module
 from classroom_asr.selector import select_transcript
@@ -839,6 +917,89 @@ def parse_batch_compat(text, decisions):
                 choices[decision.slot] = options[match.group(1).upper()]
     return choices
 selector_module.parse_batch = parse_batch_compat
+
+# The installed GitHub package can predate evidence-aware Decision fields, so keep the worker
+# self-contained: attach retrieved phone evidence to the old mutable Decision objects and patch
+# the formatter used by select_transcript. Identical blocks are printed once per batch.
+_BASE_BUILD_DECISIONS = selector_module.build_decisions
+_CURRENT_EVIDENCE = {}
+def build_decisions_evidence(graph, context=8, **_kwargs):
+    decisions = _BASE_BUILD_DECISIONS(graph, context=context)
+    for decision in decisions:
+        decision.evidence = list(_CURRENT_EVIDENCE.get(decision.slot, ()))
+    return decisions
+def _opt_text(tok):
+    return "∅(drop)" if tok is None else str(tok)
+def format_batch_evidence(decisions):
+    lines = [
+        "You are a transcription judge. For each item, choose the evidence-supported VERBATIM",
+        "word from the listed options. Keep fillers, repetitions, false starts, learner errors,",
+        "and quiet words when supported. ∅(drop) means no word was spoken. Retrieved phone evidence",
+        "covers the same short audio region and may contain neighboring words; use it to compare",
+        "the options, never to invent text. Answer each item as N:LETTER and nothing else.", ""]
+    labels = {}
+    for decision in decisions:
+        key = tuple(getattr(decision, "evidence", ()))
+        if key and key not in labels: labels[key] = f"E{len(labels) + 1}"
+    for n, decision in enumerate(decisions, 1):
+        context = " ".join([*decision.before, "[?]", *decision.after]).strip()
+        options = "  ".join(f"{letter}={_opt_text(tok)}" for letter, tok in decision.options)
+        lines += [f"{n}. context: ...{context}...", f"   options: {options}"]
+        key = tuple(getattr(decision, "evidence", ()))
+        if key: lines.append(f"   acoustic evidence: {labels[key]}")
+    if labels:
+        lines += ["", "Retrieved acoustic evidence blocks:"]
+        for evidence, label in labels.items():
+            lines.append(f"{label}:")
+            lines.extend(f"  {item}" for item in evidence)
+    return "\n".join([*lines, "", "Answers:"])
+selector_module.build_decisions = build_decisions_evidence
+selector_module.format_batch = format_batch_evidence
+
+def _evidence_by_slot(branches, anchor_chunks, phone_chunks):
+    # Map ROVER slots to timestamped phone windows through a fast text-anchor alignment.
+    graph = selector_module.build_graph([SCORE.tokens(text) for text in branches if text])
+    pivot = [slot.pivot for slot in graph if slot.kind == "word"]
+    anchor, anchor_chunk = [], []
+    for ci, chunk in enumerate(anchor_chunks or []):
+        tokens = SCORE.tokens(chunk.get("text", ""))
+        anchor.extend(tokens); anchor_chunk.extend([ci] * len(tokens))
+    if not pivot or not anchor or not phone_chunks:
+        return {}, graph
+
+    # Every pivot word gets an anchor-token position. Equal/replace blocks map proportionally;
+    # deleted pivot words inherit the nearest boundary. This is only evidence retrieval, never
+    # reference scoring, and uses no CORAAL transcript boundaries or gold text.
+    pivot_to_anchor = {}
+    for tag, i0, i1, j0, j1 in Levenshtein.opcodes(pivot, anchor).as_list():
+        pn, an = i1 - i0, j1 - j0
+        if tag in ("equal", "replace") and an:
+            for off in range(pn):
+                pivot_to_anchor[i0 + off] = j0 + min(an - 1, (off * an) // max(pn, 1))
+        elif tag == "delete":
+            nearest = min(max(j0, 0), len(anchor) - 1)
+            for pi in range(i0, i1): pivot_to_anchor[pi] = nearest
+
+    evidence = {}
+    for decision in _BASE_BUILD_DECISIONS(graph):
+        slot = graph[decision.slot]
+        pi = ((decision.slot - 1) // 2 if slot.kind == "word" else
+              min(decision.slot // 2, len(pivot) - 1))
+        ai = pivot_to_anchor.get(pi)
+        if ai is None or not (0 <= ai < len(anchor_chunk)): continue
+        chunk = anchor_chunks[anchor_chunk[ai]]
+        start, end = float(chunk["start_s"]), float(chunk["end_s"])
+        lines = []
+        for phone_chunk in phone_chunks:
+            if float(phone_chunk["end_s"]) <= start or float(phone_chunk["start_s"]) >= end:
+                continue
+            for path in phone_chunk.get("paths", []):
+                ipa = (path.get("ipa") or "").strip()
+                if ipa:
+                    lines.append(f"{path.get('source','phone')} {path.get('id','p?')} "
+                                 f"(p={float(path.get('p',0.0)):.3f}): /{ipa}/")
+        if lines: evidence[decision.slot] = lines
+    return evidence, graph
 
 def generated_token_ids_compat(generated_ids, input_ids):
     generated = generated_ids.tolist() if hasattr(generated_ids, "tolist") else generated_ids
@@ -881,18 +1042,35 @@ def llm_fn(prompt):
         print("=== SAMPLE SELECTOR RESPONSE ===", file=sys.stderr)
         print(f"generated_tokens={len(completion)} response={resp[:1500]!r}", file=sys.stderr)
     return resp
-selected = []; tot_dec = tot_chosen = 0
-for branches in data["branch_transcripts"]:
+selected = []; tot_dec = tot_chosen = tot_evidenced = 0
+for branches, anchor_chunks, phone_chunks in zip(
+        data["branch_transcripts"], data["anchor_chunks"], data["phone_evidence"]):
+    active = [b for b in branches if b]
+    evidence, _graph = _evidence_by_slot(active, anchor_chunks, phone_chunks)
+    _CURRENT_EVIDENCE.clear(); _CURRENT_EVIDENCE.update(evidence)
     text, nd, nc = select_transcript([b for b in branches if b], llm_fn, norm=SCORE, batch_size=24)
-    selected.append(text); tot_dec += nd; tot_chosen += nc
-print(f"selector decided {tot_chosen}/{tot_dec} contested slots", file=sys.stderr)
+    selected.append(text); tot_dec += nd; tot_chosen += nc; tot_evidenced += len(evidence)
+print(f"selector decided {tot_chosen}/{tot_dec} contested slots; "
+      f"phone evidence attached to {tot_evidenced}/{tot_dec}", file=sys.stderr)
 if tot_dec and not tot_chosen:
     raise RuntimeError("selector parsed zero answers; inspect SAMPLE SELECTOR RESPONSE above")
 json.dump({"selected": selected}, open(outp, "w"))
 ''')
         _wb2 = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
         _wb2 = [h for h in _wb2 if h and any(h)]
-        payload = {"branch_transcripts": [[h[k] for h in _wb2] for k in range(len(interviews))]}
+        # Qwen's ~30 s timestamped text windows are the preferred retrieval anchor. If that branch
+        # failed, fall back to another timestamped word branch; the phone windows remain immutable.
+        _anchor_key = next((key for key, hyps in [
+            ("A+B+Qwen3", hyp_Z), ("+Voxtral", hyp_C), ("+VoxtralVerbatim", hyp_VV),
+            ("A whisper", hyp_A), ("A+B", hyp_B)] if hyps and any(hyps) and key in WINDOW_PARTS), None)
+        _anchors = WINDOW_PARTS.get(_anchor_key, [[] for _ in interviews])
+        payload = {
+            "branch_transcripts": [[h[k] for h in _wb2] for k in range(len(interviews))],
+            "anchor_chunks": _anchors,
+            "phone_evidence": phone_evidence,
+        }
+        print(f"selector retrieval anchor: {_anchor_key or 'none'}; "
+              f"phone windows={sum(len(rows) for rows in phone_evidence)}")
         json.dump(payload, open(os.path.join(SEL_WORK, "in.json"), "w"))
         subprocess.run([SEL_VENV_PY, SEL_WORKER, SELECTOR_MODEL,
                         os.path.join(SEL_WORK, "in.json"), os.path.join(SEL_WORK, "out.json")], check=True)

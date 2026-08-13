@@ -23,7 +23,19 @@ def test_selector_worker_does_not_require_new_helpers_from_installed_package():
 
 def test_embedded_selector_worker_is_valid_python():
     source = _notebook_source()
-    match = re.search(r"f\.write\('''\n(.*?)\n'''\)", source, re.DOTALL)
+    workers = re.findall(r"f\.write\('''\n(.*?)\n'''\)", source, re.DOTALL)
+    matches = [worker for worker in workers if "AutoModelForMultimodalLM" in worker]
 
-    assert match, "selector worker source was not found in the generated notebook"
-    compile(match.group(1), "sel_worker.py", "exec")
+    assert len(matches) == 1, "selector worker source was not found uniquely"
+    compile(matches[0], "sel_worker.py", "exec")
+
+
+def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():
+    source = _notebook_source()
+
+    assert "def phone_window_pass" in source
+    assert '"phone_evidence": phone_evidence' in source
+    assert "def _evidence_by_slot" in source
+    assert "selector_module.format_batch = format_batch_evidence" in source
+    assert "phone evidence attached to" in source
+    assert "lambda m, a: m.transcribe_full(a), \"PhoneticXeus\"" not in source

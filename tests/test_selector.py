@@ -34,6 +34,23 @@ def test_prompt_and_parse_roundtrip():
     assert choices == {decs[0].slot: "there"}
 
 
+def test_prompt_includes_deduplicated_acoustic_evidence():
+    g = _graph("i thought so", "i sought so", "i fought so")
+    base = build_decisions(g)
+    evidence = {
+        base[0].slot: [
+            "PhoneticXEUS p1 (p=1.000): /aɪ sɔːt/",
+            "wav2vec2-phone p1 (p=0.740): /aɪ s ɔː t/",
+        ]
+    }
+    decs = build_decisions(g, evidence_by_slot=evidence)
+    prompt = format_batch([decs[0], decs[0]])
+
+    assert prompt.count("E1:") == 1
+    assert prompt.count("acoustic evidence: E1") == 2
+    assert "/aɪ sɔːt/" in prompt
+
+
 def test_parser_accepts_bounded_markdown_and_json_variants():
     g = _graph("their house", "there house", "they're house")
     decs = build_decisions(g)

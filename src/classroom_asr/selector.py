@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from typing import Mapping, Sequence
 
 from .normalize import DEFAULT, Normalizer
 from .rover import NULL, Slot, build_graph
@@ -43,6 +44,7 @@ class Decision:
     after: list[str]                            # context words after the slot
     options: list[tuple[str, object]]           # (letter, token); token may be NULL
     default: object                             # ROVER winner — used if the LLM abstains
+    evidence: list[str] = field(default_factory=list)  # retrieved acoustic/phone evidence (§14.4)
 
 
 def _contested(slot: Slot) -> bool:
@@ -59,7 +61,12 @@ def _labelled(slot: Slot) -> list[tuple[str, object]]:
     return [(chr(ord("A") + i), tok) for i, (tok, _n) in enumerate(items)]
 
 
-def build_decisions(graph: list[Slot], *, context: int = 8) -> list[Decision]:
+def build_decisions(
+    graph: list[Slot],
+    *,
+    context: int = 8,
+    evidence_by_slot: Mapping[int, Sequence[str]] | None = None,
+) -> list[Decision]:
     """One :class:`Decision` per contested slot; context words come from the neighbouring pivot
     ("word") slots (the interleaved "ins" slots carry no pivot word)."""
     words = [(j, s.pivot) for j, s in enumerate(graph) if s.kind == "word"]
@@ -69,7 +76,8 @@ def build_decisions(graph: list[Slot], *, context: int = 8) -> list[Decision]:
             continue
         before = [w for j, w in words if j < i][-context:]
         after = [w for j, w in words if j > i][:context]
-        out.append(Decision(i, before, after, _labelled(s), s.winner()))
+        evidence = list((evidence_by_slot or {}).get(i, ()))
+        out.append(Decision(i, before, after, _labelled(s), s.winner(), evidence))
     return out
 
 
@@ -81,17 +89,33 @@ def format_batch(decisions: list[Decision]) -> str:
     """Render a batch of decisions as a single instruction prompt."""
     lines = [
         "You are a transcription judge. For each item, several speech recognizers proposed a",
-        "different word for one position (marked [?]). Using the surrounding context, pick the",
-        "option that reads as the correct VERBATIM transcription — keep real fillers (um, uh,",
-        f"yeah); {DROP}(drop) means no word belongs there. Do not invent words; choose only from the",
+        "different word for one position (marked [?]). Using the surrounding context and any",
+        "retrieved acoustic evidence, pick the evidence-supported VERBATIM transcription. Phone",
+        "evidence covers the same short audio region and may include neighboring words; use it to",
+        "compare the listed options, not to invent text.",
+        f"Keep real fillers (um, uh, yeah); {DROP}(drop) means no word belongs there. Do not invent",
+        "words; choose only from the",
         "options. Answer each item on its own line as  N:LETTER  and nothing else.",
         "",
     ]
+    evidence_labels: dict[tuple[str, ...], str] = {}
+    for d in decisions:
+        key = tuple(d.evidence)
+        if key and key not in evidence_labels:
+            evidence_labels[key] = f"E{len(evidence_labels) + 1}"
+
     for n, d in enumerate(decisions, 1):
         ctx = " ".join([*d.before, "[?]", *d.after]).strip()
         opts = "  ".join(f"{L}={_opt_text(tok)}" for L, tok in d.options)
         lines.append(f"{n}. context: ...{ctx}...")
         lines.append(f"   options: {opts}")
+        if d.evidence:
+            lines.append(f"   acoustic evidence: {evidence_labels[tuple(d.evidence)]}")
+    if evidence_labels:
+        lines += ["", "Retrieved acoustic evidence blocks:"]
+        for evidence, label in evidence_labels.items():
+            lines.append(f"{label}:")
+            lines.extend(f"  {item}" for item in evidence)
     lines += ["", "Answers:"]
     return "\n".join(lines)
 
@@ -177,6 +201,7 @@ def select_transcript(
     norm: Normalizer = DEFAULT,
     batch_size: int = 24,
     context: int = 8,
+    evidence_by_slot: Mapping[int, Sequence[str]] | None = None,
 ) -> tuple[str, int, int]:
     """Fuse branch transcripts with the LLM judge over contested slots.
 
@@ -186,7 +211,7 @@ def select_transcript(
     """
     token_lists = [norm.tokens(t) for t in transcripts if t and t.strip()]
     graph = build_graph(token_lists)
-    decisions = build_decisions(graph, context=context)
+    decisions = build_decisions(graph, context=context, evidence_by_slot=evidence_by_slot)
     choices: dict[int, object] = {}
     for b in range(0, len(decisions), batch_size):
         batch = decisions[b:b + batch_size]
