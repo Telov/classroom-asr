@@ -113,6 +113,8 @@
 
 - Keep heavy ML dependencies lazy/isolated so the package's core remains usable without loading
   model stacks.
+- Hub models loaded with `trust_remote_code=True` must use a full immutable commit revision for
+  both prefetch and runtime loading. Record that revision in the run fingerprint.
 - The main Kaggle runtime and the selector may require incompatible Transformers versions; preserve
   the selector's isolated environment unless a verified replacement is agreed upon.
 - One failed optional branch should not destroy an expensive benchmark run. Fail visibly and fall

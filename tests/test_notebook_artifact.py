@@ -245,11 +245,24 @@ def test_selector_probe_allows_slow_cold_imports_and_surfaces_the_real_failure()
 def test_prefetch_excludes_unused_framework_weights_and_prioritizes_first_branch():
     source = _notebook_source()
 
-    assert 'snapshot_download(r, ignore_patterns=["*.h5", "*.msgpack"])' in source
-    prefetch_repos = source.index("repos = [m for m, on in [")
-    assert source.index("(FW_MODEL, True)", prefetch_repos) < source.index(
+    assert (
+        'snapshot_download(r, revision=revision, ignore_patterns=["*.h5", "*.msgpack"])'
+        in source
+    )
+    prefetch_repos = source.index("repos = [(m, revision) for m, on, revision in [")
+    assert source.index("(FW_MODEL, True, None)", prefetch_repos) < source.index(
         "(VOXTRAL_MODEL, USE_VOXTRAL", prefetch_repos
     )
+
+
+def test_remote_code_model_uses_one_immutable_revision_for_prefetch_and_load():
+    source = _notebook_source()
+
+    revision = "8d83dee94817a07dc150f87d08f7e0ee01bdb66d"
+    assert f'PHONETIC_XEUS_REVISION = "{revision}"' in source
+    assert "(PHONETIC_XEUS_MODEL, USE_PHONETIC_XEUS, PHONETIC_XEUS_REVISION)" in source
+    assert "revision=PHONETIC_XEUS_REVISION, device=dev" in source
+    assert '"revision": PHONETIC_XEUS_REVISION' in source
 
 
 def test_accuracy_shadow_uses_auto_language_known_good_qwen_windows_and_full_whisper():
@@ -320,7 +333,7 @@ def test_overlap_mode_skips_selector_and_its_now_unused_phone_branches():
     assert 'USE_LLM_SELECTOR = False; SELECTOR_MODEL = "Qwen/Qwen3.5-9B"' in source
     assert "USE_PHONE      = USE_LLM_SELECTOR" in source
     assert "USE_PHONETIC_XEUS = USE_LLM_SELECTOR" in source
-    assert "(SELECTOR_MODEL, USE_LLM_SELECTOR)" in source
+    assert "(SELECTOR_MODEL, USE_LLM_SELECTOR, None)" in source
 
 
 def test_word_branch_overlap_ablation_is_reported_without_rerunning_asr():

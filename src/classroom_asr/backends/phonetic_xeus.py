@@ -18,24 +18,30 @@ from __future__ import annotations
 from ..datamodel import PhonePath
 from ..pipeline.base import PhoneEncoder, SpeechSegment
 
+DEFAULT_REVISION = "8d83dee94817a07dc150f87d08f7e0ee01bdb66d"
+
 
 class PhoneticXeus(PhoneEncoder):
     def __init__(
         self,
         model_id: str = "changelinglab/PhoneticXeus",
         *,
+        revision: str = DEFAULT_REVISION,
         device: str | None = None,
     ) -> None:
         import torch  # lazy
         from transformers import AutoModel
 
+        if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision.lower()):
+            raise ValueError("revision must be a full immutable 40-character Git commit SHA")
         self.model_id = model_id
+        self.revision = revision
         self._torch = torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         # The repo ships custom modeling code; keep its native dtype (trust_remote_code models
         # don't reliably accept a dtype override). XEUS is ~600M params -> fits a T4 in fp32.
         self.model = AutoModel.from_pretrained(
-            model_id, trust_remote_code=True
+            model_id, revision=revision, trust_remote_code=True
         ).to(self.device).eval()
 
     def _transcribe_one(self, waveform, sampling_rate: int = 16_000) -> str:

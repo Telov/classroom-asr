@@ -134,6 +134,9 @@ USE_PHONE      = USE_LLM_SELECTOR; PHONE_MODEL = "facebook/wav2vec2-lv-60-espeak
 # on CORAAL — no phonetic reference) that is retrieved into the selector prompt, not merely printed.
 USE_PHONETIC_XEUS = USE_LLM_SELECTOR
 PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
+# This model executes Python from its Hub repository. Pin the complete, verified commit so a
+# mutable `main` branch cannot silently change code between benchmark runs.
+PHONETIC_XEUS_REVISION = "8d83dee94817a07dc150f87d08f7e0ee01bdb66d"
 # Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
 CRISPER_VERSION      = "2.0.2"  # exact CT2 runtime validated by the notebook integration
@@ -332,21 +335,22 @@ def _prefetch():
         return
     # Fetch in first-use order so A/B/Z do not wait behind the largest late-stage models. The
     # selector remains far enough ahead of §11.7 because all acoustic inference runs before it.
-    repos = [m for m, on in [
-        (FW_MODEL, True), (FW_QUALITY_MODEL, USE_WHISPER_LARGE_V3),
-        (CTC_MODEL, USE_CTC), (QWEN3ASR_MODEL, USE_QWEN3ASR),
-        (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM),
+    repos = [(m, revision) for m, on, revision in [
+        (FW_MODEL, True, None), (FW_QUALITY_MODEL, USE_WHISPER_LARGE_V3, None),
+        (CTC_MODEL, USE_CTC, None), (QWEN3ASR_MODEL, USE_QWEN3ASR, None),
+        (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM, None),
         # The persisted CT2 directory is self-contained. Fetch the 1.62 GB source only when a
         # conversion is actually missing; workers otherwise load the local model directly.
         (f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}",
-         USE_CRISPER and not _cw_converted_ready()),
-        (PHONE_MODEL, USE_PHONE), (PHONETIC_XEUS_MODEL, USE_PHONETIC_XEUS),
-        (SELECTOR_MODEL, USE_LLM_SELECTOR)] if on]
-    for r in repos:
+         USE_CRISPER and not _cw_converted_ready(), None),
+        (PHONE_MODEL, USE_PHONE, None),
+        (PHONETIC_XEUS_MODEL, USE_PHONETIC_XEUS, PHONETIC_XEUS_REVISION),
+        (SELECTOR_MODEL, USE_LLM_SELECTOR, None)] if on]
+    for r, revision in repos:
         try:
             # The runtime is PyTorch-only. Several wav2vec2 repositories also contain complete
             # TensorFlow and Flax copies (2.52 GB combined for branch B); never download them.
-            snapshot_download(r, ignore_patterns=["*.h5", "*.msgpack"])
+            snapshot_download(r, revision=revision, ignore_patterns=["*.h5", "*.msgpack"])
         except Exception as e: print("prefetch skip", r, repr(e)[:80])
 threading.Thread(target=_prefetch, daemon=True).start()
 print("model prefetch: started in background")
@@ -1049,7 +1053,8 @@ if USE_PHONETIC_XEUS:
     try:
         from classroom_asr.backends.phonetic_xeus import PhoneticXeus
         _phone_sources.append(phone_window_pass(
-            "PhoneticXeus", lambda dev: PhoneticXeus(PHONETIC_XEUS_MODEL, device=dev), batch_size=1))
+            "PhoneticXeus", lambda dev: PhoneticXeus(
+                PHONETIC_XEUS_MODEL, revision=PHONETIC_XEUS_REVISION, device=dev), batch_size=1))
     except Exception as e:
         print("PhoneticXeus skipped:", repr(e)[:200])
 
@@ -1806,7 +1811,9 @@ run_fingerprint = {
         "crisper": {"id": f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}",
                     "package_version": CRISPER_VERSION,
                     "qwen_verbatize": USE_CRISPER_VERBATIZE},
-        "phone": {"wav2vec2": PHONE_MODEL, "phonetic_xeus": PHONETIC_XEUS_MODEL},
+        "phone": {"wav2vec2": PHONE_MODEL,
+                  "phonetic_xeus": {"id": PHONETIC_XEUS_MODEL,
+                                     "revision": PHONETIC_XEUS_REVISION}},
         "selector": {"enabled": USE_LLM_SELECTOR, "id": SELECTOR_MODEL,
                      "transformers": SELECTOR_TRANSFORMERS,
                      "accelerate": SELECTOR_ACCELERATE},
