@@ -977,7 +977,7 @@ from rapidfuzz.distance import Levenshtein
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 import classroom_asr.selector as selector_module
 from classroom_asr.selector import (
-    build_decisions, format_choice_prompt, select_transcript_with_chooser,
+    build_decisions, format_batch, select_transcript_with_chooser,
 )
 from classroom_asr.normalize import Normalizer
 SCORE = Normalizer(fold_numbers=True, fold_spelling=True)
@@ -1064,29 +1064,38 @@ for _letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
                            f"prefix={_token_probe_prefix[-4:]} answer={_with_answer[-5:]}")
     _letter_token[_letter] = _with_answer[-1]
 
-_stats = {"forward_batches": 0, "oom_splits": 0, "overrides": 0,
-          "evidenced_overrides": 0, "margins": []}
+_stats = {"forward_batches": 0, "decode_steps": 0, "prompt_tokens": 0,
+          "oom_splits": 0, "overrides": 0, "evidenced_overrides": 0, "margins": []}
 _decision_scores = {}
 _debugged = False
 
 def _score_once(decisions):
-    # One decision per conversation makes the next assistant token exactly the constrained
-    # candidate ID. Batch those conversations for throughput; no transcript tokens are generated.
-    conversations = [[{"role": "user", "content": [
-        {"type": "text", "text": format_choice_prompt(decision)}]}]
-        for decision in decisions]
+    # Put the whole batch in one conversation so decisions that share a 24-second phone window
+    # also share one IPA block in the prompt. The old one-conversation-per-decision layout repeated
+    # that large block up to 24 times and could spend many minutes on the very first forward pass.
+    prompt = format_batch(decisions) + "\n1:"
+    conversations = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     inputs = processor.apply_chat_template(
         conversations, add_generation_prompt=True, enable_thinking=False, tokenize=True,
-        processor_kwargs={"padding": True}, return_dict=True, return_tensors="pt").to(_dev)
+        return_dict=True, return_tensors="pt").to(_dev)
+    prompt_tokens = int(inputs["input_ids"].shape[-1])
+    batch_number = _stats["forward_batches"] + 1
+    print(f"selector batch {batch_number}: prefill {len(decisions)} decisions in "
+          f"{prompt_tokens} shared prompt tokens", file=sys.stderr, flush=True)
     with torch.inference_mode():
-        # Qwen3.5's Transformers 5.15 forward API supports logits_to_keep. Keeping one position
-        # avoids materializing [batch, full_prompt, vocabulary] logits merely to score A/B/C.
-        logits = model(**inputs, logits_to_keep=1, use_cache=False).logits[:, -1, :].float()
+        # Prefill the shared evidence once, then keep its KV cache while emitting only the chosen
+        # candidate ID and the deterministic next-item scaffold. Transcript text is never freely
+        # generated and only advertised letter logits are eligible at each answer position.
+        outputs = model(**inputs, logits_to_keep=1, use_cache=True)
+        logits = outputs.logits[0, -1, :].float()
+        cache = outputs.past_key_values
+        attention_mask = inputs["attention_mask"]
     _stats["forward_batches"] += 1
+    _stats["prompt_tokens"] += prompt_tokens
     choices = {}
     global _debugged
     for row, decision in enumerate(decisions):
-        scored = [(letter, token, float(logits[row, _letter_token[letter]].item()))
+        scored = [(letter, token, float(logits[_letter_token[letter]].item()))
                   for letter, token in decision.options]
         scored.sort(key=lambda item: item[2], reverse=True)
         best_letter, best_token, best_score = scored[0]
@@ -1100,11 +1109,32 @@ def _score_once(decisions):
         choices[decision.slot] = best_token
         if not _debugged:
             _debugged = True
-            print("=== SAMPLE CONSTRAINED SELECTOR PROMPT (head) ===", file=sys.stderr)
-            print(format_choice_prompt(decision)[:1200], file=sys.stderr)
+            print("=== SAMPLE SHARED CONSTRAINED SELECTOR PROMPT (head) ===", file=sys.stderr)
+            print(prompt[:1200], file=sys.stderr)
             print("=== SAMPLE RESTRICTED CANDIDATE SCORES ===", file=sys.stderr)
             print([(letter, str(token), round(score, 4)) for letter, token, score in scored],
                   f"chosen={best_letter} margin={margin:.4f}", file=sys.stderr)
+        if row + 1 < len(decisions):
+            # The answer letter is selected above; the rest is fixed syntax, not model output.
+            suffix = best_letter + f"\n{row + 2}:"
+            suffix_ids = tokenizer.encode(suffix, add_special_tokens=False)
+            if not suffix_ids or suffix_ids[0] != _letter_token[best_letter]:
+                raise RuntimeError(f"selector scaffold tokenization changed for {suffix!r}: "
+                                   f"{suffix_ids[:4]}")
+            suffix_tensor = torch.tensor([suffix_ids], dtype=torch.long, device=_dev)
+            attention_mask = torch.cat([
+                attention_mask,
+                torch.ones((1, len(suffix_ids)), dtype=attention_mask.dtype, device=_dev),
+            ], dim=1)
+            with torch.inference_mode():
+                outputs = model(
+                    input_ids=suffix_tensor, attention_mask=attention_mask,
+                    past_key_values=cache, logits_to_keep=1, use_cache=True)
+                logits = outputs.logits[0, -1, :].float()
+                cache = outputs.past_key_values
+            _stats["decode_steps"] += 1
+    print(f"selector batch {batch_number}: complete ({len(decisions)} decisions)",
+          file=sys.stderr, flush=True)
     return choices
 
 def score_choices(decisions):
@@ -1148,6 +1178,7 @@ def _quantile(values, fraction):
     return values[min(len(values) - 1, int(fraction * (len(values) - 1)))] if values else None
 stats = {"decisions": tot_dec, "scored": tot_chosen, "evidenced": tot_evidenced,
          "overrides": _stats["overrides"], "forward_batches": _stats["forward_batches"],
+         "decode_steps": _stats["decode_steps"], "prompt_tokens": _stats["prompt_tokens"],
          "evidenced_overrides": _stats["evidenced_overrides"],
          "oom_splits": _stats["oom_splits"],
          "mean_logit_margin": (sum(finite_margins) / len(finite_margins)
@@ -1157,7 +1188,8 @@ stats = {"decisions": tot_dec, "scored": tot_chosen, "evidenced": tot_evidenced,
 print(f"selector restricted-scored {tot_chosen}/{tot_dec} contested slots; "
       f"overrode ROVER in {_stats['overrides']}; phone evidence attached to "
       f"{tot_evidenced}/{tot_dec}; forward batches={_stats['forward_batches']} "
-      f"OOM splits={_stats['oom_splits']}", file=sys.stderr)
+      f"shared prompt tokens={_stats['prompt_tokens']} OOM splits={_stats['oom_splits']}",
+      file=sys.stderr)
 json.dump({"selected": selected, "threshold_selected": threshold_selected, "stats": stats},
           open(outp, "w"))
 ''')

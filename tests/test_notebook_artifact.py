@@ -82,7 +82,7 @@ def test_payload_is_marked_and_installs_its_exact_revision():
 def test_selector_worker_uses_the_exact_revision_constrained_choice_api():
     source = _notebook_source()
 
-    assert "format_choice_prompt, select_transcript_with_chooser" in source
+    assert "format_batch, select_transcript_with_chooser" in source
     assert "def generated_token_ids_compat" not in source
     assert "def parse_batch_compat" not in source
     assert "selector_module.parse_batch" not in source
@@ -95,7 +95,12 @@ def test_selector_shadow_scores_only_advertised_next_token_ids():
     assert '_token_probe_text = processor.apply_chat_template(' in source
     assert 'tokenizer.encode(_token_probe_text + _letter, add_special_tokens=False)' in source
     assert 'is not one contextual token' in source
-    assert 'model(**inputs, logits_to_keep=1, use_cache=False)' in source
+    assert 'prompt = format_batch(decisions) + "\\n1:"' in source
+    assert 'model(**inputs, logits_to_keep=1, use_cache=True)' in source
+    assert 'past_key_values=cache, logits_to_keep=1, use_cache=True' in source
+    assert 'selector batch {batch_number}: prefill' in source
+    assert 'selector batch {batch_number}: complete' in source
+    assert "conversations = [[" not in source[source.index("# Candidate IDs are deliberately"):]
     assert "model.generate(" not in source[source.index("# Candidate IDs are deliberately"):]
     assert 'score_choices, norm=SCORE, batch_size=24, evidence_by_slot=evidence' in source
     assert '"llm_selected_wer": None' in source
@@ -207,7 +212,7 @@ def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():
     assert "def phone_window_pass" in source
     assert '"phone_evidence": phone_evidence' in source
     assert "def _evidence_by_slot" in source
-    assert "format_choice_prompt(decision)" in source
+    assert "format_batch(decisions)" in source
     assert "evidence_by_slot=evidence" in source
     assert "phone evidence attached to" in source
     assert "lambda m, a: m.transcribe_full(a), \"PhoneticXeus\"" not in source
