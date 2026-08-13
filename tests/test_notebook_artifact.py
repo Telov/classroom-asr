@@ -173,6 +173,14 @@ def test_completed_crisper_conversion_skips_source_prefetch_and_balances_whole_f
     assert "Crisper whole-file GPU plan:" in source
 
 
+def test_derived_crisper_and_selector_handoffs_are_always_deleted():
+    source = _notebook_source()
+
+    assert "shutil.rmtree(CW_RUN, ignore_errors=True)" in source
+    assert "shutil.rmtree(SEL_RUN, ignore_errors=True)" in source
+    assert "derived inference handoffs are deleted every run" in source
+
+
 def test_crisper_verbatize_pairs_qwen_text_with_the_same_temporary_audio_window():
     source = _notebook_source()
 

@@ -777,7 +777,7 @@ interview. Both outputs are scored independently. The worker prints which backen
     code(r"""
 hyp_CW = hyp_CWV = None
 if USE_CRISPER:
-    import os, sys, json, subprocess, threading, tempfile
+    import os, sys, json, subprocess, threading, tempfile, shutil
     _cw_t0 = time.time()
     # Worker source and audio-derived handoff JSON are session-temporary. Only the venv and
     # converted CT2 model belong in the Files-only persisted CW_WORK directory.
@@ -951,6 +951,10 @@ json.dump({"independent": independent, "verbatized": verbatized,
     except Exception as e:
         print("CrisperWhisper isolation failed:", repr(e)[:200])
         hyp_CW = hyp_CWV = [""] * len(interviews)
+    finally:
+        # The handoff contains Qwen window transcripts and both Crisper outputs. It is never a
+        # cache: remove it deterministically even if one worker fails while the session stays up.
+        shutil.rmtree(CW_RUN, ignore_errors=True)
     rec("+CrisperWhisper", time.time() - _cw_t0)
     add_branch("+CrisperWhisper", hyp_CW)
     if hyp_CWV and any(hyp_CWV): add_branch("+CrisperQwenVerbatize", hyp_CWV)
@@ -1332,7 +1336,7 @@ reassembled at several non-default logit-margin thresholds for diagnostics only;
 choose the canonical threshold or transcript."""),
     code(r"""
 if USE_LLM_SELECTOR:
-    import os, json, subprocess, tempfile, time
+    import os, json, subprocess, tempfile, time, shutil
     _sel_t0 = time.time()
     # Keep only the reusable venv in SEL_WORK. Transcripts, phone evidence, decisions, worker
     # source, and selected output are derived per run and live in the ephemeral session temp dir.
@@ -1694,6 +1698,10 @@ json.dump({"selected": selected, "threshold_selected": threshold_selected, "stat
               json.dumps(selector_threshold_wer, sort_keys=True))
     except Exception as e:
         print(f"LLM selector failed; canonical transcript remains {backbone_name}:", repr(e)[:500])
+    finally:
+        # Includes branch transcripts, phone evidence, and selected outputs. Keep only the reusable
+        # dependency venv under SEL_WORK; derived inference handoffs are deleted every run.
+        shutil.rmtree(SEL_RUN, ignore_errors=True)
     rec("+LLMSelector", time.time() - _sel_t0)
 """),
     md("""## 12. Timings + save summary
