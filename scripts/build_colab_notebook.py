@@ -424,7 +424,7 @@ if USE_QWEN3ASR:
     # windows balanced across GPUs (no 2+1 idle), reassembled in order (same output)
     hyp_Z = run_windows("A+B+Qwen3",
                         lambda dev: Qwen3ASR(QWEN3ASR_MODEL, language="English", device=dev),
-                        chunk_s=LLM_CHUNK_S, batch_size=64)   # 1.7B: room for a big batch (OOM-backoff guards)
+                        chunk_s=LLM_CHUNK_S, batch_size=32)   # 64 gave no speedup, 2x VRAM -> back to 32
     add_branch("A+B+Qwen3", hyp_Z)
 """),
     md("""## 9. Branch C / VV — Voxtral Mini 3B, **both passes on one load**
@@ -473,18 +473,20 @@ if USE_CRISPER:
         with open(WORKER, "w") as f:
             f.write('''
 import sys, json, warnings, logging
-from crisperwhisper import CrisperWhisperModel
+from crisperwhisper import CrisperWhisperModel   # imports transformers -> its loggers now exist
 # The crisperwhisper package still calls from_pretrained with the old `torch_dtype=` kwarg;
 # that is inside the dependency, so it can't be fixed at our source. transformers emits it via
-# its LOGGER (warning_once), not warnings.warn, so drop just that one line with a targeted
-# logging filter on the transformers handler (not a verbosity/level change, not a broad mute).
+# its LOGGER (warning_once), not warnings.warn. Attach the filter to the EMITTING logger
+# (transformers.modeling_utils): Logger.handle runs a logger's own filters before it dispatches
+# to any handler, so this drops just that one line regardless of whether/when a handler exists
+# (the earlier handler-based filter missed it -- in a subprocess the record hits logging's
+# lastResort handler, which lives on no logger). Not a verbosity change, not a broad mute.
 warnings.filterwarnings("ignore", message=".*torch_dtype.*")   # belt-and-suspenders
 class _DropTorchDtype(logging.Filter):
     def filter(self, record): return "torch_dtype" not in record.getMessage()
 _flt = _DropTorchDtype()
-for _lg in (logging.getLogger("transformers"), logging.getLogger()):
-    _lg.addFilter(_flt)
-    for _h in _lg.handlers: _h.addFilter(_flt)
+for _name in ("transformers", "transformers.modeling_utils"):
+    logging.getLogger(_name).addFilter(_flt)
 size, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 paths = json.load(open(inp))
 try:
