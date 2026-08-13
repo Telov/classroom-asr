@@ -125,7 +125,7 @@ USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbat
 # Conversation-LLM selector (§14): the design's judge over the candidate graph. Overrides only
 # the contested slots (confident spans frozen, §12.5), driving the final transcript from the
 # branch baseline toward the oracle floor. Qwen3.5-9B = design's "default first judge" (§14.2);
-# runs isolated (own venv, newer transformers) in 4-bit. NEW/novel escape hatch off (§14.5).
+# runs isolated (own venv, newer transformers) in fp16 across both freed T4s. NEW hatch off (§14.5).
 USE_LLM_SELECTOR = True;  SELECTOR_MODEL = "Qwen/Qwen3.5-9B"
 
 # Speed (all quality-neutral): the LLM branches auto-pick fp16 on T4 (Turing has no bf16
@@ -184,7 +184,7 @@ if USE_CRISPER:
 
 # (a2) Selector venv — Qwen3.5-9B needs a newer transformers than the 4.57.6 the main kernel pins
 # for qwen-asr, so the LLM judge runs in its OWN --system-site-packages venv (shadows
-# transformers/accelerate/bitsandbytes; reuses system torch + the installed classroom_asr).
+# transformers/accelerate; reuses system torch + the installed classroom_asr).
 # Built in the background so it's ready when the acoustic branches finish (§11.7).
 SEL_WORK = os.path.join(os.environ.get("ASR_PERSIST", os.path.abspath(".")), "sel_iso")
 os.makedirs(SEL_WORK, exist_ok=True)
@@ -198,7 +198,7 @@ def _sel_prewarm():
         subprocess.run([sys.executable, "-m", "virtualenv", "--system-site-packages", SEL_VENV],
                        check=True)
         subprocess.run([os.path.join(SEL_VENV, "bin", "pip"), "-q", "install", "-U",
-                        "transformers", "accelerate", "bitsandbytes", "hf_transfer"], check=True)
+                        "transformers", "accelerate", "hf_transfer"], check=True)   # fp16, no bnb
         open(SEL_READY, "w").close()
     except Exception as e:
         _sel["err"] = e
@@ -710,8 +710,8 @@ The design's judge (§14.2 "default first judge"). It sees only the **contested*
 each as its branch candidates + context, and picks the option that best fits — the confident
 spans are frozen (§12.5) and every slot it can't decide falls back to the ROVER vote, so the
 result is **never worse than the fusion**. `needs_novel_candidate`/NEW is off (§14.5). Runs in
-its own venv (Qwen3.5 needs newer transformers than the pinned 4.57.6) in 4-bit; acoustic models
-are already unloaded, so it has the GPU (§21 staging). This is the final transcript WER."""),
+its own venv (Qwen3.5 needs newer transformers than the pinned 4.57.6) at **full fp16, sharded
+across both freed T4s** — no quantization (§21). This is the final transcript WER."""),
     code(r"""
 if USE_LLM_SELECTOR:
     import os, json, subprocess, time
@@ -723,7 +723,7 @@ if USE_LLM_SELECTOR:
         with open(SEL_WORKER, "w") as f:
             f.write('''
 import sys, json, torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from classroom_asr.selector import select_transcript
 from classroom_asr.normalize import Normalizer
 SCORE = Normalizer(fold_numbers=True, fold_spelling=True)
@@ -731,15 +731,21 @@ model_id, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 data = json.load(open(inp))
 tok = AutoTokenizer.from_pretrained(model_id)
 if tok.pad_token_id is None: tok.pad_token = tok.eos_token
-bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
-model = AutoModelForCausalLM.from_pretrained(model_id, quantization_config=bnb, device_map="cuda:0").eval()
+# Full fp16, sharded across BOTH T4s (acoustic models are unloaded -> 32 GB free; 9B fp16 ~18 GB).
+# No quantization: the design wants the judge validated at full precision first (§21). fp16 (not
+# bf16) because T4/Turing has fp16 tensor cores but no bf16 path.
+try:
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float16, device_map="auto").eval()
+except TypeError:
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16, device_map="auto").eval()
+_dev = next(model.parameters()).device            # feed inputs to the shard holding the embeddings
 def llm_fn(prompt):
     msgs = [{"role": "user", "content": prompt}]
     try:
         ids = tok.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=False, return_tensors="pt")
     except TypeError:
         ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
-    ids = ids.to(model.device)
+    ids = ids.to(_dev)
     with torch.inference_mode():
         out = model.generate(ids, max_new_tokens=512, do_sample=False, pad_token_id=tok.pad_token_id)
     return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
