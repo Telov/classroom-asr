@@ -622,6 +622,23 @@ def error_counts_of(hyps):
             "errors": E, "wer": round(E / R if R else 0.0, 4),
             "deletion_rate": round(D / R if R else 0.0, 4)}
 
+def per_interview_error_counts(hyps):
+    rows = []
+    for k, (rt, h) in enumerate(zip(_reftok, hyps)):
+        S = D = I = 0
+        for tag, _src_pos, _dest_pos in Levenshtein.editops(
+                rt, hyp_tokens(h)).as_list():
+            if tag == "replace": S += 1
+            elif tag == "delete": D += 1
+            elif tag == "insert": I += 1
+        E = S + D + I
+        rows.append({"interview": interviews[k][0].stem,
+                     "minutes": round(len(load_16k(interviews[k][0])) / 960000, 1),
+                     "reference_words": len(rt), "substitutions": S, "deletions": D,
+                     "insertions": I, "errors": E,
+                     "wer": round(E / len(rt) if rt else 0.0, 4)})
+    return rows
+
 def recall_floor(pool):
     # Fraction of REFERENCE words that NO branch produced anywhere. This is a RECALL lower bound
     # on achievable WER: it ignores insertions and is NOT a single realizable transcript (each ref
@@ -1282,22 +1299,33 @@ for _bi, ((_name, _hyps), _hits) in enumerate(zip(_wb_named, _branch_hits)):
     _unique = _hits - _other_hits
     _overlap = len(_hits & _other_hits) / max(len(_hits), 1)
     _floor_without = (_R - len(_other_hits)) / max(_R, 1)
+    _required = _name == "Qwen3-ASR"
     _other_branches = _wb[:_bi] + _wb[_bi + 1:]
-    _oracle_without = realizable_oracle_wer(_other_branches)
-    _oracle_delta = _oracle_without - r_oracle
+    # Qwen defines the production graph pivot and fallback policy. Removing it changes the
+    # architecture rather than ablating optional evidence, so do not present that as a comparable
+    # leave-one-out oracle. Reference-hit coverage remains useful and is still reported.
+    _oracle_without = None if _required else realizable_oracle_wer(_other_branches)
+    _oracle_delta = None if _required else _oracle_without - r_oracle
     _stage_s = _marginal_seconds.get(_name)
+    _unique_by_category = Counter(cat(_reftok[k][ri]) for k, ri in _unique)
     _row = {"branch": _name, "wer": round(wer_of(_hyps), 4),
+            "architecture_required": _required,
             "reference_hits": len(_hits), "unique_reference_hits": len(_unique),
+            "unique_reference_hits_by_category": dict(_unique_by_category.most_common()),
             "hit_overlap_fraction": round(_overlap, 4),
             "recall_floor_without": round(_floor_without, 4),
             "recall_floor_increase_if_removed": round(len(_unique) / max(_R, 1), 4),
-            "realizable_oracle_without": round(_oracle_without, 4),
-            "realizable_oracle_increase_if_removed": round(_oracle_delta, 4),
+            "realizable_oracle_without": (round(_oracle_without, 4)
+                                           if _oracle_without is not None else None),
+            "realizable_oracle_increase_if_removed": (round(_oracle_delta, 4)
+                                                        if _oracle_delta is not None else None),
             "marginal_stage_seconds_if_removed": (round(_stage_s, 1)
                                                    if _stage_s is not None else None)}
     branch_overlap_ablation.append(_row)
+    _oracle_print = _oracle_without if _oracle_without is not None else float("nan")
+    _delta_print = _oracle_delta if _oracle_delta is not None else float("nan")
     print(f"{_name:22s} {_row['wer']:.3f} {len(_unique):7d} "
-          f"{_floor_without:14.3f} {_oracle_without:15.3f} {_oracle_delta:+12.3f} "
+          f"{_floor_without:14.3f} {_oracle_print:15.3f} {_delta_print:+12.3f} "
           f"{_stage_s if _stage_s is not None else float('nan'):8.1f}")
 print(f"full-pool recall floor: {(_R-len(_all_hits))/max(_R,1):.3f}")
 branch_pair_overlap = []
@@ -1743,6 +1771,7 @@ for name, h, enabled in _branch_outputs:
                            "interviews_total": len(interviews)}
     if h and any(h):
         branch_metrics[name] = error_counts_of(h)
+        branch_metrics[name]["per_interview"] = per_interview_error_counts(h)
         branch_metrics[name]["interviews_with_text"] = produced
         branch_metrics[name]["interviews_total"] = len(interviews)
         res[name] = branch_metrics[name]["wer"]

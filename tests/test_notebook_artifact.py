@@ -353,11 +353,14 @@ def test_word_branch_overlap_ablation_is_reported_without_rerunning_asr():
 
     assert "=== word-branch overlap: exact leave-one-out floor + graph-oracle effect ===" in source
     assert '"unique_reference_hits": len(_unique)' in source
+    assert '"unique_reference_hits_by_category"' in source
+    assert '"architecture_required": _required' in source
+    assert '_oracle_without = None if _required' in source
     assert '"recall_floor_increase_if_removed"' in source
     assert '"realizable_oracle_without"' in source
     assert '"realizable_oracle_increase_if_removed"' in source
     assert '"marginal_stage_seconds_if_removed"' in source
-    assert "_oracle_without = realizable_oracle_wer(_other_branches)" in source
+    assert "else realizable_oracle_wer(_other_branches)" in source
     assert 'crisper_phase_seconds.get("independent_s")' in source
     assert 'crisper_phase_seconds.get("verbatize_s")' in source
     assert '_sibling not in _present_names' in source
@@ -405,6 +408,8 @@ def test_summary_identifies_run_and_reports_each_branch_error_shape():
     assert '"cached_hf_revisions"' in source
     assert "not a claim that every listed revision was loaded" in source
     assert '"branch_metrics": branch_metrics' in source
+    assert "def per_interview_error_counts(hyps):" in source
+    assert 'branch_metrics[name]["per_interview"]' in source
     assert 'status = ("disabled" if not enabled else "empty" if produced == 0' in source
     assert 'else "ok" if produced == len(interviews) else "partial")' in source
     assert '"branch_status": branch_status' in source
