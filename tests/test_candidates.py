@@ -21,9 +21,22 @@ def test_mbr_picks_majority():
     assert mbr.source is CandidateSource.MBR
 
 
-def test_token_vote():
+def test_token_vote_weights_per_branch_not_per_hypothesis():
+    # review finding #6: a branch's deep N-best must not outvote a branch with one hypothesis.
+    hyps = [
+        _cand("q1", "x", source=CandidateSource.QWEN),
+        _cand("q2", "x", source=CandidateSource.QWEN),     # extra Qwen N-best: no extra weight
+        _cand("q3", "xx", source=CandidateSource.QWEN),
+        _cand("g1", "y", source=CandidateSource.GIGAAM),
+    ]
+    # one representative per branch: Qwen->"x", GigaAM->"y" -> plurality is 1 of 2 branches
+    assert abs(token_vote(hyps) - 0.5) < 1e-9
+
+
+def test_token_vote_single_branch_is_full_agreement():
+    # all from one branch (its N-best) -> one branch, trivially agrees with itself
     hyps = [_cand("a", "x"), _cand("b", "x"), _cand("c", "y")]
-    assert abs(token_vote(hyps) - 2 / 3) < 1e-9
+    assert token_vote(hyps) == 1.0
 
 
 def _span(**kw):

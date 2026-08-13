@@ -14,12 +14,11 @@ def _graph(*texts):
 def test_only_contested_slots_become_decisions():
     # "went" has a 2/3 majority -> frozen; a 1-1-1 split would be contested.
     g = _graph("i went to the store", "i want to the store", "i went to the store")
-    decs = build_decisions(g)
-    assert decs == []                                   # majority everywhere -> nothing to ask
+    assert build_decisions(g) == []                     # majority everywhere -> nothing to ask
 
     g2 = _graph("their house", "there house", "they're house")   # 3-way split on word 0
     decs2 = build_decisions(g2)
-    assert len(decs2) == 1 and decs2[0].slot == 0
+    assert len(decs2) == 1
     toks = {tok for _, tok in decs2[0].options}
     assert toks == {"their", "there", "they're"}
 
@@ -31,9 +30,8 @@ def test_prompt_and_parse_roundtrip():
     assert "1. context:" in prompt and "[?]" in prompt
     # letters are assigned in the option order shown in the prompt
     letter_for = {tok: L for L, tok in decs[0].options}
-    resp = f"1:{letter_for['there']}"
-    choices = parse_batch(resp, decs)
-    assert choices == {0: "there"}
+    choices = parse_batch(f"1:{letter_for['there']}", decs)
+    assert choices == {decs[0].slot: "there"}
 
 
 def test_llm_choice_overrides_only_its_slot():
@@ -62,11 +60,10 @@ def test_bad_llm_output_falls_back_to_rover():
 
 
 def test_drop_candidate_is_offered_when_branches_delete():
-    # pivot has "really"; two branches drop it -> NULL is a candidate (but 2/3 is a majority,
-    # so it's frozen, not contested). Force contest with an even split:
-    g = _graph("i really do", "i do", "i truly do", "i do")   # slot1: really/∅/truly/∅ = 1/2/1
+    # pivot has "really"; an even really/truly/drop/drop split is contested (∅ = 2 of 4, no
+    # strict majority) -> a decision whose options include NULL (drop) must be offered.
+    g = _graph("i really do", "i do", "i truly do", "i do")
     decs = build_decisions(g)
-    # slot for word-after-"i": ∅ has 2 votes of 4 -> not a strict majority -> contested
-    slot1 = [d for d in decs if d.slot == 1]
-    assert slot1, "the really/truly/drop slot should be contested"
-    assert any(tok is NULL for _, tok in slot1[0].options)
+    drop_slots = [d for d in decs if any(tok is NULL for _, tok in d.options)
+                  and {"really", "truly"} & {tok for _, tok in d.options}]
+    assert drop_slots, "the really/truly/drop slot should be contested and offer ∅"

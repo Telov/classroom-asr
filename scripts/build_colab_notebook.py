@@ -299,9 +299,10 @@ print(f"{len(interviews)} interviews, {total/60:.1f} min, "
 rec("build interviews (load+resample)", _time.time() - _bld0)
 """),
     md("""## 5. Whole-recording runner + scoring (rapidfuzz)
-`whole_rec` transcribes each interview on the GPUs. `wer_of` scores a branch over the
-full transcripts; `oracle_wer` is the candidate-oracle at the word level — the fraction
-of reference words that **no** branch recovers (a lower bound the pool can't beat)."""),
+`whole_rec` transcribes each interview on the GPUs. `wer_of` scores a branch over the full
+transcripts; `recall_floor` = fraction of reference words **no** branch produced (a recall lower
+bound — ignores insertions); `realizable_oracle_wer` = the best full WER a selector over the
+candidate graph could actually reach (§11.6)."""),
     code(r"""
 import threading, gc, time
 from tqdm.auto import tqdm
@@ -419,7 +420,11 @@ def wer_of(hyps):
         E += Levenshtein.distance(rt, SCORE.tokens(h or "")); R += len(rt)
     return E / R if R else 0.0
 
-def oracle_wer(pool):   # pool = list of branch hyp-lists; word-level recoverability
+def recall_floor(pool):
+    # Fraction of REFERENCE words that NO branch produced anywhere. This is a RECALL lower bound
+    # on achievable WER: it ignores insertions and is NOT a single realizable transcript (each ref
+    # word may be recovered by a different branch). It answers "did the ensemble even hear this
+    # word", not "what WER can a selector reach" -- for that honest ceiling see realizable_oracle_wer.
     unrec = R = 0
     for i, rt in enumerate(_reftok):
         hit = set()
@@ -429,13 +434,27 @@ def oracle_wer(pool):   # pool = list of branch hyp-lists; word-level recoverabi
         unrec += len(rt) - len(hit); R += len(rt)
     return unrec / R if R else 0.0
 
+def realizable_oracle_wer(pool):
+    # Honest ceiling: per interview build the confusion network from all branches, then pick the
+    # per-slot candidate that best matches the reference -> a REAL transcript, scored with full WER
+    # (insertions included). This is what a perfect selector over this candidate graph could reach.
+    from classroom_asr.rover import build_graph as _bg, realizable_oracle_tokens as _roracle
+    E = R = 0
+    for i, rt in enumerate(_reftok):
+        tls = [t for t in (SCORE.tokens(h[i] or "") for h in pool) if t]
+        g = _bg(tls)
+        pivot = [s.pivot for s in g if s.kind == "word"]
+        ops = Levenshtein.opcodes(pivot, rt).as_list()      # fast rapidfuzz pivot<->ref alignment
+        E += Levenshtein.distance(rt, _roracle(g, rt, opcodes=ops)); R += len(rt)
+    return E / R if R else 0.0
+
 def add_branch(tag, hyps):
     # only count a branch if it actually produced text (a crashed branch is all "")
     got = sum(1 for h in hyps if h)
     if got == 0:
         print(f"[{tag:14s}] produced nothing (skipped from pool)"); return
     pool.append(hyps)
-    print(f"[{tag:14s}] branch WER={wer_of(hyps):.3f}   oracle(pool)={oracle_wer(pool):.3f}"
+    print(f"[{tag:14s}] branch WER={wer_of(hyps):.3f}   recall_floor(pool)={recall_floor(pool):.3f}"
           f"   ({got}/{len(hyps)} interviews)")
 
 def run_branch(tag, make_model, get_text=None):
@@ -646,10 +665,13 @@ for p, n in subs.most_common(15): print(f"   {p:30} x{n}")
 print("\nMost-inserted words (hyp words with no ref):")
 for w, n in ins.most_common(15): print(f"   {w!r:18} x{n}")
 """),
-    md("""## 11.5 Oracle-floor breakdown — what the *whole ensemble* still misses
-Section 11 is branch A alone. This is the **oracle floor**: the reference words that **no
-branch** recovered — the exact `oracle_wer` set (a ref word counts as recovered iff it lands
-in an `equal` span for at least one branch). It's the honest ceiling for *this* model set.
+    md("""## 11.5 Recall-floor breakdown — words the *whole ensemble* never produced
+Section 11 is branch A alone. This is the **candidate recall floor**: reference words that **no
+branch** produced anywhere (a word counts as recovered iff it lands in an `equal` span for some
+branch). Note this is a **recall lower bound**, *not* an achievable WER — it ignores insertions
+and isn't a single realizable transcript; the honest achievable ceiling is `realizable_oracle_wer`
+in §11.6. Still, it's exactly the set no selector can ever recover, so its make-up is the useful
+signal here.
 
 Vernacular is deliberately **kept as errors** (CORAAL is regional AAL — `gonna`, `y'all`,
 g-dropping are the features of interest, not noise to fold away), so they surface here as
@@ -657,7 +679,7 @@ genuine misses. The category split separates convention/vernacular from the mode
 deletions (backchannel overlap, reduced function words)."""),
     code(r"""
 from collections import Counter
-# Same "recovered" rule as oracle_wer(): a ref index is recovered iff some branch aligns it
+# Same "recovered" rule as recall_floor(): a ref index is recovered iff some branch aligns it
 # in an `equal` span. Everything else is the floor — tally those ref words by type/category.
 floor = Counter(); total_unrec = R = 0
 if not pool:
@@ -690,8 +712,8 @@ else:
 
     bycat = Counter()
     for w, n in floor.items(): bycat[cat(w)] += n
-    print(f"ORACLE FLOOR: {total_unrec} of {R} ref words recovered by NO branch"
-          f"   (oracle WER {total_unrec/R:.3f}; matches the pool oracle above)")
+    print(f"CANDIDATE RECALL FLOOR: {total_unrec} of {R} ref words produced by NO branch"
+          f"   (unrecovered-word rate {total_unrec/R:.3f}; a recall lower bound, not achievable WER)")
     print("\nby category (share of the floor):")
     for c, n in bycat.most_common():
         print(f"   {n:5d}  {100*n/total_unrec:4.1f}%   {c}")
@@ -700,13 +722,14 @@ else:
         print(f"   {w!r:16} x{n:<4} [{cat(w)}]")
 """),
     md("""## 11.6 Selection — deterministic ROVER fusion (the LLM selector's substrate)
-The oracle (0.073) is the *ceiling* if you always pick the right branch per word; the baseline
-(branch A, ~0.193) is one branch alone. A real system has no reference, so it aligns the
-branches to each other and votes. This is that layer: `rover.fuse` builds the per-word candidate
-graph (each slot = every branch's aligned candidate, `NULL` = drop) and majority-votes it — a
-strong no-LLM baseline that also settles the confident, agreeing spans (§12.5). The design's
-Qwen3.5-9B judge (§14) is a drop-in `chooser` that overrides only the *uncertain* slots; this
-number is what it has to beat, on the way from baseline down toward the oracle floor."""),
+The **baseline** (branch A) is one branch alone; the **realizable oracle** is the best WER a
+perfect selector could reach *over this candidate graph* — a real assembled transcript scored
+with full WER (insertions included), so it's an honest ceiling, unlike the recall floor (§11.5).
+A real system has no reference, so it aligns the branches into a **confusion network** (word
+slots + insertion slots, so a word only some branches heard stays selectable) and votes:
+`rover.fuse` majority-votes it — a strong no-LLM baseline that settles the confident, agreeing
+spans (§12.5). The Qwen3.5-9B judge (§11.7) overrides only the *uncertain* slots; the fused
+number is what it has to beat, between baseline and the realizable oracle."""),
     code(r"""
 from classroom_asr.rover import fuse, build_graph
 # every whole-recording WORD branch we actually produced (phone branches are IPA, excluded)
@@ -714,6 +737,7 @@ _wb = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", 
 _wb = [h for h in _wb if h and any(h)]
 fused = [fuse([h[k] for h in _wb], norm=SCORE) for k in range(len(interviews))]
 fused_wer = wer_of(fused)
+r_oracle = realizable_oracle_wer(pool)     # honest achievable ceiling over the candidate graph
 # how many slots the LLM would even be asked about (disagreement), vs frozen-confident ones
 _disagree = _total = 0
 for k in range(len(interviews)):
@@ -721,19 +745,24 @@ for k in range(len(interviews)):
         _total += 1; _disagree += 0 if s.agreed else 1
 print(f"fused {len(_wb)} word branches")
 print(f"[FUSED (ROVER)  ] final WER={fused_wer:.3f}"
-      f"   vs baseline A={wer_of(hyp_A):.3f}  vs oracle floor={oracle_wer(pool):.3f}")
+      f"   vs baseline A={wer_of(hyp_A):.3f}  vs realizable oracle={r_oracle:.3f}"
+      f"  (recall floor={recall_floor(pool):.3f})")
+_gap = wer_of(hyp_A) - r_oracle
 print(f"headroom captured by deterministic vote: "
-      f"{100*(wer_of(hyp_A)-fused_wer)/max(wer_of(hyp_A)-oracle_wer(pool),1e-9):.0f}% of baseline->oracle gap")
+      f"{100*(wer_of(hyp_A)-fused_wer)/max(_gap,1e-9):.0f}% of the baseline->realizable-oracle gap")
 print(f"uncertain slots (what the LLM judge would see): {_disagree}/{_total} "
       f"({100*_disagree/max(_total,1):.0f}%); the rest are frozen-confident (§12.5)")
 """),
-    md("""## 11.7 Conversation-LLM selector (§14) — Qwen3.5-9B judge over the graph
-The design's judge (§14.2 "default first judge"). It sees only the **contested** slots (§11.6),
-each as its branch candidates + context, and picks the option that best fits — the confident
-spans are frozen (§12.5) and every slot it can't decide falls back to the ROVER vote, so the
-result is **never worse than the fusion**. `needs_novel_candidate`/NEW is off (§14.5). Runs in
-its own venv (Qwen3.5 needs newer transformers than the pinned 4.57.6) at **full fp16, sharded
-across both freed T4s** — no quantization (§21). This is the final transcript WER."""),
+    md("""## 11.7 A local contextual word-judge (Qwen3.5-9B over the graph) — a first cut at §14
+**Scope, honestly:** this is *not yet* the design's §14–15 whole-lesson selector. It gets only a
+few words of local context per contested slot — **no** teacher/student roles, turn/timeline
+boundaries, overlap metadata, lesson vocabulary, or phone/P2G/RAG evidence, and it runs per
+interview independently. It's a local contextual word-judge over the ROVER graph, a first step
+toward §14. It picks among each contested slot's branch candidates (`needs_novel_candidate`/NEW
+off, §14.5); a slot it *fails to parse* falls back to the ROVER vote — but a **parseable-but-wrong
+pick can raise WER**, so this is measured against the fusion, not assumed to beat it. Runs in its
+own venv (Qwen3.5 needs newer transformers than the pinned 4.57.6) at full fp16 across both freed
+T4s (§21). This is the final transcript WER."""),
     code(r"""
 if USE_LLM_SELECTOR:
     import os, json, subprocess, time
@@ -798,16 +827,18 @@ json.dump({"selected": selected}, open(outp, "w"))
         sel_wer = wer_of(llm_sel)
         print(f"[LLM SELECTED   ] final WER={sel_wer:.3f}"
               f"   vs fused(ROVER)={fused_wer:.3f}  vs baseline A={wer_of(hyp_A):.3f}"
-              f"  vs oracle floor={oracle_wer(pool):.3f}")
-        gap = wer_of(hyp_A) - oracle_wer(pool)
-        print(f"captured {100*(wer_of(hyp_A)-sel_wer)/max(gap,1e-9):.0f}% of the baseline->oracle headroom")
+              f"  vs realizable oracle={r_oracle:.3f}")
+        gap = wer_of(hyp_A) - r_oracle
+        print(f"captured {100*(wer_of(hyp_A)-sel_wer)/max(gap,1e-9):.0f}% of the baseline->realizable-oracle gap"
+              f"   (delta vs ROVER: {sel_wer-fused_wer:+.3f})")
     except Exception as e:
         print("LLM selector failed -> keeping ROVER fusion:", repr(e)[:200])
     rec("+LLMSelector", time.time() - _sel_t0)
 """),
     md("""## 12. Timings + save summary
 Persistent per-stage wall-times (every stage `⏱`-printed as it finished; here they're
-collected into one table) and the WER/oracle summary."""),
+collected into one table) and the WER summary (branch WERs, recall floor, realizable oracle,
+fused, and LLM-selected)."""),
     code(r"""
 import json
 # --- timing table (slowest first) ---
@@ -821,14 +852,18 @@ for name, h in [("A_whisper", hyp_A), ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_
     if h and any(h): res[name] = round(wer_of(h), 4)
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",
-           "branch_wer": res, "oracle_wer": round(oracle_wer(pool), 4),
-           "baseline_wer": res.get("A_whisper"),
+           "branch_wer": res, "baseline_wer": res.get("A_whisper"),
+           # honest metrics: recall_floor = fraction of ref words no branch produced (a recall
+           # LOWER BOUND, ignores insertions); realizable_oracle = best full-WER a selector over
+           # the candidate graph could reach (a real transcript). fused/llm are actual WER.
+           "candidate_recall_floor": round(recall_floor(pool), 4),
+           "realizable_oracle_wer": round(r_oracle, 4) if "r_oracle" in dir() else None,
            "fused_rover_wer": round(fused_wer, 4) if "fused_wer" in dir() else None,
            "llm_selected_wer": round(sel_wer, 4) if "sel_wer" in dir() else None,
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
-try:   # oracle-floor breakdown from §11.5 (defined only if the pool had branches)
-    summary["oracle_floor_by_category"] = dict(bycat.most_common())
-    summary["oracle_floor_top"] = [[w, n] for w, n in floor.most_common(30)]
+try:   # recall-floor breakdown from §11.5 (defined only if the pool had branches)
+    summary["recall_floor_by_category"] = dict(bycat.most_common())
+    summary["recall_floor_top"] = [[w, n] for w, n in floor.most_common(30)]
 except NameError:
     pass
 json.dump(summary, open("coraal_oracle_summary.json", "w"), indent=2)

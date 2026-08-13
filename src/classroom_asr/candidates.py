@@ -71,16 +71,25 @@ def mbr_consensus(
 
 
 def token_vote(hyps: list[TextCandidate], *, norm: Normalizer = DEFAULT) -> float:
-    """Fraction of branches whose full token sequence equals the plurality one.
+    """Fraction of *branches* whose token sequence equals the plurality one.
 
-    A cheap cross-branch agreement signal for :func:`should_expand` and for the
-    ``model_disagreement`` flag (§13.1).
+    A cheap cross-branch agreement signal for :func:`should_expand` and the
+    ``model_disagreement`` flag (§13.1). One vote **per branch** (its best-ranked hypothesis):
+    a branch with a deep N-best list must not outvote one with a single hypothesis — internal
+    beam diversity is not cross-model disagreement.
     """
     if not hyps:
         return 1.0
-    keys = [tuple(norm.tokens(h.text)) for h in hyps]
+    best: dict[object, tuple[int, tuple]] = {}      # source -> (beam_rank, tokens) for its best hyp
+    for h in hyps:
+        src = getattr(h, "source", None)
+        rank = getattr(h, "beam_rank", 0) or 0
+        toks = tuple(norm.tokens(h.text))
+        if src not in best or rank < best[src][0]:
+            best[src] = (rank, toks)
+    keys = [toks for _, toks in best.values()]
     top, n = Counter(keys).most_common(1)[0]
-    return n / len(hyps)
+    return n / len(keys)
 
 
 # Flags that always warrant candidate expansion regardless of confidence (§12.5,

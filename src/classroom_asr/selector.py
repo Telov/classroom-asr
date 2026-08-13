@@ -55,13 +55,15 @@ def _labelled(slot: Slot) -> list[tuple[str, object]]:
 
 
 def build_decisions(graph: list[Slot], *, context: int = 8) -> list[Decision]:
-    """One :class:`Decision` per contested slot; context words come from the pivot transcript."""
+    """One :class:`Decision` per contested slot; context words come from the neighbouring pivot
+    ("word") slots (the interleaved "ins" slots carry no pivot word)."""
+    words = [(j, s.pivot) for j, s in enumerate(graph) if s.kind == "word"]
     out: list[Decision] = []
     for i, s in enumerate(graph):
         if not _contested(s):
             continue
-        before = [graph[j].pivot for j in range(max(0, i - context), i)]
-        after = [graph[j].pivot for j in range(i + 1, min(len(graph), i + 1 + context))]
+        before = [w for j, w in words if j < i][-context:]
+        after = [w for j, w in words if j > i][:context]
         out.append(Decision(i, before, after, _labelled(s), s.winner()))
     return out
 
@@ -107,9 +109,9 @@ def assemble(graph: list[Slot], choices: dict[int, object]) -> list[str]:
     """Final tokens: the LLM's choice where it decided, the ROVER winner everywhere else."""
     out: list[str] = []
     for i, s in enumerate(graph):
-        tok = choices.get(i, s.winner()) if i in choices else s.winner()
+        tok = choices.get(i, s.winner())
         if tok is not NULL:
-            out.append(tok)
+            out.extend(str(tok).split())          # an "ins" candidate may be a multi-word phrase
     return out
 
 
