@@ -1768,15 +1768,15 @@ for _package in _package_names:
 _model_ids = [FW_MODEL, FW_QUALITY_MODEL, CTC_MODEL, QWEN3ASR_MODEL, VOXTRAL_MODEL,
               f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}", PHONE_MODEL,
               PHONETIC_XEUS_MODEL, SELECTOR_MODEL]
-_resolved_hf_revisions = {}
+_cached_hf_revisions = {}
 try:
     from huggingface_hub import scan_cache_dir
     for _repo in scan_cache_dir().repos:
         if _repo.repo_id in _model_ids:
-            _resolved_hf_revisions[_repo.repo_id] = sorted(
+            _cached_hf_revisions[_repo.repo_id] = sorted(
                 revision.commit_hash for revision in _repo.revisions)
 except Exception as _cache_error:
-    _resolved_hf_revisions["_scan_error"] = type(_cache_error).__name__
+    _cached_hf_revisions["_scan_error"] = type(_cache_error).__name__
 
 _completed_epoch = _run_time.time()
 run_fingerprint = {
@@ -1811,7 +1811,8 @@ run_fingerprint = {
                      "transformers": SELECTOR_TRANSFORMERS,
                      "accelerate": SELECTOR_ACCELERATE},
     },
-    "resolved_hf_revisions": _resolved_hf_revisions,
+    # Cache inventory, not a claim that every listed revision was loaded when multiple are present.
+    "cached_hf_revisions": _cached_hf_revisions,
 }
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",

@@ -106,7 +106,7 @@ are:
 
 The selector and its phone/IPA inputs are temporarily paused while upstream branches
 undergo exact overlap and subset-oracle analysis. The final JSON includes branch WER
-and S/D/I, deletion rates, model/runtime fingerprints, resolved Hub revisions,
+and S/D/I, deletion rates, model/runtime fingerprints, cached Hub revision inventory,
 leave-one-out and pairwise overlap, and a runtime-aware Pareto frontier across all
 Qwen-anchored branch subsets. Read the Qwen→realizable-oracle gap and deletion slices,
 not just absolute WER (§18).
