@@ -587,7 +587,7 @@ if USE_CRISPER:
             raise _cw["err"]
         with open(WORKER, "w") as f:
             f.write('''
-import sys, json, warnings, logging
+import sys, json, warnings, logging, fcntl
 from crisperwhisper import CrisperWhisperModel   # imports transformers -> its loggers now exist
 # The crisperwhisper package still calls from_pretrained with the old `torch_dtype=` kwarg;
 # that is inside the dependency, so it can't be fixed at our source. transformers emits it via
@@ -602,14 +602,22 @@ class _DropTorchDtype(logging.Filter):
 _flt = _DropTorchDtype()
 for _name in ("transformers", "transformers.modeling_utils"):
     logging.getLogger(_name).addFilter(_flt)
-size, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
+size, inp, outp, init_lock = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 paths = json.load(open(inp))
-try:
-    m = CrisperWhisperModel(size, backend="ct2")          # fast forked CT2
-    print("CW backend: ct2 (fast)", flush=True)           # to STDOUT so we can see the path taken
-except Exception as e:
-    print("CW backend: transformers (SLOW) -- ct2 failed:", repr(e)[:200], flush=True)
-    m = CrisperWhisperModel(size, backend="transformers")  # in-venv fallback
+# The first CT2 load converts the HF model into a shared local cache. Two GPU workers starting
+# that conversion concurrently can observe a half-written JSON file and send one worker down the
+# 10+ minute Transformers fallback. Serialize only construction/conversion; transcription remains
+# parallel across both GPUs after the lock is released.
+with open(init_lock, "w") as _lock_file:
+    fcntl.flock(_lock_file, fcntl.LOCK_EX)
+    try:
+        m = CrisperWhisperModel(size, backend="ct2")       # fast forked CT2
+        print("CW backend: ct2 (fast)", flush=True)
+    except Exception as e:
+        print("CW backend: transformers (SLOW) -- ct2 failed:", repr(e)[:200], flush=True)
+        m = CrisperWhisperModel(size, backend="transformers")
+    finally:
+        fcntl.flock(_lock_file, fcntl.LOCK_UN)
 out = {}
 for p in paths:
     try:
@@ -626,6 +634,7 @@ json.dump(out, open(outp, "w"))
         gpus = [g for g in GPUS if g is not None] or [None]
         shards = [paths[i::len(gpus)] for i in range(len(gpus))]
         res = {}
+        init_lock = os.path.join(CW_WORK, "ct2_model_init.lock")
         def _cw_run(gi, gpu, shard):
             if not shard:
                 return
@@ -635,7 +644,8 @@ json.dump(out, open(outp, "w"))
                 env = dict(os.environ)
                 if gpu is not None:
                     env["CUDA_VISIBLE_DEVICES"] = str(gpu)  # each subprocess sees exactly one GPU
-                subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE, inp, outp], check=True, env=env)
+                subprocess.run([CW_VENV_PY, WORKER, CRISPER_SIZE, inp, outp, init_lock],
+                               check=True, env=env)
                 res.update(json.load(open(outp)))           # disjoint keys per shard -> safe
             except Exception as e:                          # don't crash the thread; skip cleanly
                 print(f"CrisperWhisper GPU{gpu} worker failed: {repr(e)[:160]}", flush=True)
@@ -880,7 +890,9 @@ if USE_LLM_SELECTOR:
         if _sel.get("thread") is not None: _sel["thread"].join()   # wait for the venv build (§2a)
         if _sel.get("err") is not None: raise _sel["err"]
         with open(SEL_WORKER, "w") as f:
-            f.write('''
+            # Raw literal: the embedded worker contains regexes and ``\n`` string escapes that
+            # must reach its source unchanged instead of being decoded by this notebook cell.
+            f.write(r'''
 import sys, json, re, torch, transformers
 from rapidfuzz.distance import Levenshtein
 from transformers import AutoModelForMultimodalLM, AutoProcessor
@@ -896,8 +908,8 @@ data = json.load(open(inp))
 # helpers from the package. Patch the module global used by select_transcript with the tolerant
 # parser locally; once origin contains the same implementation this remains harmless.
 _ANSWER = re.compile(
-    r"^\s*(?:[-*]\s*)?[\"']?(\d+)[\"']?\s*(?:[:.)=\-]|->)\s*"
-    r"(?:[\"']?\s*)?(?:option\s+)?([A-Za-z])\b", re.IGNORECASE | re.MULTILINE)
+    r"^\s*(?:[-*]\s*)?(\d+)\s*(?:[:.)=]|->)\s*"
+    r"(?:option\s+)?([A-Za-z])\b", re.IGNORECASE | re.MULTILINE)
 def parse_batch_compat(text, decisions):
     raw = text or ""; answers = []
     try: payload = json.loads(raw.strip())
@@ -1068,14 +1080,14 @@ json.dump({"selected": selected}, open(outp, "w"))
             ("A+B+Qwen3", hyp_Z), ("+Voxtral", hyp_C), ("+VoxtralVerbatim", hyp_VV),
             ("A whisper", hyp_A), ("A+B", hyp_B)] if hyps and any(hyps) and key in WINDOW_PARTS), None)
         _anchors = WINDOW_PARTS.get(_anchor_key, [[] for _ in interviews])
-        payload = {
+        _selector_input = {
             "branch_transcripts": [[h[k] for h in _wb2] for k in range(len(interviews))],
             "anchor_chunks": _anchors,
             "phone_evidence": phone_evidence,
         }
         print(f"selector retrieval anchor: {_anchor_key or 'none'}; "
               f"phone windows={sum(len(rows) for rows in phone_evidence)}")
-        json.dump(payload, open(os.path.join(SEL_WORK, "in.json"), "w"))
+        json.dump(_selector_input, open(os.path.join(SEL_WORK, "in.json"), "w"))
         subprocess.run([SEL_VENV_PY, SEL_WORKER, SELECTOR_MODEL,
                         os.path.join(SEL_WORK, "in.json"), os.path.join(SEL_WORK, "out.json")], check=True)
         llm_sel = json.load(open(os.path.join(SEL_WORK, "out.json")))["selected"]

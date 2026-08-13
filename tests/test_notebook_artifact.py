@@ -1,5 +1,7 @@
+import ast
+import io
 import json
-import re
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -17,6 +19,14 @@ def _notebook(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _code_sources(path: Path) -> list[str]:
+    return [
+        "".join(cell.get("source", []))
+        for cell in _notebook(path)["cells"]
+        if cell.get("cell_type") == "code"
+    ]
+
+
 def test_persistent_launcher_fetches_an_immutable_payload_revision():
     notebook = _notebook(LAUNCHER_NOTEBOOK)
     source = _notebook_source(LAUNCHER_NOTEBOOK)
@@ -27,6 +37,37 @@ def test_persistent_launcher_fetches_an_immutable_payload_revision():
     assert 'os.environ["CLASSROOM_ASR_GIT_REF"] = revision' in source
     assert "shell.run_cell(source" in source
     assert "raise error" in source
+
+
+def test_launcher_control_state_survives_payload_variable_collision():
+    source, = _code_sources(LAUNCHER_NOTEBOOK)
+    downloaded = {
+        "metadata": {"classroom_asr": {"kind": "payload", "schema": 1}},
+        "cells": [
+            {"cell_type": "code", "source": ["payload = {'not': 'the notebook'}\n"]},
+            {"cell_type": "code", "source": ["ran_after_collision = True\n"]},
+        ],
+    }
+    responses = [
+        io.BytesIO(json.dumps({"sha": "a" * 40}).encode()),
+        io.BytesIO(json.dumps(downloaded).encode()),
+    ]
+    namespace = {}
+
+    class Result:
+        error_before_exec = None
+        error_in_exec = None
+
+    class Shell:
+        def run_cell(self, cell_source, **_kwargs):
+            exec(cell_source, namespace)
+            return Result()
+
+    namespace["get_ipython"] = lambda: Shell()
+    with patch("urllib.request.urlopen", side_effect=responses):
+        exec(source, namespace)
+
+    assert namespace["ran_after_collision"] is True
 
 
 def test_payload_is_marked_and_installs_its_exact_revision():
@@ -48,12 +89,30 @@ def test_selector_worker_does_not_require_new_helpers_from_installed_package():
 
 
 def test_embedded_selector_worker_is_valid_python():
-    source = _notebook_source()
-    workers = re.findall(r"f\.write\('''\n(.*?)\n'''\)", source, re.DOTALL)
+    workers = []
+    for source in _code_sources(PAYLOAD_NOTEBOOK):
+        if "AutoModelForMultimodalLM" not in source:
+            continue
+        tree = ast.parse(source)
+        workers.extend(
+            ast.literal_eval(call.args[0])
+            for call in ast.walk(tree)
+            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "write" and call.args
+                and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str))
+        )
     matches = [worker for worker in workers if "AutoModelForMultimodalLM" in worker]
 
     assert len(matches) == 1, "selector worker source was not found uniquely"
     compile(matches[0], "sel_worker.py", "exec")
+
+
+def test_crisper_workers_serialize_shared_ct2_cache_initialization():
+    source = _notebook_source()
+
+    assert "fcntl.flock(_lock_file, fcntl.LOCK_EX)" in source
+    assert 'init_lock = os.path.join(CW_WORK, "ct2_model_init.lock")' in source
+    assert "inp, outp, init_lock]" in source
 
 
 def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():

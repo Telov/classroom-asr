@@ -72,20 +72,28 @@ if marker.get("kind") != "payload" or marker.get("schema") != 1:
 os.environ["CLASSROOM_ASR_GIT_REF"] = revision
 print(f"classroom-asr payload: {revision[:12]} | {len(payload['cells'])} cells", flush=True)
 
-shell = get_ipython()
-if shell is None:
-    raise RuntimeError("the persistent launcher must run inside a Jupyter/Kaggle kernel")
-for index, cell in enumerate(payload["cells"]):
-    if cell.get("cell_type") != "code":
-        continue
-    source = "".join(cell.get("source", []))
-    if not source.strip():
-        continue
-    print(f"\n=== payload cell {index + 1}/{len(payload['cells'])} ===", flush=True)
-    result = shell.run_cell(source, store_history=False)
-    error = result.error_before_exec or result.error_in_exec
-    if error is not None:
-        raise error
+def _classroom_asr_run_payload(notebook):
+    # Payload cells intentionally share the Jupyter user namespace, but launcher control state
+    # must not live there: experiment cells commonly use names such as ``payload`` themselves.
+    # Function locals keep the immutable cell list and loop counters out of that namespace.
+    shell = get_ipython()
+    if shell is None:
+        raise RuntimeError("the persistent launcher must run inside a Jupyter/Kaggle kernel")
+    cells = tuple(notebook["cells"])
+    total = len(cells)
+    for index, cell in enumerate(cells):
+        if cell.get("cell_type") != "code":
+            continue
+        source = "".join(cell.get("source", []))
+        if not source.strip():
+            continue
+        print(f"\n=== payload cell {index + 1}/{total} ===", flush=True)
+        result = shell.run_cell(source, store_history=False)
+        error = result.error_before_exec or result.error_in_exec
+        if error is not None:
+            raise error
+
+_classroom_asr_run_payload(payload)
 """
     ),
 ]
