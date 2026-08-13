@@ -154,6 +154,29 @@ def test_crisper_workers_serialize_shared_ct2_cache_initialization():
     assert "fcntl.flock(_lock_file, fcntl.LOCK_EX)" in source
     assert 'init_lock = os.path.join(CW_RUN, "ct2_model_init.lock")' in source
     assert "inp, outp, init_lock]" in source
+    assert "if main_arg == size:" in source
+    assert "Worker 0 may have completed conversion while this worker waited" in source
+    assert 'm = CrisperWhisperModel(main_arg, backend="ct2", cache_dir=cache_dir)' in source
+
+
+def test_completed_crisper_conversion_skips_source_prefetch_and_balances_whole_files():
+    source = _notebook_source()
+
+    assert "def _cw_converted_ready():" in source
+    assert 'key = f"{slug}_float16_{hashlib.sha256(repo.encode()).hexdigest()[:12]}"' in source
+    assert 'and os.path.isfile(os.path.join(candidate, ".conversion_complete"))' in source
+    assert "USE_CRISPER and not _cw_converted_ready()" in source
+    assert "for path in sorted(paths, key=lambda p: duration_s[p], reverse=True)" in source
+    assert "Crisper whole-file GPU plan:" in source
+
+
+def test_silence_windows_are_cached_only_in_memory_for_the_current_run():
+    source = _notebook_source()
+
+    assert "_WINDOW_RECORD_CACHE = {}" in source
+    assert "session-only audio views; never persisted or reused across runs" in source
+    assert "if key not in _WINDOW_RECORD_CACHE:" in source
+    assert "return _WINDOW_RECORD_CACHE[key]" in source
 
 
 def test_crisper_uses_validated_non_speculative_ct2_and_persists_only_converted_model():

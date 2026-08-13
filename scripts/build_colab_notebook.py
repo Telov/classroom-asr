@@ -160,10 +160,12 @@ now, so they finish *while* the A→Qwen branches compute. Pure overlap — no G
 CrisperWhisper **venv** and its converted CT2 main model (under `/kaggle/working/cw_iso`)
 survive between sessions. Source model **weights are NOT persisted** — the full ensemble exceeds
 the persisted-dir cap, so those live in the roomy default cache and re-download each session
-(overlapped with compute by the prefetch below). No transcript, timestamp, IPA, phone, selector,
-or other derived inference output is cached; transcription always runs fresh."""),
+(overlapped with compute by the prefetch below). Once CrisperWhisper's persisted CT2 conversion is
+complete, its now-redundant 1.62 GB source checkpoint is no longer fetched. No transcript,
+timestamp, IPA, phone, selector, or other derived inference output is cached; transcription always
+runs fresh."""),
     code(r"""
-import os, sys, subprocess, threading, shutil, glob
+import os, sys, subprocess, threading, shutil, glob, hashlib
 # A persisted venv can come back from a previous Kaggle session with bin/python stripped of its
 # execute bit (persistence doesn't preserve +x) -> PermissionError at run time. So before reusing
 # one, prove its python actually runs; if not, chmod, then wipe-and-rebuild as a last resort.
@@ -193,6 +195,15 @@ CW_READY = os.path.join(CW_WORK, ".venv_ready")   # stores the exact validated e
 CW_ENV_SPEC = f"crisperwhisper[ct2]=={CRISPER_VERSION}"
 CW_CT2_CACHE = os.path.join(CW_WORK, "ct2_models")
 os.makedirs(CW_CT2_CACHE, exist_ok=True)
+def _cw_converted_ready():
+    # True only for a completed persisted CT2 conversion, never a partial directory.
+    repo = (CRISPER_SIZE if "/" in CRISPER_SIZE
+            else f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}")
+    slug = repo.replace("/", "--").replace("\\", "--")
+    key = f"{slug}_float16_{hashlib.sha256(repo.encode()).hexdigest()[:12]}"
+    candidate = os.path.join(CW_CT2_CACHE, key)
+    return (os.path.isfile(os.path.join(candidate, "model.bin"))
+            and os.path.isfile(os.path.join(candidate, ".conversion_complete")))
 # Remove derived handoff files left by payloads before they were moved to session-temporary storage.
 # These exact non-recursive targets never include the reusable venv or converted model cache.
 for _legacy in ([os.path.join(CW_WORK, "cw_worker.py"),
@@ -311,7 +322,10 @@ def _prefetch():
     repos = [m for m, on in [
         (FW_MODEL, True), (CTC_MODEL, USE_CTC), (QWEN3ASR_MODEL, USE_QWEN3ASR),
         (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM),
-        (f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}", USE_CRISPER),   # venv reads same HF cache
+        # The persisted CT2 directory is self-contained. Fetch the 1.62 GB source only when a
+        # conversion is actually missing; workers otherwise load the local model directly.
+        (f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}",
+         USE_CRISPER and not _cw_converted_ready()),
         (PHONE_MODEL, USE_PHONE), (PHONETIC_XEUS_MODEL, USE_PHONETIC_XEUS),
         (SELECTOR_MODEL, USE_LLM_SELECTOR)] if on]
     for r in repos:
@@ -442,13 +456,19 @@ def _free_models(models):
             if g is not None:
                 with torch.cuda.device(g): torch.cuda.empty_cache()
 
-WINDOW_PARTS = {}   # desc -> per-interview timestamped text windows; selector retrieval anchor
+WINDOW_PARTS = {}          # desc -> per-interview timestamped text windows; selector anchor
+_WINDOW_RECORD_CACHE = {}  # session-only audio views; never persisted or reused across runs
 
 def _window_records_of(k, chunk_s):
     from classroom_asr.backends import iter_silence_chunks
-    wav = load_16k(interviews[k][0])
-    return [(start / 16000, (start + len(c)) / 16000, c)
-            for start, c in iter_silence_chunks(wav, 16000, chunk_s) if len(c) >= 400]
+    key = (k, float(chunk_s))
+    if key not in _WINDOW_RECORD_CACHE:
+        wav = load_16k(interviews[k][0])
+        _WINDOW_RECORD_CACHE[key] = [
+            (start / 16000, (start + len(c)) / 16000, c)
+            for start, c in iter_silence_chunks(wav, 16000, chunk_s) if len(c) >= 400
+        ]
+    return _WINDOW_RECORD_CACHE[key]
 
 def _windows_of(k, chunk_s):
     return [c for _start, _end, c in _window_records_of(k, chunk_s)]
@@ -671,21 +691,27 @@ def _cached_model_arg(name):
             and os.path.isfile(os.path.join(candidate, ".conversion_complete"))):
         return candidate
     return name
-# The first CT2 load converts the HF model into a shared local cache. Two GPU workers starting
-# that conversion concurrently can observe a half-written JSON file and send one worker down the
-# 10+ minute Transformers fallback. Serialize only construction/conversion; transcription remains
-# parallel across both GPUs after the lock is released.
-with open(init_lock, "w") as _lock_file:
-    fcntl.flock(_lock_file, fcntl.LOCK_EX)
-    try:
-        main_arg = _cached_model_arg(size)
+# The first CT2 load converts the HF model into a shared local cache. Serialize that conversion so
+# a second worker cannot observe half-written files. A completed persisted conversion is immutable,
+# so both isolated GPU processes can load it concurrently on later runs instead of serializing two
+# ordinary model loads behind this lock.
+try:
+    main_arg = _cached_model_arg(size)
+    if main_arg == size:
+        with open(init_lock, "w") as _lock_file:
+            fcntl.flock(_lock_file, fcntl.LOCK_EX)
+            try:
+                # Worker 0 may have completed conversion while this worker waited.
+                main_arg = _cached_model_arg(size)
+                m = CrisperWhisperModel(main_arg, backend="ct2", cache_dir=cache_dir)
+            finally:
+                fcntl.flock(_lock_file, fcntl.LOCK_UN)
+    else:
         m = CrisperWhisperModel(main_arg, backend="ct2", cache_dir=cache_dir)
-        print("CW backend: ct2 (fast)", flush=True)
-    except Exception as e:
-        print("CW backend: transformers (SLOW) -- ct2 failed:", repr(e)[:200], flush=True)
-        m = CrisperWhisperModel(size, backend="transformers")
-    finally:
-        fcntl.flock(_lock_file, fcntl.LOCK_UN)
+    print("CW backend: ct2 (fast)", flush=True)
+except Exception as e:
+    print("CW backend: transformers (SLOW) -- ct2 failed:", repr(e)[:200], flush=True)
+    m = CrisperWhisperModel(size, backend="transformers")
 out = {}
 for p in paths:
     try:
@@ -700,7 +726,20 @@ json.dump(out, open(outp, "w"))
         # cross-file interaction and each file keeps CrisperWhisper's native internal 30s
         # chunking), so the per-file output is byte-identical to the single-worker run.
         gpus = [g for g in GPUS if g is not None] or [None]
-        shards = [paths[i::len(gpus)] for i in range(len(gpus))]
+        # Keep each interview whole (identical decoding), but use longest-processing-time-first
+        # assignment instead of the old 2+1 round robin. This minimizes idle tail time whenever
+        # interview lengths differ, without using transcript/reference information.
+        duration_s = {
+            path: len(load_16k(interviews[k][0])) / 16000.0
+            for k, path in enumerate(paths)
+        }
+        shards = [[] for _ in gpus]; shard_seconds = [0.0 for _ in gpus]
+        for path in sorted(paths, key=lambda p: duration_s[p], reverse=True):
+            gi = min(range(len(gpus)), key=lambda i: (shard_seconds[i], i))
+            shards[gi].append(path); shard_seconds[gi] += duration_s[path]
+        print("Crisper whole-file GPU plan:",
+              [f"GPU{g}: {len(shards[i])} files, {shard_seconds[i]/60:.1f} min"
+               for i, g in enumerate(gpus)], flush=True)
         res = {}
         init_lock = os.path.join(CW_RUN, "ct2_model_init.lock")
         def _cw_run(gi, gpu, shard):
