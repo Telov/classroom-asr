@@ -107,12 +107,48 @@ def test_embedded_selector_worker_is_valid_python():
     compile(matches[0], "sel_worker.py", "exec")
 
 
+def test_embedded_crisper_worker_is_valid_python_after_literal_decoding():
+    workers = []
+    for source in _code_sources(PAYLOAD_NOTEBOOK):
+        if "CrisperWhisperModel" not in source or "f.write" not in source:
+            continue
+        tree = ast.parse(source)
+        workers.extend(
+            ast.literal_eval(call.args[0])
+            for call in ast.walk(tree)
+            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "write" and call.args
+                and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str))
+        )
+    matches = [worker for worker in workers if "CrisperWhisperModel" in worker]
+
+    assert len(matches) == 1, "CrisperWhisper worker source was not found uniquely"
+    compile(matches[0], "cw_worker.py", "exec")
+
+
 def test_crisper_workers_serialize_shared_ct2_cache_initialization():
     source = _notebook_source()
 
     assert "fcntl.flock(_lock_file, fcntl.LOCK_EX)" in source
     assert 'init_lock = os.path.join(CW_WORK, "ct2_model_init.lock")' in source
     assert "inp, outp, init_lock]" in source
+
+
+def test_crisper_uses_lossless_speculative_ct2_and_persists_only_converted_models():
+    source = _notebook_source()
+
+    assert 'CRISPER_SPECULATIVE  = True;  CRISPER_DRAFT_SIZE = "turbo"' in source
+    assert 'CRISPER_VERSION      = "2.0.2"' in source
+    assert 'CW_ENV_SPEC = f"crisperwhisper[ct2]=={CRISPER_VERSION}"' in source
+    assert "CrisperWhisper runtime smoke check failed" in source
+    assert 'CW_CT2_CACHE = os.path.join(CW_WORK, "ct2_models")' in source
+    assert 'draft_model=draft_arg' in source
+    assert 'speculative_k="auto"' in source
+    assert 'kwargs["speculative_decoding"] = True' in source
+    assert 'os.path.isfile(os.path.join(candidate, ".conversion_complete"))' in source
+    assert '"transcript"' not in source[source.index("def _cached_model_arg"):source.index(
+        "# The first CT2 load", source.index("def _cached_model_arg")
+    )]
 
 
 def test_prefetch_excludes_unused_framework_weights_and_prioritizes_first_branch():
