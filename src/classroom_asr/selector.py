@@ -4,7 +4,7 @@ Design §14.1: the LLM is a *judge over a constrained candidate graph* — it se
 evidence-supported candidate per uncertain span, it does not compose a transcript from scratch.
 This module is the reference-free realization of that:
 
-* :func:`build_decisions` — from the :mod:`rover` graph, take only the **contested** slots (no
+* :func:`build_decisions` — from the candidate graph, take only the **contested** slots (no
   clear majority; the confident/agreeing ones are frozen, §12.5), and package each as a
   :class:`Decision`: the labelled candidate options every branch offered (``∅`` = drop the word)
   plus a few words of surrounding context.
@@ -14,8 +14,8 @@ This module is the reference-free realization of that:
 * :func:`format_choice_prompt` / :func:`select_transcript_with_chooser` — the stricter adapter
   for judges that score only advertised candidate IDs instead of generating and parsing prose.
 * :func:`select_transcript` — glue: graph → contested decisions → LLM choices → assembled
-  transcript, with the ROVER majority vote as the default for every slot the LLM didn't (or
-  couldn't) decide. Valid but wrong LLM choices can still worsen WER and must be measured.
+  transcript, with the primary Qwen backbone as the fallback for every slot the LLM did not
+  decide. Valid but wrong LLM choices can still worsen WER and must be measured.
 
 The design's ``NEW`` free-form escape hatch (§14.5) is intentionally **off** here — enabled later
 only for OOV/nonce spans with strong phone/P2G support.
@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
 
 from .normalize import DEFAULT, Normalizer
-from .rover import NULL, Slot, build_graph
+from .candidate_graph import NULL, Slot, build_graph
 
 DROP = "∅"  # shown to the model as the "drop this word" candidate
 _ANSWER = re.compile(
@@ -45,21 +45,29 @@ class Decision:
     before: list[str]                           # context words before the slot
     after: list[str]                            # context words after the slot
     options: list[tuple[str, object]]           # (letter, token); token may be NULL
-    default: object                             # ROVER winner — used if the LLM abstains
+    default: object                             # primary-backbone value if the LLM abstains
     evidence: list[str] = field(default_factory=list)  # retrieved acoustic/phone evidence (§14.4)
 
 
 def _contested(slot: Slot) -> bool:
-    """A slot worth asking the LLM about: branches disagree and none holds a strict majority."""
+    """A slot worth asking about: branches disagree and Qwen lacks a strict majority.
+
+    Agreement is an uncertainty signal, never an alternative transcript assembler. In particular,
+    a non-Qwen majority must remain selectable instead of being silently frozen while assembly
+    falls back to Qwen.
+    """
     if len(slot.votes) <= 1:
         return False
     total = sum(slot.votes.values())
-    return max(slot.votes.values()) * 2 <= total
+    return slot.votes.get(slot.anchor(), 0) * 2 <= total
 
 
 def _labelled(slot: Slot) -> list[tuple[str, object]]:
-    """Candidate options as (letter, token), most-voted first, ``NULL`` last."""
-    items = sorted(slot.votes.items(), key=lambda kv: (-kv[1], kv[0] is NULL, str(kv[0])))
+    """Candidate options with the primary-backbone value first, then stable alternatives."""
+    anchor = slot.anchor()
+    items = sorted(slot.votes.items(), key=lambda kv: (
+        kv[0] != anchor, kv[0] is NULL, str(kv[0])
+    ))
     return [(chr(ord("A") + i), tok) for i, (tok, _n) in enumerate(items)]
 
 
@@ -79,7 +87,7 @@ def build_decisions(
         before = [w for j, w in words if j < i][-context:]
         after = [w for j, w in words if j > i][:context]
         evidence = list((evidence_by_slot or {}).get(i, ()))
-        out.append(Decision(i, before, after, _labelled(s), s.winner(), evidence))
+        out.append(Decision(i, before, after, _labelled(s), s.anchor(), evidence))
     return out
 
 
@@ -92,9 +100,10 @@ def format_batch(decisions: list[Decision]) -> str:
     lines = [
         "You are a transcription judge. For each item, several speech recognizers proposed a",
         "different word for one position (marked [?]). Using the surrounding context and any",
-        "retrieved acoustic evidence, pick the evidence-supported VERBATIM transcription. Phone",
-        "evidence covers the same short audio region and may include neighboring words; use it to",
-        "compare the listed options, not to invent text.",
+        "retrieved acoustic evidence, pick the evidence-supported VERBATIM transcription.",
+        "Candidate-local phone evidence compares each option's expected context pronunciation",
+        "with a localized realized-phone excerpt; match is an accent-aware score from 0 to 1.",
+        "Use it to compare the listed options, not to invent text.",
         f"Keep real fillers (um, uh, yeah); {DROP}(drop) means no word belongs there. Do not invent",
         "words; choose only from the",
         "options. Answer each item on its own line as  N:LETTER  and nothing else.",
@@ -108,7 +117,10 @@ def format_batch(decisions: list[Decision]) -> str:
 
     for n, d in enumerate(decisions, 1):
         ctx = " ".join([*d.before, "[?]", *d.after]).strip()
-        opts = "  ".join(f"{L}={_opt_text(tok)}" for L, tok in d.options)
+        opts = "  ".join(
+            f"{L}={_opt_text(tok)}" + (" [Qwen backbone]" if tok == d.default else "")
+            for L, tok in d.options
+        )
         lines.append(f"{n}. context: ...{ctx}...")
         lines.append(f"   options: {opts}")
         if d.evidence:
@@ -141,7 +153,7 @@ def format_choice_prompt(decision: Decision) -> str:
     ]
     if decision.evidence:
         lines += [
-            "Acoustic phone evidence for the same short region (it may include neighboring words):",
+            "Candidate-local acoustic phone matches (0=poor, 1=close):",
             *(f"  {item}" for item in decision.evidence),
         ]
     lines += ["Answer with exactly one candidate ID letter and nothing else.", "Candidate ID:"]
@@ -213,10 +225,10 @@ def generated_token_ids(generated_ids, input_ids) -> list[int]:
 
 
 def assemble(graph: list[Slot], choices: dict[int, object]) -> list[str]:
-    """Final tokens: the LLM's choice where it decided, the ROVER winner everywhere else."""
+    """Final tokens: the LLM's choice where decided, the primary backbone everywhere else."""
     out: list[str] = []
     for i, s in enumerate(graph):
-        tok = choices.get(i, s.winner())
+        tok = choices.get(i, s.anchor())
         if tok is not NULL:
             out.extend(str(tok).split())          # an "ins" candidate may be a multi-word phrase
     return out
@@ -234,11 +246,11 @@ def select_transcript_with_chooser(
     """Fuse transcripts using a chooser that returns constrained ``slot -> candidate`` values.
 
     Every returned value is checked against that decision's advertised candidates. Unknown slots
-    and invented values are ignored, so the deterministic ROVER winner remains the fallback.
+    and invented values are ignored, so the primary backbone remains the fallback.
     This is the non-generative adapter used by restricted-logit LLM judges.
     """
     token_lists = [norm.tokens(t) for t in transcripts if t and t.strip()]
-    graph = build_graph(token_lists)
+    graph = build_graph(token_lists, pivot_index=0)
     return select_graph_with_chooser(
         graph,
         chooser_fn,
@@ -260,7 +272,7 @@ def select_graph_with_chooser(
 
     This is equivalent to :func:`select_transcript_with_chooser`, but lets callers reuse an
     expensive whole-recording confusion graph for diagnostic reassembly and threshold sweeps.
-    Candidate validation and the ROVER fallback are identical.
+    Candidate validation and the primary-backbone fallback are identical.
     """
     decisions = build_decisions(graph, context=context, evidence_by_slot=evidence_by_slot)
     choices: dict[int, object] = {}
@@ -269,7 +281,7 @@ def select_graph_with_chooser(
         try:
             proposed = chooser_fn(batch)
         except Exception:
-            continue                            # abstain -> ROVER defaults for the batch
+            continue                            # abstain -> backbone defaults for the batch
         if not isinstance(proposed, Mapping):
             continue
         for decision in batch:
@@ -294,7 +306,7 @@ def select_transcript(
 
     ``llm_fn(prompt) -> str`` runs the model. Returns ``(transcript, n_decisions, n_chosen)`` —
     ``n_chosen`` is how many contested slots the LLM actually decided; the rest fall back to the
-    ROVER vote. Chosen candidates remain constrained but can still be wrong.
+    primary backbone. Chosen candidates remain constrained but can still be wrong.
     """
     def parsed_chooser(batch: list[Decision]) -> Mapping[int, object]:
         return parse_batch(llm_fn(format_batch(batch)), batch)

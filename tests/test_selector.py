@@ -1,5 +1,5 @@
 from classroom_asr.normalize import Normalizer
-from classroom_asr.rover import build_graph, NULL
+from classroom_asr.candidate_graph import build_graph, NULL
 from classroom_asr.selector import (
     build_decisions, format_batch, format_choice_prompt, parse_batch, generated_token_ids,
     assemble, select_graph_with_chooser, select_transcript, select_transcript_with_chooser,
@@ -9,7 +9,7 @@ N = Normalizer()
 
 
 def _graph(*texts):
-    return build_graph([N.tokens(t) for t in texts])
+    return build_graph([N.tokens(t) for t in texts], pivot_index=0)
 
 
 def test_only_contested_slots_become_decisions():
@@ -22,6 +22,16 @@ def test_only_contested_slots_become_decisions():
     assert len(decs2) == 1
     toks = {tok for _, tok in decs2[0].options}
     assert toks == {"their", "there", "they're"}
+
+
+def test_non_backbone_majority_stays_selectable():
+    # Qwen/branch 0 says "went", but the alternatives agree on "want". This cannot be frozen:
+    # majority agreement is an uncertainty signal, not an assembler that may replace Qwen.
+    g = _graph("i went home", "i want home", "i want home")
+    decisions = build_decisions(g)
+    assert len(decisions) == 1
+    assert decisions[0].default == "went"
+    assert {token for _, token in decisions[0].options} == {"went", "want"}
 
 
 def test_prompt_and_parse_roundtrip():
@@ -90,8 +100,8 @@ def test_llm_choice_overrides_only_its_slot():
     assert assemble(g, choices) == ["there", "house"]
 
 
-def test_bad_llm_output_falls_back_to_rover():
-    # llm returns garbage -> abstain -> ROVER majority ("went" 2/3) stands
+def test_bad_llm_output_falls_back_to_primary_backbone():
+    # The LLM returns garbage, so the first (primary/Qwen) transcript remains unchanged.
     g_texts = ["i went home now", "i want home now", "i went home now"]
     out, n, nc = select_transcript(g_texts, lambda p: "no idea", norm=N)
     assert out == "i went home now"                     # unchanged by the useless judge

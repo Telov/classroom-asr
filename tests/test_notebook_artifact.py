@@ -88,7 +88,7 @@ def test_selector_worker_uses_the_exact_revision_constrained_choice_api():
     assert "selector_module.parse_batch" not in source
 
 
-def test_selector_shadow_scores_only_advertised_next_token_ids():
+def test_canonical_selector_scores_only_advertised_next_token_ids():
     source = _notebook_source()
 
     assert 'tokenizer.padding_side = "left"' in source
@@ -105,11 +105,12 @@ def test_selector_shadow_scores_only_advertised_next_token_ids():
     assert "conversations = [[" not in source[source.index("# Candidate IDs are deliberately"):]
     assert "model.generate(" not in source[source.index("# Candidate IDs are deliberately"):]
     assert 'graph, score_choices, batch_size=24, evidence_by_slot=evidence' in source
-    assert '"llm_selected_wer": None' in source
-    assert '"llm_scored_shadow_wer"' in source
+    assert '"llm_selected_wer": (round(llm_selected_wer, 4)' in source
+    assert '"llm_selector_stats"' in source
     assert 'thresholds = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0]' in source
-    assert '"llm_scored_shadow_margin_wer"' in source
-    assert "canonical transcript remains FUSED (ROVER)" in source
+    assert '"llm_selector_margin_wer"' in source
+    assert 'canonical_source = "constrained LLM selector"' in source
+    assert "fused_rover_wer" not in source
 
 
 def test_embedded_selector_worker_is_valid_python():
@@ -237,6 +238,9 @@ def test_phone_evidence_reaches_the_selector_worker_payload_and_prompt():
     assert "def phone_window_pass" in source
     assert '"phone_evidence": phone_evidence' in source
     assert "def _evidence_by_slot" in source
+    assert "best_phone_subsequence" in source
+    assert "selector compact phone evidence:" in source
+    assert "candidate-local chars=" in source
     assert "format_batch(decisions)" in source
     assert "evidence_by_slot=evidence" in source
     assert "phone evidence attached to" in source

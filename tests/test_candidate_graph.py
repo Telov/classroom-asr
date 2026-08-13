@@ -1,4 +1,4 @@
-from classroom_asr.rover import build_graph, fuse, realizable_oracle_tokens, NULL
+from classroom_asr.candidate_graph import build_graph, realizable_oracle_tokens, NULL
 from classroom_asr.normalize import Normalizer
 from classroom_asr.metrics import score
 
@@ -9,33 +9,16 @@ def _words(graph):
     return [s for s in graph if s.kind == "word"]
 
 
-def test_majority_fixes_a_substitution():
-    # two branches say "went", one says "want" -> vote picks "went"
-    out = fuse(["i went to the store", "i want to the store", "i went to the store"], norm=N)
-    assert out == "i went to the store"
+def test_designated_backbone_is_the_graph_pivot():
+    graph = build_graph(
+        [N.tokens("qwen short"), N.tokens("another much longer transcript")], pivot_index=0)
+    assert [slot.pivot for slot in graph if slot.kind == "word"] == ["qwen", "short"]
 
 
-def test_majority_deletion_drops_a_word():
-    # pivot (longest) has "really"; the other two dropped it -> NULL wins, word dropped
-    out = fuse(["i really went home", "i went home", "i went home"], norm=N)
-    assert out == "i went home"
-
-
-def test_pivot_keeps_word_on_a_tie():
-    # 1 keep vs 1 drop is a tie -> conservative: keep the pivot's word
-    out = fuse(["i really went home", "i went home"], norm=N)
-    assert out == "i really went home"
-
-
-def test_fusion_beats_the_best_single_branch():
-    ref = "the quick brown fox jumps"
-    a = "the quick brown box jumps"      # 1 sub (fox->box)
-    b = "the quick brown fox jumped"     # 1 sub (jumps->jumped)
-    c = "the quick brown fox jumps"      # perfect
-    fused = fuse([a, b, c], norm=N)
-    assert fused == ref                  # majority recovers both -> 0 WER
-    assert score(ref, fused, norm=N).wer == 0.0
-    assert score(ref, a, norm=N).wer > 0.0
+def test_anchor_is_backbone_word_or_no_insertion():
+    graph = build_graph(
+        [N.tokens("i went home"), N.tokens("i really want home")], pivot_index=0)
+    assert [slot.anchor() for slot in graph] == [None, "i", None, "went", None, "home", None]
 
 
 def test_graph_marks_agreement():
@@ -73,7 +56,5 @@ def test_oracle_recovers_a_pivot_deletion_from_an_insertion_slot():
     assert oracle == "i really do"
 
 
-def test_empty_and_single():
-    assert fuse([], norm=N) == ""
-    assert fuse(["", "  "], norm=N) == ""
-    assert fuse(["only one branch here"], norm=N) == "only one branch here"
+def test_empty_graph():
+    assert build_graph([]) == []

@@ -1,16 +1,14 @@
-"""Reference-free confusion network + ROVER fusion over whole-recording branch transcripts.
+"""Reference-free candidate alignment over whole-recording branch transcripts.
 
 A real system has no reference, so it builds the per-position candidate set by aligning the
 branches to **each other**, then chooses. This module is that substrate:
 
-* :func:`build_graph` aligns every branch to a pivot (the most complete one) and produces an
+* :func:`build_graph` aligns every branch to a designated primary pivot (or the longest one for
+  generic callers) and produces an
   interleaved **confusion network**: a ``"word"`` slot per pivot position *and* an ``"ins"`` slot
   for every gap between them. A word another branch heard where the pivot didn't lands in the
   adjacent ``"ins"`` slot, so it stays selectable (it is not silently discarded). ``NULL`` (emit
   nothing) is a candidate in every slot.
-* :func:`fuse` is the deterministic default selector — ROVER majority vote over all slots — a
-  strong no-LLM baseline that also settles the confident, agreeing spans (§12.5). The LLM judge
-  is a drop-in ``chooser`` that overrides only the uncertain slots.
 * :func:`realizable_oracle_tokens` — the **honest** ceiling: for a given reference it builds an
   actual transcript by choosing, per slot, the candidate that best matches the reference
   (including emitting an ``"ins"`` candidate to recover a word the pivot dropped, or ``NULL`` to
@@ -28,7 +26,6 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from .metrics import Op, align
-from .normalize import DEFAULT, Normalizer
 
 NULL = None  # a slot candidate meaning "emit nothing here"
 
@@ -44,19 +41,21 @@ class Slot:
         """True when every branch offered the same candidate (nothing to decide)."""
         return len(self.votes) == 1
 
-    def winner(self) -> str | None:
-        """Majority vote. Ties break toward the conservative default: keep the pivot word on a
-        ``"word"`` slot, insert nothing on an ``"ins"`` slot."""
-        default = self.pivot if self.kind == "word" else NULL
-        return max(self.votes.items(), key=lambda kv: (kv[1], kv[0] == default))[0]
+    def anchor(self) -> str | None:
+        """The primary-backbone value: pivot word, or no insertion for a gap slot."""
+        return self.pivot if self.kind == "word" else NULL
 
 
-def build_graph(token_lists: list[list[str]]) -> list[Slot]:
-    """Interleaved confusion network: ``ins[0], word[0], ins[1], word[1], …, word[P-1], ins[P]``."""
+def build_graph(token_lists: list[list[str]], *, pivot_index: int | None = None) -> list[Slot]:
+    """Interleaved candidate graph.
+
+    ``pivot_index`` anchors the graph to a designated primary backbone (Qwen in the production
+    path). When omitted, the legacy longest-hypothesis behavior is retained for generic callers.
+    """
     lists = [t for t in token_lists if t]
     if not lists:
         return []
-    pivot = max(lists, key=len)                       # most complete branch anchors the network
+    pivot = (lists[pivot_index] if pivot_index is not None else max(lists, key=len))
     P = len(pivot)
     word_votes = [Counter() for _ in range(P)]
     ins_votes = [Counter() for _ in range(P + 1)]
@@ -84,26 +83,6 @@ def build_graph(token_lists: list[list[str]]) -> list[Slot]:
         slots.append(Slot("word", pivot[i], word_votes[i]))
     slots.append(Slot("ins", None, ins_votes[P]))
     return slots
-
-
-def _emit(tok, out: list[str]) -> None:
-    if tok is not NULL:
-        out.extend(str(tok).split())                  # "ins" candidates may be multi-word phrases
-
-
-def select(slots: list[Slot], chooser=None) -> list[str]:
-    """Assemble a token list. ``chooser(slot) -> token|NULL`` overrides the majority vote."""
-    pick = chooser or (lambda s: s.winner())
-    out: list[str] = []
-    for s in slots:
-        _emit(pick(s), out)
-    return out
-
-
-def fuse(transcripts, *, norm: Normalizer = DEFAULT, chooser=None) -> str:
-    """Fuse whole-recording branch transcripts into one string via the confusion network."""
-    token_lists = [norm.tokens(t) for t in transcripts if t and t.strip()]
-    return " ".join(select(build_graph(token_lists), chooser)).strip()
 
 
 # --------------------------------------------------------------------------- #

@@ -550,11 +550,13 @@ def realizable_oracle_wer(pool):
     # Honest ceiling: per interview build the confusion network from all branches, then pick the
     # per-slot candidate that best matches the reference -> a REAL transcript, scored with full WER
     # (insertions included). This is what a perfect selector over this candidate graph could reach.
-    from classroom_asr.rover import build_graph as _bg, realizable_oracle_tokens as _roracle
+    from classroom_asr.candidate_graph import build_graph as _bg, realizable_oracle_tokens as _roracle
     E = R = 0
     for i, rt in enumerate(_reftok):
         tls = [t for t in (SCORE.tokens(h[i] or "") for h in pool) if t]
-        g = _bg(tls)
+        # ``pool`` is ordered with the primary Qwen transcript first.  Anchor the graph to that
+        # transcript so the oracle measures the exact candidate graph seen by the selector.
+        g = _bg(tls, pivot_index=0)
         pivot = [s.pivot for s in g if s.kind == "word"]
         ops = Levenshtein.opcodes(pivot, rt).as_list()      # fast rapidfuzz pivot<->ref alignment
         E += Levenshtein.distance(rt, _roracle(g, rt, opcodes=ops)); R += len(rt)
@@ -945,37 +947,50 @@ else:
     for w, n in floor.most_common(30):
         print(f"   {w!r:16} x{n:<4} [{cat(w)}]")
 """),
-    md("""## 11.6 Selection — deterministic ROVER fusion (the LLM selector's substrate)
-The **baseline** (branch A) is one branch alone; the **realizable oracle** is the best WER a
-perfect selector could reach *over this candidate graph* — a real assembled transcript scored
-with full WER (insertions included), so it's an honest ceiling, unlike the recall floor (§11.5).
-A real system has no reference, so it aligns the branches into a **confusion network** (word
-slots + insertion slots, so a word only some branches heard stays selectable) and votes:
-`rover.fuse` majority-votes it — a strong no-LLM baseline that settles the confident, agreeing
-spans (§12.5). The Qwen3.5-9B judge (§11.7) overrides only the *uncertain* slots; the fused
-number is what it has to beat, between baseline and the realizable oracle."""),
+    md("""## 11.6 Selection — Qwen-anchored candidate graph
+The **primary backbone** is Qwen3-ASR, as specified by the design. Other word recognizers supply
+alternatives at aligned word and insertion slots; they do not vote a separate consensus
+transcript into existence. The Qwen backbone therefore remains intact wherever the selector is
+not asked, abstains, or fails.
+
+The **realizable oracle** is the best WER a perfect selector could reach *over this same
+Qwen-anchored candidate graph* — a real assembled transcript scored with full WER (insertions
+included), so it is an honest ceiling unlike the recall floor (§11.5). Agreement between branches
+is still useful as an uncertainty signal, but majority-vote fusion is no longer a transcript
+variant or an acceptance target."""),
     code(r"""
-from classroom_asr.rover import fuse, build_graph
-# every whole-recording WORD branch we actually produced (phone branches are IPA, excluded)
-_wb = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
-_wb = [h for h in _wb if h and any(h)]
-fused = [fuse([h[k] for h in _wb], norm=SCORE) for k in range(len(interviews))]
-fused_wer = wer_of(fused)
-r_oracle = realizable_oracle_wer(pool)     # honest achievable ceiling over the candidate graph
-# how many slots the LLM would even be asked about (disagreement), vs frozen-confident ones
-_disagree = _total = 0
+from classroom_asr.candidate_graph import build_graph
+from classroom_asr.selector import build_decisions
+# Qwen is deliberately first: build_graph(..., pivot_index=0) and every selector fallback are
+# anchored to it. Phone branches are IPA evidence, not word candidates.
+_wb_named = [("Qwen3-ASR", globals().get("hyp_Z")),
+             ("Whisper", globals().get("hyp_A")),
+             ("GigaAM", globals().get("hyp_B")),
+             ("Voxtral", globals().get("hyp_C")),
+             ("VoxtralVerbatim", globals().get("hyp_VV")),
+             ("CrisperWhisper", globals().get("hyp_CW"))]
+_wb_named = [(name, h) for name, h in _wb_named if h and any(h)]
+if not _wb_named:
+    raise RuntimeError("no word-recognition branch produced a candidate transcript")
+backbone_name, backbone_hyps = _wb_named[0]
+if backbone_name != "Qwen3-ASR":
+    print(f"Qwen3-ASR unavailable; emergency backbone is {backbone_name}")
+_wb = [h for _, h in _wb_named]
+canonical = list(backbone_hyps)
+canonical_source = backbone_name
+canonical_wer = wer_of(canonical)
+r_oracle = realizable_oracle_wer(_wb)
+_decisions = _total = 0
 for k in range(len(interviews)):
-    for s in build_graph([SCORE.tokens(h[k]) for h in _wb if h[k]]):
-        _total += 1; _disagree += 0 if s.agreed else 1
-print(f"fused {len(_wb)} word branches")
-print(f"[FUSED (ROVER)  ] final WER={fused_wer:.3f}"
+    graph = build_graph([SCORE.tokens(h[k]) for h in _wb if h[k]], pivot_index=0)
+    _total += len(graph); _decisions += len(build_decisions(graph))
+print(f"Qwen-anchored graph from {len(_wb)} word branches: "
+      + ", ".join(name for name, _ in _wb_named))
+print(f"[BACKBONE       ] {backbone_name} WER={canonical_wer:.3f}"
       f"   vs baseline A={wer_of(hyp_A):.3f}  vs realizable oracle={r_oracle:.3f}"
       f"  (recall floor={recall_floor(pool):.3f})")
-_gap = wer_of(hyp_A) - r_oracle
-print(f"headroom captured by deterministic vote: "
-      f"{100*(wer_of(hyp_A)-fused_wer)/max(_gap,1e-9):.0f}% of the baseline->realizable-oracle gap")
-print(f"uncertain slots (what the LLM judge would see): {_disagree}/{_total} "
-      f"({100*_disagree/max(_total,1):.0f}%); the rest are frozen-confident (§12.5)")
+print(f"selector decisions: {_decisions}/{_total} aligned slots "
+      f"({100*_decisions/max(_total,1):.1f}%); every unselected slot keeps the backbone token")
 """),
     md("""## 11.7 Acoustic-evidence-aware local judge (Qwen3.5-9B) — first §14 slice
 **Scope, honestly:** this is still not the complete §14–15 whole-lesson selector. It receives
@@ -991,10 +1006,10 @@ candidate IDs for each span, batched across decisions. This is both structurally
 avoids hundreds of generated answer tokens. It runs in its own venv at full fp16 across both freed
 T4s (§21).
 
-**Shadow gate:** this first restricted-scoring run is diagnostic. ROVER remains the canonical
-transcript regardless of the shadow WER; promotion requires measured non-regression. The same
-forward-pass scores are also reassembled at several non-default logit-margin thresholds, giving a
-promotion curve without extra model inference or any reference-guided canonical choice."""),
+On a successful run, the constrained selector result is the canonical transcript. If selection
+fails, the canonical result remains the Qwen backbone. The same forward-pass scores are also
+reassembled at several non-default logit-margin thresholds for diagnostics only; references never
+choose the canonical threshold or transcript."""),
     code(r"""
 if USE_LLM_SELECTOR:
     import os, json, subprocess, tempfile, time
@@ -1003,7 +1018,8 @@ if USE_LLM_SELECTOR:
     # source, and selected output are derived per run and live in the ephemeral session temp dir.
     SEL_RUN = tempfile.mkdtemp(prefix="classroom_asr_selector_")
     SEL_WORKER = os.path.join(SEL_RUN, "sel_worker.py")
-    shadow_sel = None; shadow_wer = None; shadow_stats = None; shadow_threshold_wer = None
+    llm_selected = None; llm_selected_wer = None; selector_stats = None
+    selector_threshold_wer = None
     try:
         if _sel.get("thread") is not None: _sel["thread"].join()   # wait for the venv build (§2a)
         if _sel.get("err") is not None: raise _sel["err"]
@@ -1014,7 +1030,9 @@ if USE_LLM_SELECTOR:
 import sys, json, math, torch, transformers
 from rapidfuzz.distance import Levenshtein
 from transformers import AutoModelForMultimodalLM, AutoProcessor
+from phonemizer import phonemize
 import classroom_asr.selector as selector_module
+from classroom_asr.phonetics import best_phone_subsequence
 from classroom_asr.selector import (
     build_decisions, format_batch, select_graph_with_chooser,
 )
@@ -1024,8 +1042,10 @@ model_id, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
 data = json.load(open(inp))
 
 def _evidence_by_slot(branches, anchor_chunks, phone_chunks):
-    # Map ROVER slots to timestamped phone windows through a fast text-anchor alignment.
-    graph = selector_module.build_graph([SCORE.tokens(text) for text in branches if text])
+    # Map Qwen-anchored candidate slots to timestamped phone windows through a fast text-anchor
+    # alignment, then reduce each raw phone window to candidate-local pronunciation matches.
+    graph = selector_module.build_graph(
+        [SCORE.tokens(text) for text in branches if text], pivot_index=0)
     pivot = [slot.pivot for slot in graph if slot.kind == "word"]
     anchor, anchor_chunk = [], []
     for ci, chunk in enumerate(anchor_chunks or []):
@@ -1047,8 +1067,10 @@ def _evidence_by_slot(branches, anchor_chunks, phone_chunks):
             nearest = min(max(j0, 0), len(anchor) - 1)
             for pi in range(i0, i1): pivot_to_anchor[pi] = nearest
 
-    evidence = {}
-    for decision in build_decisions(graph):
+    decisions = build_decisions(graph)
+    paths_by_slot = {}
+    raw_chars = 0
+    for decision in decisions:
         slot = graph[decision.slot]
         pi = ((decision.slot - 1) // 2 if slot.kind == "word" else
               min(decision.slot // 2, len(pivot) - 1))
@@ -1056,16 +1078,75 @@ def _evidence_by_slot(branches, anchor_chunks, phone_chunks):
         if ai is None or not (0 <= ai < len(anchor_chunk)): continue
         chunk = anchor_chunks[anchor_chunk[ai]]
         start, end = float(chunk["start_s"]), float(chunk["end_s"])
-        lines = []
+        paths = []
         for phone_chunk in phone_chunks:
             if float(phone_chunk["end_s"]) <= start or float(phone_chunk["start_s"]) >= end:
                 continue
             for path in phone_chunk.get("paths", []):
                 ipa = (path.get("ipa") or "").strip()
                 if ipa:
-                    lines.append(f"{path.get('source','phone')} {path.get('id','p?')} "
-                                 f"(p={float(path.get('p',0.0)):.3f}): /{ipa}/")
-        if lines: evidence[decision.slot] = lines
+                    raw_chars += len(ipa)
+                    paths.append({"source": path.get("source", "phone"),
+                                  "id": path.get("id", "p?"),
+                                  "p": float(path.get("p", 0.0)), "ipa": ipa})
+        if paths:
+            paths_by_slot[decision.slot] = paths
+
+    # G2P every distinct candidate-in-context once. The selector never receives the full raw
+    # 24-second phone stream: it sees only the best local realized excerpt for each advertised
+    # candidate, plus an accent-aware phone similarity score.
+    phrase_by_choice = {}
+    phrases = set()
+    for decision in decisions:
+        for letter, token in decision.options:
+            if token is selector_module.NULL:
+                continue
+            phrase = " ".join([*decision.before[-1:], str(token), *decision.after[:1]])
+            phrase_by_choice[(decision.slot, letter)] = phrase
+            phrases.add(phrase)
+    ordered_phrases = sorted(phrases)
+    expected = phonemize(
+        ordered_phrases, language="en-us", backend="espeak", strip=True,
+        preserve_punctuation=False, with_stress=True, njobs=1)
+    if isinstance(expected, str):
+        expected = [expected]
+    ipa_by_phrase = dict(zip(ordered_phrases, expected))
+
+    evidence = {}
+    compact_chars = 0
+    for decision in decisions:
+        paths = paths_by_slot.get(decision.slot, [])
+        if not paths:
+            continue
+        lines = []
+        for letter, token in decision.options:
+            if token is selector_module.NULL:
+                continue
+            phrase = phrase_by_choice[(decision.slot, letter)]
+            expected_ipa = ipa_by_phrase.get(phrase, "")
+            best_by_source = {}
+            for path in paths:
+                similarity, excerpt = best_phone_subsequence(expected_ipa, path["ipa"], flank=4)
+                prior = best_by_source.get(path["source"])
+                if prior is None or similarity > prior[0]:
+                    best_by_source[path["source"]] = (similarity, excerpt, path)
+            matches = []
+            best_excerpt = ""
+            best_similarity = -1.0
+            for source, (similarity, excerpt, path) in sorted(best_by_source.items()):
+                matches.append(f"{source}={similarity:.3f}(p={path['p']:.3f})")
+                if similarity > best_similarity:
+                    best_similarity, best_excerpt = similarity, excerpt
+            if matches:
+                line = (f"{letter}={token} exp/{expected_ipa}/ " + " ".join(matches)
+                        + f" heard≈/{best_excerpt}/")
+                compact_chars += len(line)
+                lines.append(line)
+        if lines:
+            evidence[decision.slot] = lines
+    print(f"selector compact phone evidence: {len(evidence)}/{len(decisions)} decisions; "
+          f"raw-window IPA chars={raw_chars} candidate-local chars={compact_chars}",
+          file=sys.stderr, flush=True)
     return evidence, graph
 
 processor = AutoProcessor.from_pretrained(model_id)
@@ -1105,7 +1186,8 @@ for _letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
 
 _stats = {"prefill_attempts": 0, "forward_batches": 0, "decode_steps": 0,
           "prompt_tokens": 0, "completed_decisions": 0,
-          "oom_splits": 0, "overrides": 0, "evidenced_overrides": 0, "margins": []}
+          "oom_splits": 0, "backbone_overrides": 0,
+          "evidenced_backbone_overrides": 0, "margins": []}
 _decision_scores = {}
 _debugged = False
 _total_decisions = 0
@@ -1144,9 +1226,9 @@ def _score_once(decisions):
         margin = best_score - scored[1][2] if len(scored) > 1 else math.inf
         _stats["margins"].append(margin)
         if best_token != decision.default:
-            _stats["overrides"] += 1
+            _stats["backbone_overrides"] += 1
             if decision.evidence:
-                _stats["evidenced_overrides"] += 1
+                _stats["evidenced_backbone_overrides"] += 1
         _decision_scores[decision.slot] = (best_token, margin)
         choices[decision.slot] = best_token
         if not _debugged:
@@ -1216,8 +1298,8 @@ for interview_number, (graph, evidence) in enumerate(prepared, 1):
     text, nd, nc = select_graph_with_chooser(
         graph, score_choices, batch_size=24, evidence_by_slot=evidence)
     selected.append(text); tot_dec += nd; tot_chosen += nc; tot_evidenced += len(evidence)
-    # Reassemble margin-gated shadow variants without another model forward pass. This produces a
-    # promotion curve from the same scores; references are used only later for benchmark reporting.
+    # Reassemble margin-gated diagnostic variants without another model forward pass. The zero
+    # threshold is the canonical selector policy; references are only used later for reporting.
     for threshold in thresholds:
         gated = {slot: token for slot, (token, margin) in _decision_scores.items()
                  if margin >= threshold}
@@ -1231,25 +1313,24 @@ sorted_margins = sorted(finite_margins)
 def _quantile(values, fraction):
     return values[min(len(values) - 1, int(fraction * (len(values) - 1)))] if values else None
 stats = {"decisions": tot_dec, "scored": tot_chosen, "evidenced": tot_evidenced,
-         "overrides": _stats["overrides"], "prefill_attempts": _stats["prefill_attempts"],
+         "backbone_overrides": _stats["backbone_overrides"],
+         "prefill_attempts": _stats["prefill_attempts"],
          "forward_batches": _stats["forward_batches"],
          "decode_steps": _stats["decode_steps"], "prompt_tokens": _stats["prompt_tokens"],
-         "evidenced_overrides": _stats["evidenced_overrides"],
+         "evidenced_backbone_overrides": _stats["evidenced_backbone_overrides"],
          "oom_splits": _stats["oom_splits"],
          "mean_logit_margin": (sum(finite_margins) / len(finite_margins)
                                if finite_margins else None),
          "p10_logit_margin": _quantile(sorted_margins, 0.10),
          "median_logit_margin": _quantile(sorted_margins, 0.50)}
 print(f"selector restricted-scored {tot_chosen}/{tot_dec} contested slots; "
-      f"overrode ROVER in {_stats['overrides']}; phone evidence attached to "
+      f"overrode the Qwen backbone in {_stats['backbone_overrides']}; phone evidence attached to "
       f"{tot_evidenced}/{tot_dec}; forward batches={_stats['forward_batches']} "
       f"shared prompt tokens={_stats['prompt_tokens']} OOM splits={_stats['oom_splits']}",
       file=sys.stderr)
 json.dump({"selected": selected, "threshold_selected": threshold_selected, "stats": stats},
           open(outp, "w"))
 ''')
-        _wb2 = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
-        _wb2 = [h for h in _wb2 if h and any(h)]
         # Qwen's ~30 s timestamped text windows are the preferred retrieval anchor. If that branch
         # failed, fall back to another timestamped word branch; the phone windows remain immutable.
         _anchor_key = next((key for key, hyps in [
@@ -1257,7 +1338,9 @@ json.dump({"selected": selected, "threshold_selected": threshold_selected, "stat
             ("A whisper", hyp_A), ("A+B", hyp_B)] if hyps and any(hyps) and key in WINDOW_PARTS), None)
         _anchors = WINDOW_PARTS.get(_anchor_key, [[] for _ in interviews])
         _selector_input = {
-            "branch_transcripts": [[h[k] for h in _wb2] for k in range(len(interviews))],
+            # _wb is already Qwen-first. The worker preserves this order and anchors its graph to
+            # branch 0, so abstentions and non-decisions retain Qwen rather than a majority vote.
+            "branch_transcripts": [[h[k] for h in _wb] for k in range(len(interviews))],
             "anchor_chunks": _anchors,
             "phone_evidence": phone_evidence,
         }
@@ -1266,31 +1349,35 @@ json.dump({"selected": selected, "threshold_selected": threshold_selected, "stat
         json.dump(_selector_input, open(os.path.join(SEL_RUN, "in.json"), "w"))
         subprocess.run([SEL_VENV_PY, SEL_WORKER, SELECTOR_MODEL,
                         os.path.join(SEL_RUN, "in.json"), os.path.join(SEL_RUN, "out.json")], check=True)
-        _shadow_result = json.load(open(os.path.join(SEL_RUN, "out.json")))
-        shadow_sel = _shadow_result["selected"]
-        shadow_stats = _shadow_result["stats"]
-        shadow_wer = wer_of(shadow_sel)
-        shadow_threshold_wer = {
+        _selector_result = json.load(open(os.path.join(SEL_RUN, "out.json")))
+        llm_selected = _selector_result["selected"]
+        selector_stats = _selector_result["stats"]
+        llm_selected_wer = wer_of(llm_selected)
+        selector_threshold_wer = {
             threshold: round(wer_of(texts), 4)
-            for threshold, texts in _shadow_result["threshold_selected"].items()}
-        print(f"[LLM SHADOW     ] shadow WER={shadow_wer:.3f}"
-              f"   vs fused(ROVER)={fused_wer:.3f}  vs baseline A={wer_of(hyp_A):.3f}"
+            for threshold, texts in _selector_result["threshold_selected"].items()}
+        canonical = llm_selected
+        canonical_source = "constrained LLM selector"
+        canonical_wer = llm_selected_wer
+        print(f"[LLM SELECTED   ] canonical WER={llm_selected_wer:.3f}"
+              f"   vs Qwen backbone={wer_of(backbone_hyps):.3f}"
+              f"  vs baseline A={wer_of(hyp_A):.3f}"
               f"  vs realizable oracle={r_oracle:.3f}")
         gap = wer_of(hyp_A) - r_oracle
-        print(f"shadow captured {100*(wer_of(hyp_A)-shadow_wer)/max(gap,1e-9):.0f}% of the "
-              f"baseline->realizable-oracle gap   (delta vs ROVER: {shadow_wer-fused_wer:+.3f})")
-        print("shadow selector stats:", json.dumps(shadow_stats, sort_keys=True))
-        print("shadow non-default override margin curve (threshold -> WER):",
-              json.dumps(shadow_threshold_wer, sort_keys=True))
-        print("^ shadow only; canonical transcript remains FUSED (ROVER)")
+        print(f"selector captured {100*(wer_of(hyp_A)-llm_selected_wer)/max(gap,1e-9):.0f}% "
+              f"of the baseline->realizable-oracle gap; delta vs Qwen backbone: "
+              f"{llm_selected_wer-wer_of(backbone_hyps):+.3f}")
+        print("selector stats:", json.dumps(selector_stats, sort_keys=True))
+        print("diagnostic backbone-override margin curve (threshold -> WER):",
+              json.dumps(selector_threshold_wer, sort_keys=True))
     except Exception as e:
-        print("LLM shadow selector failed; canonical ROVER unaffected:", repr(e)[:500])
-    rec("+LLMSelectorShadow", time.time() - _sel_t0)
+        print(f"LLM selector failed; canonical transcript remains {backbone_name}:", repr(e)[:500])
+    rec("+LLMSelector", time.time() - _sel_t0)
 """),
     md("""## 12. Timings + save summary
 Persistent per-stage wall-times (every stage `⏱`-printed as it finished; here they're
 collected into one table) and the WER summary (branch WERs, recall floor, realizable oracle,
-canonical ROVER, and the non-canonical constrained-LLM shadow result)."""),
+Qwen backbone, and the canonical constrained-selector result when selection succeeds)."""),
     code(r"""
 import json
 # --- timing table (slowest first) ---
@@ -1307,19 +1394,20 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
            "branch_wer": res, "baseline_wer": res.get("A_whisper"),
            # honest metrics: recall_floor = fraction of ref words no branch produced (a recall
            # LOWER BOUND, ignores insertions); realizable_oracle = best full-WER a selector over
-           # the candidate graph could reach (a real transcript). ROVER is canonical in this run;
-           # the constrained LLM score is shadow-only and cannot alter the saved transcript.
+           # the Qwen-anchored candidate graph could reach (a real transcript).
            "candidate_recall_floor": round(recall_floor(pool), 4),
            "realizable_oracle_wer": round(r_oracle, 4) if "r_oracle" in dir() else None,
-           "fused_rover_wer": round(fused_wer, 4) if "fused_wer" in dir() else None,
-           "canonical_wer": round(fused_wer, 4) if "fused_wer" in dir() else None,
-           "llm_selected_wer": None,
-           "llm_scored_shadow_wer": (round(shadow_wer, 4)
-                                      if "shadow_wer" in dir() and shadow_wer is not None else None),
-           "llm_scored_shadow_stats": (shadow_stats
-                                        if "shadow_stats" in dir() else None),
-           "llm_scored_shadow_margin_wer": (shadow_threshold_wer
-                                             if "shadow_threshold_wer" in dir() else None),
+           "primary_backbone": backbone_name if "backbone_name" in dir() else None,
+           "qwen_backbone_wer": (round(wer_of(backbone_hyps), 4)
+                                  if "backbone_hyps" in dir() else None),
+           "canonical_source": canonical_source if "canonical_source" in dir() else None,
+           "canonical_wer": round(canonical_wer, 4) if "canonical_wer" in dir() else None,
+           "llm_selected_wer": (round(llm_selected_wer, 4)
+                                if "llm_selected_wer" in dir()
+                                and llm_selected_wer is not None else None),
+           "llm_selector_stats": selector_stats if "selector_stats" in dir() else None,
+           "llm_selector_margin_wer": (selector_threshold_wer
+                                       if "selector_threshold_wer" in dir() else None),
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
 try:   # recall-floor breakdown from §11.5 (defined only if the pool had branches)
     summary["recall_floor_by_category"] = dict(bycat.most_common())

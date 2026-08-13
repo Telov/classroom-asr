@@ -17,6 +17,13 @@
   transcript. The `NEW` escape hatch remains gated as described in the design document.
 - Candidate-oracle WER and the candidate recall floor are different metrics. Do not label the
   recall floor as WER or as a realizable transcript.
+- Qwen3-ASR is the primary word-transcript backbone. Align other word candidates to Qwen and keep
+  the Qwen token whenever the constrained selector is not asked, abstains, or fails. Do not create
+  or score a majority-vote/ROVER transcript variant; branch agreement is only an uncertainty
+  signal. On a successful run, the constrained selector output is the canonical transcript.
+- Feed the selector compact candidate-local phonetic evidence: expected pronunciation in local
+  context, accent-aware match scores, and localized realized-phone excerpts. Do not place entire
+  multi-second IPA windows in the LLM prompt.
 
 ## Document reading and project notes
 
@@ -62,7 +69,7 @@
   fresh Kaggle runtimes receive current package and notebook code. Still ask before force-pushing,
   rewriting published history, deleting remote refs, or making other destructive remote changes.
 - After changing notebook structure, regenerate
-  `colab/CORAAL_candidate_oracle.ipynb` with `python scripts/build_colab_notebook.py`.
+  `colab/CORAAL_candidate_oracle_payload.ipynb` with `python scripts/build_colab_notebook.py`.
 - Run `python -m pytest -q` for the full suite. Also compile embedded/generated worker code when it
   changes and verify the notebook contains no stale execution output.
 - Preserve unrelated user changes in a dirty worktree.

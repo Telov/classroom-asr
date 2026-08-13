@@ -94,3 +94,43 @@ def phonetic_similarity(ipa_a: str, ipa_b: str) -> float:
         return 1.0
     dist = phone_edit_distance(a, b)
     return max(0.0, 1.0 - dist / denom)
+
+
+def best_phone_subsequence(
+    expected_ipa: str, realized_ipa: str, *, flank: int = 4
+) -> tuple[float, str]:
+    """Align an expected pronunciation to its best local region in a longer phone stream.
+
+    The realized input may cover a whole acoustic window containing neighbouring words. Prefix
+    and suffix phones are therefore free, while edits inside the selected region use the same
+    accent-aware costs as :func:`phonetic_similarity`. The returned excerpt includes a small
+    phone flank for judge context but never returns the full long window.
+    """
+    expected = strip_ipa(expected_ipa)
+    realized = strip_ipa(realized_ipa)
+    if not expected or not realized:
+        return 0.0, ""
+
+    # Semi-global edit distance: matching may start/end anywhere in ``realized``. Alongside each
+    # cost retain the start index so the winning local excerpt can be recovered without a full
+    # O(m*n) backpointer matrix.
+    prev = [0.0] * (len(realized) + 1)
+    prev_start = list(range(len(realized) + 1))
+    for i, phone in enumerate(expected, 1):
+        cur = [float(i)] + [0.0] * len(realized)
+        cur_start = [0] + [0] * len(realized)
+        for j, observed in enumerate(realized, 1):
+            candidates = (
+                (prev[j - 1] + _sub_cost(phone, observed), prev_start[j - 1]),
+                (prev[j] + 1.0, prev_start[j]),       # expected phone deleted
+                (cur[j - 1] + 1.0, cur_start[j - 1]), # extra realized phone
+            )
+            cur[j], cur_start[j] = min(candidates, key=lambda item: item[0])
+        prev, prev_start = cur, cur_start
+
+    end = min(range(1, len(prev)), key=lambda j: prev[j])
+    start = min(prev_start[end], end)
+    aligned_len = max(1, end - start)
+    similarity = max(0.0, 1.0 - prev[end] / max(len(expected), aligned_len))
+    lo, hi = max(0, start - flank), min(len(realized), end + flank)
+    return similarity, "".join(realized[lo:hi])

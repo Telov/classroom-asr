@@ -43,7 +43,7 @@ def mbr_consensus(
     """Minimum-Bayes-risk consensus over text hypotheses (§12.4).
 
     Treats branch scores as a posterior over hypotheses and returns the
-    hypothesis minimizing expected WER against the rest — a ROVER/MBR-style
+    hypothesis minimizing expected WER against the rest — an MBR-style
     "safe" candidate. Returns ``None`` for an empty input.
     """
     if not hyps:
