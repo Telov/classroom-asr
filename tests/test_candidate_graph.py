@@ -97,5 +97,21 @@ def test_oracle_cannot_union_parts_of_mutually_exclusive_insertion_candidates():
     assert score("a b c x", " ".join(oracle), norm=N).wer == 0.25
 
 
+def test_adding_a_branch_cannot_worsen_the_realizable_oracle():
+    ref = N.tokens("i really want to go")
+    pivot = N.tokens("i want go")
+    first_alternative = N.tokens("i really want go")
+    second_alternative = N.tokens("i want to go")
+
+    smaller = build_graph([pivot, first_alternative], pivot_index=0)
+    larger = build_graph([pivot, first_alternative, second_alternative], pivot_index=0)
+    smaller_text = " ".join(realizable_oracle_tokens(smaller, ref))
+    larger_text = " ".join(realizable_oracle_tokens(larger, ref))
+
+    assert score(" ".join(ref), larger_text, norm=N).wer <= score(
+        " ".join(ref), smaller_text, norm=N
+    ).wer
+
+
 def test_empty_graph():
     assert build_graph([]) == []

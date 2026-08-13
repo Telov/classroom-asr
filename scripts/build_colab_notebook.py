@@ -1281,9 +1281,11 @@ for _count in range(len(_optional_indices) + 1):
         branch_subset_results.append({
             "branches": _names,
             "branch_count": len(_names),
-            "realizable_oracle_wer": round(realizable_oracle_wer(_subset_pool), 4),
-            "recall_floor": round((_R - len(_subset_hits)) / max(_R, 1), 4),
-            "estimated_stage_seconds": round(_cost, 1),
+            # Keep full precision for Pareto dominance. Rounding before comparison can erase a
+            # real small WER gain or make two nearly equal runtimes dominate one another by typo.
+            "realizable_oracle_wer": realizable_oracle_wer(_subset_pool),
+            "recall_floor": (_R - len(_subset_hits)) / max(_R, 1),
+            "estimated_stage_seconds": _cost,
         })
 
 branch_subset_pareto = []
@@ -1298,7 +1300,12 @@ for _candidate in sorted(branch_subset_results,
         for other in branch_subset_results
     )
     if not _dominated:
-        branch_subset_pareto.append(_candidate)
+        branch_subset_pareto.append({
+            **_candidate,
+            "realizable_oracle_wer": round(_candidate["realizable_oracle_wer"], 4),
+            "recall_floor": round(_candidate["recall_floor"], 4),
+            "estimated_stage_seconds": round(_candidate["estimated_stage_seconds"], 1),
+        })
 print("\n=== Qwen-anchored accuracy/runtime Pareto frontier (all branch subsets) ===")
 print("stage_s  oracle  floor  branches")
 for _row in branch_subset_pareto:

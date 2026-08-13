@@ -338,7 +338,9 @@ def test_all_qwen_anchored_branch_subsets_emit_an_accuracy_runtime_pareto_fronti
     assert '"Qwen3-ASR": ("A+B+Qwen3",)' in source
     assert '"Voxtral": ("Voxtral load (shared)", "+Voxtral")' in source
     assert '"CrisperQwenVerbatize": ("+CrisperWhisper",)' in source
-    assert "branch_subset_pareto.append(_candidate)" in source
+    assert '"realizable_oracle_wer": realizable_oracle_wer(_subset_pool)' in source
+    assert 'round(_candidate["realizable_oracle_wer"], 4)' in source
+    assert "branch_subset_pareto.append({" in source
     assert '"branch_subset_pareto"' in source
 
 
