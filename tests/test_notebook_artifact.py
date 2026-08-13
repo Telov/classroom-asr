@@ -373,6 +373,9 @@ def test_summary_identifies_run_and_reports_each_branch_error_shape():
     assert '"overall_wall_seconds"' in source
     assert '"resolved_hf_revisions"' in source
     assert '"branch_metrics": branch_metrics' in source
+    assert 'status = ("disabled" if not enabled else "empty" if produced == 0' in source
+    assert 'else "ok" if produced == len(interviews) else "partial")' in source
+    assert '"branch_status": branch_status' in source
     assert '"run_fingerprint": run_fingerprint' in source
 
 

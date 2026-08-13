@@ -1719,14 +1719,28 @@ print(f"   {sum(dt for _, dt in TIMINGS):7.1f}s  TOTAL (sum of tracked stages)")
 
 res = {}
 branch_metrics = {}
-for name, h in [("A_whisper_turbo", hyp_A), ("ANV_whisper_turbo_no_vad", hyp_ANV),
-                ("A3_whisper_large_v3", hyp_A3),
-                ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_voxtral", hyp_C),
-                ("VV_voxtral_verbatim", hyp_VV), ("CW_crisperwhisper", hyp_CW),
-                ("CWV_crisper_qwen_verbatize", hyp_CWV)]:
+branch_status = {}
+_branch_outputs = [
+    ("A_whisper_turbo", hyp_A, True),
+    ("ANV_whisper_turbo_no_vad", hyp_ANV, USE_WHISPER_NO_VAD_SHADOW),
+    ("A3_whisper_large_v3", hyp_A3, USE_WHISPER_LARGE_V3),
+    ("B_ctc", hyp_B, USE_CTC),
+    ("Z_qwen3", hyp_Z, USE_QWEN3ASR),
+    ("C_voxtral", hyp_C, USE_VOXTRAL),
+    ("VV_voxtral_verbatim", hyp_VV, USE_VOXTRAL_VERBATIM),
+    ("CW_crisperwhisper", hyp_CW, USE_CRISPER),
+    ("CWV_crisper_qwen_verbatize", hyp_CWV, USE_CRISPER_VERBATIZE),
+]
+for name, h, enabled in _branch_outputs:
+    produced = sum(bool(text) for text in (h or []))
+    status = ("disabled" if not enabled else "empty" if produced == 0
+              else "ok" if produced == len(interviews) else "partial")
+    branch_status[name] = {"enabled": bool(enabled), "status": status,
+                           "interviews_with_text": produced,
+                           "interviews_total": len(interviews)}
     if h and any(h):
         branch_metrics[name] = error_counts_of(h)
-        branch_metrics[name]["interviews_with_text"] = sum(bool(text) for text in h)
+        branch_metrics[name]["interviews_with_text"] = produced
         branch_metrics[name]["interviews_total"] = len(interviews)
         res[name] = branch_metrics[name]["wer"]
 
@@ -1788,6 +1802,7 @@ run_fingerprint = {
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",
            "branch_wer": res, "branch_metrics": branch_metrics,
+           "branch_status": branch_status,
            "baseline_wer": res.get("A_whisper_turbo"),
            # honest metrics: recall_floor = fraction of ref words no branch produced (a recall
            # LOWER BOUND, ignores insertions); realizable_oracle = best full-WER a selector over
