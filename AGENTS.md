@@ -58,9 +58,9 @@
 
 - Make coherent Git commits habitually after changes are verified. Keep generated notebook changes
   in the same commit as their generator source and tests.
-- Do not push, rewrite history, or otherwise mutate remote state without authorization. Remember
-  that Kaggle installs package code from `https://github.com/Telov/classroom-asr`, so unpushed local
-  package changes are not available to a fresh Kaggle runtime.
+- Push verified commits to `origin/main` routinely without asking for separate authorization, so
+  fresh Kaggle runtimes receive current package and notebook code. Still ask before force-pushing,
+  rewriting published history, deleting remote refs, or making other destructive remote changes.
 - After changing notebook structure, regenerate
   `colab/CORAAL_candidate_oracle.ipynb` with `python scripts/build_colab_notebook.py`.
 - Run `python -m pytest -q` for the full suite. Also compile embedded/generated worker code when it
