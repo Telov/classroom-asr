@@ -15,7 +15,7 @@ from pathlib import Path
 
 GITHUB_REPO = "Telov/classroom-asr"
 ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "colab" / "CORAAL_candidate_oracle.ipynb"
+OUT = ROOT / "colab" / "CORAAL_candidate_oracle_payload.ipynb"
 
 
 def md(text: str) -> dict:
@@ -62,6 +62,7 @@ Run All). If it ever still stops here, just click Run All once more."""),
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
 os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"     # current high-throughput Hub/Xet downloads
+ASR_GIT_REF = os.environ.get("CLASSROOM_ASR_GIT_REF", "main")
 # Persist ONLY the small CrisperWhisper venv across Kaggle sessions (Settings -> Persistence
 # -> "Files only" keeps /kaggle/working). Model WEIGHTS are deliberately NOT persisted here:
 # the persisted dir is capped (~20 GB) but the full model set is ~26 GB, so redirecting the HF
@@ -81,7 +82,10 @@ torch.backends.cudnn.allow_tf32 = True
 # loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
 # versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
 %pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz virtualenv pyyaml typeguard
-%pip -q install "transformers==4.57.6" "accelerate==1.12.0" "git+https://github.com/{GITHUB_REPO}.git"
+import subprocess, sys
+subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                "transformers==4.57.6", "accelerate==1.12.0",
+                f"git+https://github.com/{GITHUB_REPO}.git@{{ASR_GIT_REF}}"], check=True)
 # NOTE: CrisperWhisper is NOT installed here — its CT2 fork replaces the `ctranslate2`
 # module and would clobber faster-whisper (branch A). It runs in an isolated venv (§9a).
 import classroom_asr, os
@@ -1123,7 +1127,8 @@ print(json.dumps(summary, indent=2))
 ]
 
 NB = {"cells": CELLS,
-      "metadata": {"colab": {"provenance": [], "gpuType": "T4"}, "accelerator": "GPU",
+      "metadata": {"classroom_asr": {"kind": "payload", "schema": 1},
+                   "colab": {"provenance": [], "gpuType": "T4"}, "accelerator": "GPU",
                    "kernelspec": {"name": "python3", "display_name": "Python 3"},
                    "language_info": {"name": "python"}},
       "nbformat": 4, "nbformat_minor": 0}
