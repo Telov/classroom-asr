@@ -351,9 +351,14 @@ def _prefetch():
         (SELECTOR_MODEL, USE_LLM_SELECTOR, None)] if on]
     for r, revision in repos:
         try:
-            # The runtime is PyTorch-only. Several wav2vec2 repositories also contain complete
-            # TensorFlow and Flax copies (2.52 GB combined for branch B); never download them.
-            snapshot_download(r, revision=revision, ignore_patterns=["*.h5", "*.msgpack"])
+            # The runtime prefers safetensors. Several repositories also carry duplicate legacy
+            # PyTorch, TensorFlow, Flax, or training checkpoints. Exclude those from best-effort
+            # prefetch; a loader can still fetch a truly required file lazily. Do not exclude
+            # generic `model.bin`, which is the actual CTranslate2 format.
+            snapshot_download(
+                r, revision=revision,
+                ignore_patterns=["pytorch_model.bin", "*.pt", "*.ckpt", "*.h5", "*.msgpack"],
+            )
         except Exception as e: print("prefetch skip", r, repr(e)[:80])
 threading.Thread(target=_prefetch, daemon=True).start()
 print("model prefetch: started in background")

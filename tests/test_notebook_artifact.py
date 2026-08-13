@@ -265,10 +265,8 @@ def test_selector_probe_allows_slow_cold_imports_and_surfaces_the_real_failure()
 def test_prefetch_excludes_unused_framework_weights_and_prioritizes_first_branch():
     source = _notebook_source()
 
-    assert (
-        'snapshot_download(r, revision=revision, ignore_patterns=["*.h5", "*.msgpack"])'
-        in source
-    )
+    assert '"pytorch_model.bin", "*.pt", "*.ckpt", "*.h5", "*.msgpack"' in source
+    assert "generic `model.bin`" in source
     prefetch_repos = source.index("repos = [(m, revision) for m, on, revision in [")
     assert source.index("(FW_MODEL, True, None)", prefetch_repos) < source.index(
         "(VOXTRAL_MODEL, USE_VOXTRAL", prefetch_repos
