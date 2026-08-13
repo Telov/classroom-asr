@@ -12,6 +12,10 @@ def _notebook_source() -> str:
     return "\n".join("".join(cell.get("source", [])) for cell in notebook["cells"])
 
 
+def _notebook() -> dict:
+    return json.loads(NOTEBOOK.read_text(encoding="utf-8"))
+
+
 def test_selector_worker_does_not_require_new_helpers_from_installed_package():
     source = _notebook_source()
 
@@ -23,7 +27,26 @@ def test_selector_worker_does_not_require_new_helpers_from_installed_package():
 
 def test_embedded_selector_worker_is_valid_python():
     source = _notebook_source()
-    match = re.search(r"f\.write\('''\n(.*?)\n'''\)", source, re.DOTALL)
+    workers = re.findall(r"f\.write\(r?'''\n(.*?)\n'''\)", source, re.DOTALL)
+    worker = next((text for text in workers if "parse_batch_compat" in text), None)
 
-    assert match, "selector worker source was not found in the generated notebook"
-    compile(match.group(1), "sel_worker.py", "exec")
+    assert worker, "selector worker source was not found in the generated notebook"
+    compile(worker, "sel_worker.py", "exec")
+
+
+def test_every_generated_code_cell_is_valid_python():
+    for index, cell in enumerate(_notebook()["cells"]):
+        if cell.get("cell_type") == "code":
+            compile("".join(cell.get("source", [])), f"notebook_cell_{index}.py", "exec")
+
+
+def test_notebook_has_quota_friendly_iteration_path():
+    source = _notebook_source()
+
+    assert 'SELECTOR_BUNDLE_PATH = next(' in source
+    assert '"schema_version": 1' in source
+    assert '"references": refs' in source
+    assert '"branches": {name: values' in source
+    assert "RUN_PHONE_DIAGNOSTICS = False" in source
+    assert "SELECTOR_SMOKE_TEST = not SELECTOR_ONLY" in source
+    assert 'str(SELECTOR_MAX_LLM_CALLS)' in source

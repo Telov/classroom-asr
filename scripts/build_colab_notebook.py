@@ -63,6 +63,18 @@ Run All). If it ever still stops here, just click Run All once more."""),
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # less fragmentation OOM
 os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"     # current high-throughput Hub/Xet downloads
+# A prior full run emits this small artifact before the selector starts. Preserve it with Kaggle
+# Files persistence, or attach it as a dataset on a later session: the notebook then auto-enters
+# selector-only mode and skips every acoustic model and audio download.
+from pathlib import Path as _Path
+FORCE_FULL_RUN = False   # set True to ignore a preserved/attached bundle and rerun all acoustics
+_bundle_candidates = [
+    _Path("/kaggle/working/selector_iteration_bundle.json"),
+    *sorted(_Path("/kaggle/input").glob("**/selector_iteration_bundle.json"))
+] if _Path("/kaggle").exists() else [_Path("selector_iteration_bundle.json")]
+SELECTOR_BUNDLE_PATH = next((str(p) for p in _bundle_candidates if p.is_file()), "")
+SELECTOR_ONLY = bool(SELECTOR_BUNDLE_PATH) and not FORCE_FULL_RUN
+print("run mode:", "SELECTOR ONLY from " + SELECTOR_BUNDLE_PATH if SELECTOR_ONLY else "FULL ACOUSTIC")
 # Persist ONLY the small CrisperWhisper venv across Kaggle sessions (Settings -> Persistence
 # -> "Files only" keeps /kaggle/working). Model WEIGHTS are deliberately NOT persisted here:
 # the persisted dir is capped (~20 GB) but the full model set is ~26 GB, so redirecting the HF
@@ -78,11 +90,18 @@ import torch
 # TF32 matmul: free speedup on Ampere+ (Colab A100/L4), no-op on T4/Turing; inference-safe.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-# Everything up front (mid-notebook installs don't reliably import on Kaggle). Two calls:
-# loose deps first, then PIN transformers/accelerate LAST so qwen-asr's required
-# versions win over anything crisperwhisper/others pull in (4.57.6 also fits Whisper/Voxtral).
-%pip -q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr soundfile rapidfuzz virtualenv pyyaml typeguard
-%pip -q install "transformers==4.57.6" "accelerate==1.12.0" "git+https://github.com/{GITHUB_REPO}.git"
+# A selector-only iteration needs no audio stack. A full run installs everything up front
+# (mid-notebook installs don't reliably import on Kaggle), then pins qwen-asr's versions last.
+if SELECTOR_ONLY:
+    get_ipython().run_line_magic(
+        "pip", '-q install rapidfuzz virtualenv "git+https://github.com/{GITHUB_REPO}.git"')
+else:
+    get_ipython().run_line_magic(
+        "pip", '-q install "mistral-common[audio]" phonemizer faster-whisper qwen-asr '
+               'soundfile rapidfuzz virtualenv pyyaml typeguard')
+    get_ipython().run_line_magic(
+        "pip", '-q install "transformers==4.57.6" "accelerate==1.12.0" '
+               '"git+https://github.com/{GITHUB_REPO}.git"')
 # NOTE: CrisperWhisper is NOT installed here — its CT2 fork replaces the `ctranslate2`
 # module and would clobber faster-whisper (branch A). It runs in an isolated venv (§9a).
 import classroom_asr, os
@@ -114,11 +133,14 @@ WHISPER_VAD    = True      # skip silence (less hallucination); off = keep quiet
 USE_CTC        = True;  CTC_MODEL      = "facebook/wav2vec2-large-960h-lv60-self"
 USE_QWEN3ASR   = True;  QWEN3ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 USE_VOXTRAL    = True;  VOXTRAL_MODEL  = "mistralai/Voxtral-Mini-3B-2507"
-USE_PHONE      = True;  PHONE_MODEL    = "facebook/wav2vec2-lv-60-espeak-cv-ft"
+# Phone recognizers are diagnostics on CORAAL: their IPA never enters the word graph or selector.
+# Keep them off the critical path; enable only for a dedicated pronunciation-path run.
+RUN_PHONE_DIAGNOSTICS = False
+USE_PHONE      = RUN_PHONE_DIAGNOSTICS;  PHONE_MODEL = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 # PhoneticXeus (§7.3/§10): the design's named universal phone recognizer (XEUS + self-cond CTC,
 # SOTA accented-English IPA). Phone branches output realized IPA (unscored on CORAAL — no
 # phonetic reference); they feed the OOV/nonce recovery route (phone lattice -> P2G), not word WER.
-USE_PHONETIC_XEUS = True;  PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
+USE_PHONETIC_XEUS = RUN_PHONE_DIAGNOSTICS;  PHONETIC_XEUS_MODEL = "changelinglab/PhoneticXeus"
 # Verbatim branches (keep um/uh/false starts — the deletions clean models can't recover):
 USE_CRISPER          = True;  CRISPER_SIZE = "large"   # turbo|large|medium|small (+ "_pro")
 USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbatim
@@ -126,11 +148,24 @@ USE_VOXTRAL_VERBATIM = True             # Voxtral, prompted to transcribe verbat
 # the contested slots (confident spans frozen, §12.5), driving the final transcript from the
 # branch baseline toward the oracle floor. Qwen3.5-9B = design's "default first judge" (§14.2);
 # runs isolated (own venv, newer transformers) in fp16 across both freed T4s. NEW hatch off (§14.5).
-USE_LLM_SELECTOR = True;  SELECTOR_MODEL = "Qwen/Qwen3.5-9B"
+USE_LLM_SELECTOR = True
+# Default quota-friendly workflow: a full acoustic run does only a cheap selector smoke test and
+# emits the bundle; the next selector-only session runs the real 9B judge. Set this True only when
+# you explicitly want acoustics + the full judge in one long session.
+RUN_FULL_SELECTOR_DURING_ACOUSTIC_RUN = False
+SELECTOR_SMOKE_TEST = not SELECTOR_ONLY and not RUN_FULL_SELECTOR_DURING_ACOUSTIC_RUN
+# 0.8B + one batch validates install, model load, prompt, generation, parsing, and output plumbing.
+# It is NOT a quality result; selector-only mode and the one-shot override above use the real 9B.
+SELECTOR_MODEL = "Qwen/Qwen3.5-0.8B" if SELECTOR_SMOKE_TEST else "Qwen/Qwen3.5-9B"
+SELECTOR_MAX_LLM_CALLS = 1 if SELECTOR_SMOKE_TEST else 0   # 0 = all contested-slot batches
 # Pin the selector-only environment independently from qwen-asr's older main-kernel stack.
 # These are the versions validated by this notebook; the fingerprint in §2a upgrades a persisted
 # selector venv whenever either pin changes instead of silently reusing stale packages.
 SELECTOR_TRANSFORMERS = "5.15.0"; SELECTOR_ACCELERATE = "1.14.0"
+
+if SELECTOR_ONLY:       # hypotheses come from the bundle loaded in §4
+    USE_CTC = USE_QWEN3ASR = USE_VOXTRAL = USE_VOXTRAL_VERBATIM = USE_CRISPER = False
+    USE_PHONE = USE_PHONETIC_XEUS = False
 
 # Speed (all quality-neutral): the LLM branches auto-pick fp16 on T4 (Turing has no bf16
 # tensor cores — that was most of the slowness; fp16 is the same inference path Whisper
@@ -264,7 +299,7 @@ def _prefetch():
         (VOXTRAL_MODEL, USE_VOXTRAL or USE_VOXTRAL_VERBATIM), (QWEN3ASR_MODEL, USE_QWEN3ASR),
         (f"nyralabs/CrisperWhisper2.0_{CRISPER_SIZE}", USE_CRISPER),   # venv reads same HF cache
         (SELECTOR_MODEL, USE_LLM_SELECTOR),                            # §14 LLM judge (big, prefetch early)
-        (FW_MODEL, True), (CTC_MODEL, USE_CTC), (PHONE_MODEL, USE_PHONE)] if on]
+        (FW_MODEL, not SELECTOR_ONLY), (CTC_MODEL, USE_CTC), (PHONE_MODEL, USE_PHONE)] if on]
     for r in repos:                                   # biggest first (Voxtral) for max overlap
         try: snapshot_download(r)
         except Exception as e: print("prefetch skip", r, repr(e)[:80])
@@ -276,7 +311,10 @@ print("model prefetch: started in background")
 import os, tarfile, urllib.request, ssl
 from pathlib import Path
 _dl0 = _time.time()
-os.makedirs("coraal/txt", exist_ok=True); os.makedirs("coraal/audio", exist_ok=True)
+if SELECTOR_ONLY:
+    print("selector-only: skipping CORAAL download/extraction")
+else:
+    os.makedirs("coraal/txt", exist_ok=True); os.makedirs("coraal/audio", exist_ok=True)
 
 def fetch(url, dest):
     if os.path.exists(dest): print("cached", dest); return
@@ -285,22 +323,24 @@ def fetch(url, dest):
     with urllib.request.urlopen(url, context=ctx) as r, open(dest, "wb") as f: f.write(r.read())
     print("  ->", os.path.getsize(dest)//1_000_000, "MB")
 
-fetch(f"{BASE}/{COMP}_textfiles_{VERSION}.tar.gz", "coraal/txt.tar.gz")
-fetch(f"{BASE}/{COMP}_audio_{AUDIO_PART}_{VERSION}.tar.gz", "coraal/audio.tar.gz")
-for tarball, dest in [("coraal/txt.tar.gz","coraal/txt"), ("coraal/audio.tar.gz","coraal/audio")]:
-    if any(Path(dest).iterdir()): continue
-    with tarfile.open(tarball) as t: t.extractall(dest, filter="data")
-print("transcripts:", len(list(Path('coraal/txt').rglob('*.txt'))),
-      "| wavs:", len(list(Path('coraal/audio').rglob('*.wav'))))
+if not SELECTOR_ONLY:
+    fetch(f"{BASE}/{COMP}_textfiles_{VERSION}.tar.gz", "coraal/txt.tar.gz")
+    fetch(f"{BASE}/{COMP}_audio_{AUDIO_PART}_{VERSION}.tar.gz", "coraal/audio.tar.gz")
+    for tarball, dest in [("coraal/txt.tar.gz","coraal/txt"), ("coraal/audio.tar.gz","coraal/audio")]:
+        if any(Path(dest).iterdir()): continue
+        with tarfile.open(tarball) as t: t.extractall(dest, filter="data")
+    print("transcripts:", len(list(Path('coraal/txt').rglob('*.txt'))),
+          "| wavs:", len(list(Path('coraal/audio').rglob('*.wav'))))
 rec("download+extract CORAAL", _time.time() - _dl0)
 """),
     md("## 4. Build interviews: full audio + full verbatim reference (~1h total)"),
     code(r"""
-import torchaudio
+import json
 from pathlib import Path
 from classroom_asr.data.coraal import parse_transcript, iter_transcripts
+if not SELECTOR_ONLY:
+    import torchaudio
 
-wavs = {p.stem: p for p in Path("coraal/audio").rglob("*.wav")}
 _full = {}
 def load_16k(path):
     if path in _full: return _full[path]
@@ -309,18 +349,41 @@ def load_16k(path):
     if sr != 16000: w = torchaudio.functional.resample(w, sr, 16000)
     a = w.squeeze(0).numpy().astype("float32"); _full[path] = a; return a
 
-interviews = []   # (wav_path, full_reference_text)
-total = 0.0
 _bld0 = _time.time()
-for txt in iter_transcripts("coraal/txt"):
-    if txt.stem not in wavs: continue
-    segs = sorted(parse_transcript(txt), key=lambda x: x.start)
-    ref = " ".join(s.text for s in segs if s.text).strip()   # whole verbatim transcript
-    if not ref: continue
-    dur = len(load_16k(wavs[txt.stem])) / 16000
-    interviews.append((wavs[txt.stem], ref)); total += dur
-    if total >= TARGET_MINUTES * 60: break
-refs = [r for _, r in interviews]
+if SELECTOR_ONLY:
+    selector_bundle = json.load(open(SELECTOR_BUNDLE_PATH, encoding="utf-8"))
+    if selector_bundle.get("schema_version") != 1:
+        raise ValueError(f"unsupported selector bundle schema: {selector_bundle.get('schema_version')}")
+    refs = selector_bundle["references"]
+    total = float(selector_bundle["minutes"]) * 60
+    interviews = [(None, ref) for ref in refs]       # length/reference compatibility; audio unused
+    saved_branches = selector_bundle["branches"]
+    bad_lengths = {name: len(values) for name, values in saved_branches.items()
+                   if len(values) != len(refs)}
+    if bad_lengths:
+        raise ValueError(f"selector bundle branch/reference length mismatch: {bad_lengths}")
+    hyp_A = saved_branches.get("A_whisper")
+    hyp_B = saved_branches.get("B_ctc")
+    hyp_Z = saved_branches.get("Z_qwen3")
+    hyp_C = saved_branches.get("C_voxtral")
+    hyp_VV = saved_branches.get("VV_voxtral_verbatim")
+    hyp_CW = saved_branches.get("CW_crisperwhisper")
+    if not hyp_A:
+        raise ValueError("selector bundle has no A_whisper baseline")
+    print("loaded selector bundle branches:", [k for k, v in saved_branches.items() if any(v or [])])
+else:
+    wavs = {p.stem: p for p in Path("coraal/audio").rglob("*.wav")}
+    interviews = []   # (wav_path, full_reference_text)
+    total = 0.0
+    for txt in iter_transcripts("coraal/txt"):
+        if txt.stem not in wavs: continue
+        segs = sorted(parse_transcript(txt), key=lambda x: x.start)
+        ref = " ".join(s.text for s in segs if s.text).strip()   # whole verbatim transcript
+        if not ref: continue
+        dur = len(load_16k(wavs[txt.stem])) / 16000
+        interviews.append((wavs[txt.stem], ref)); total += dur
+        if total >= TARGET_MINUTES * 60: break
+    refs = [r for _, r in interviews]
 print(f"{len(interviews)} interviews, {total/60:.1f} min, "
       f"{sum(len(r.split()) for r in refs)} reference words")
 rec("build interviews (load+resample)", _time.time() - _bld0)
@@ -495,35 +558,40 @@ def run_branch(tag, make_model, get_text=None):
 """),
     md("## 6. Branch A — Whisper (whole recording) → baseline"),
     code(r"""
-from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
 # window-balanced: each interview split into large (~15 min) silence-snapped slices spread
 # across both GPUs, so neither idles on the 2+1 interview split. Transcription is unchanged
 # per slice (faster-whisper VAD+conditioning run inside each), so WER stays put.
-hyp_A = run_windows("A whisper", lambda dev: FasterWhisperASR(
-    FW_MODEL, language="en", device=dev, vad_filter=WHISPER_VAD),
-    chunk_s=900, batch_size=1)
+if not SELECTOR_ONLY:
+    from classroom_asr.backends.faster_whisper_asr import FasterWhisperASR
+    hyp_A = run_windows("A whisper", lambda dev: FasterWhisperASR(
+        FW_MODEL, language="en", device=dev, vad_filter=WHISPER_VAD),
+        chunk_s=900, batch_size=1)
 pool = []
 add_branch("A", hyp_A)
 print("^ baseline WER = branch A")
 """),
     md("## 7. Branch B — wav2vec2 CTC"),
     code(r"""
-hyp_B = None
-if USE_CTC:
-    from classroom_asr.backends.wav2vec2_ctc import Wav2Vec2CTC
-    hyp_B = run_windows("A+B", lambda dev: Wav2Vec2CTC(CTC_MODEL, device=dev),
-                        chunk_s=900, batch_size=8)
+if not SELECTOR_ONLY:
+    hyp_B = None
+    if USE_CTC:
+        from classroom_asr.backends.wav2vec2_ctc import Wav2Vec2CTC
+        hyp_B = run_windows("A+B", lambda dev: Wav2Vec2CTC(CTC_MODEL, device=dev),
+                            chunk_s=900, batch_size=8)
+if hyp_B:
     add_branch("A+B", hyp_B)
 """),
     md("## 8. Branch Z — Qwen3-ASR-1.7B (the design's backbone)"),
     code(r"""
-hyp_Z = None
-if USE_QWEN3ASR:
-    from classroom_asr.backends.qwen3_asr import Qwen3ASR
-    # windows balanced across GPUs (no 2+1 idle), reassembled in order (same output)
-    hyp_Z = run_windows("A+B+Qwen3",
-                        lambda dev: Qwen3ASR(QWEN3ASR_MODEL, language="English", device=dev),
-                        chunk_s=LLM_CHUNK_S, batch_size=32)   # 64 gave no speedup, 2x VRAM -> back to 32
+if not SELECTOR_ONLY:
+    hyp_Z = None
+    if USE_QWEN3ASR:
+        from classroom_asr.backends.qwen3_asr import Qwen3ASR
+        # windows balanced across GPUs (no 2+1 idle), reassembled in order (same output)
+        hyp_Z = run_windows("A+B+Qwen3",
+                            lambda dev: Qwen3ASR(QWEN3ASR_MODEL, language="English", device=dev),
+                            chunk_s=LLM_CHUNK_S, batch_size=32) # 64: no speedup, 2x VRAM
+if hyp_Z:
     add_branch("A+B+Qwen3", hyp_Z)
 """),
     md("""## 9. Branch C / VV — Voxtral Mini 3B, **both passes on one load**
@@ -532,20 +600,24 @@ keep every filler/false start/repetition) — but the 9.5 GB weights are loaded 
 and reused for both passes (quality-neutral: same model, only the decode mode changes).
 Both are scored so we see the clean vs verbatim oracle contribution side by side."""),
     code(r"""
-hyp_C = hyp_VV = None
-if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
-    from classroom_asr.backends.voxtral_asr import VoxtralASR
-    with stage("Voxtral load (shared)"):            # one 9.5 GB load reused by both passes
-        vmodels = load_models(lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev))
-    def _vox_pass(mode, tag):                       # windows balanced across GPUs, one mode
-        for m in vmodels: m.mode = mode
-        t0 = time.time(); out = window_pass(vmodels, tag, chunk_s=LLM_CHUNK_S, batch_size=12)
-        rec(tag, time.time() - t0); return out
-    if USE_VOXTRAL:
-        hyp_C = _vox_pass("transcription", "+Voxtral"); add_branch("+Voxtral", hyp_C)
-    if USE_VOXTRAL_VERBATIM:
-        hyp_VV = _vox_pass("verbatim", "+VoxtralVerbatim"); add_branch("+VoxtralVerbatim", hyp_VV)
-    _free_models(vmodels); vmodels = None; del vmodels
+if not SELECTOR_ONLY:
+    hyp_C = hyp_VV = None
+    if USE_VOXTRAL or USE_VOXTRAL_VERBATIM:
+        from classroom_asr.backends.voxtral_asr import VoxtralASR
+        with stage("Voxtral load (shared)"):            # one 9.5 GB load reused by both passes
+            vmodels = load_models(lambda dev: VoxtralASR(VOXTRAL_MODEL, language="en", device=dev))
+        def _vox_pass(mode, tag):                       # windows balanced across GPUs, one mode
+            for m in vmodels: m.mode = mode
+            t0 = time.time(); out = window_pass(vmodels, tag, chunk_s=LLM_CHUNK_S, batch_size=12)
+            rec(tag, time.time() - t0); return out
+        if USE_VOXTRAL:
+            hyp_C = _vox_pass("transcription", "+Voxtral"); add_branch("+Voxtral", hyp_C)
+        if USE_VOXTRAL_VERBATIM:
+            hyp_VV = _vox_pass("verbatim", "+VoxtralVerbatim"); add_branch("+VoxtralVerbatim", hyp_VV)
+        _free_models(vmodels); vmodels = None; del vmodels
+else:
+    if hyp_C: add_branch("+Voxtral", hyp_C)
+    if hyp_VV: add_branch("+VoxtralVerbatim", hyp_VV)
 """),
     md("""## 9a. Branch CW — CrisperWhisper 2.0 (**verbatim** Whisper, isolated CT2)
 The verbatim lever: a Whisper fine-tune that *keeps* the `um`/`uh`/false starts the clean
@@ -559,8 +631,9 @@ transcribes a disjoint slice of the interviews in parallel (whole files, so each
 CrisperWhisper's native chunking and the output is identical). The worker prints which backend
 it got — `ct2 (fast)` or the `transformers (SLOW)` fallback — so a slow run is visible."""),
     code(r"""
-hyp_CW = None
-if USE_CRISPER:
+if not SELECTOR_ONLY:
+    hyp_CW = None
+if USE_CRISPER and not SELECTOR_ONLY:
     import os, sys, json, subprocess, threading
     _cw_t0 = time.time()
     WORKER = os.path.join(CW_WORK, "cw_worker.py")
@@ -633,6 +706,38 @@ json.dump(out, open(outp, "w"))
         print("CrisperWhisper isolation failed:", repr(e)[:200]); hyp_CW = [""] * len(interviews)
     rec("+CrisperWhisper", time.time() - _cw_t0)
     add_branch("+CrisperWhisper", hyp_CW)
+elif hyp_CW:
+    add_branch("+CrisperWhisper", hyp_CW)
+"""),
+    md("""## 9b. Save the selector-iteration bundle
+This compact JSON is written **before** the selector runs, so even a judge crash leaves reusable
+acoustic evidence. Preserve `/kaggle/working/selector_iteration_bundle.json` with Files
+persistence, download it, or publish it as a private Kaggle dataset. On a later session, attach
+that file and this notebook automatically skips CORAAL/audio plus every acoustic model."""),
+    code(r"""
+import json, os
+_word_branch_pairs = [
+    ("A_whisper", hyp_A), ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z),
+    ("C_voxtral", hyp_C), ("VV_voxtral_verbatim", hyp_VV),
+    ("CW_crisperwhisper", hyp_CW),
+]
+_word_branch_pairs = [(name, values) for name, values in _word_branch_pairs
+                      if values and any(values)]
+selector_bundle = {
+    "schema_version": 1,
+    "component": COMPONENT,
+    "minutes": round(total / 60, 3),
+    "scoring": "whole-recording; numbers+spelling folded; fillers kept",
+    "references": refs,
+    "branches": {name: values for name, values in _word_branch_pairs},
+}
+SELECTOR_BUNDLE_OUT = ("/kaggle/working/selector_iteration_bundle.json"
+                       if os.path.isdir("/kaggle/working") else "selector_iteration_bundle.json")
+with open(SELECTOR_BUNDLE_OUT, "w", encoding="utf-8") as f:
+    json.dump(selector_bundle, f, ensure_ascii=False)
+print(f"selector iteration bundle: {SELECTOR_BUNDLE_OUT} "
+      f"({os.path.getsize(SELECTOR_BUNDLE_OUT)/1_000_000:.2f} MB, "
+      f"{len(_word_branch_pairs)} branches)")
 """),
     md("""## 10. Phone branches — realized IPA (the pronunciation path)
 Not a word transcript: the phone branch's product is *pronunciation*. Scoring it needs a
@@ -760,8 +865,7 @@ number is what it has to beat, between baseline and the realizable oracle."""),
     code(r"""
 from classroom_asr.rover import fuse, build_graph
 # every whole-recording WORD branch we actually produced (phone branches are IPA, excluded)
-_wb = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
-_wb = [h for h in _wb if h and any(h)]
+_wb = [values for _name, values in _word_branch_pairs]
 fused = [fuse([h[k] for h in _wb], norm=SCORE) for k in range(len(interviews))]
 fused_wer = wer_of(fused)
 r_oracle = realizable_oracle_wer(pool)     # honest achievable ceiling over the candidate graph
@@ -799,7 +903,7 @@ if USE_LLM_SELECTOR:
         if _sel.get("thread") is not None: _sel["thread"].join()   # wait for the venv build (§2a)
         if _sel.get("err") is not None: raise _sel["err"]
         with open(SEL_WORKER, "w") as f:
-            f.write('''
+            f.write(r'''
 import sys, json, re, torch, transformers
 from transformers import AutoModelForMultimodalLM, AutoProcessor
 import classroom_asr.selector as selector_module
@@ -807,6 +911,7 @@ from classroom_asr.selector import select_transcript
 from classroom_asr.normalize import Normalizer
 SCORE = Normalizer(fold_numbers=True, fold_spelling=True)
 model_id, inp, outp = sys.argv[1], sys.argv[2], sys.argv[3]
+max_llm_calls = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 data = json.load(open(inp))
 
 # Keep this generated worker compatible with the classroom_asr revision installed from GitHub.
@@ -859,11 +964,14 @@ except TypeError:
     model = AutoModelForMultimodalLM.from_pretrained(
         model_id, torch_dtype=torch.float16, device_map="auto").eval()
 _dev = next(model.parameters()).device            # feed inputs to the shard holding the embeddings
-_dbg = {"n": 0}
+_dbg = {"n": 0, "calls": 0}
 print(f"selector runtime: transformers={transformers.__version__} model={type(model).__name__}",
       file=sys.stderr)
 print(f"selector package: {selector_module.__file__}", file=sys.stderr)
 def llm_fn(prompt):
+    if max_llm_calls and _dbg["calls"] >= max_llm_calls:
+        return ""                                   # smoke test: remaining slots use ROVER
+    _dbg["calls"] += 1
     # Follow Qwen3.5's official AutoProcessor + multimodal-model interface even for text-only
     # input. Hard-disable thinking in the chat template so it cannot consume the answer budget.
     msgs = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
@@ -890,20 +998,24 @@ if tot_dec and not tot_chosen:
     raise RuntimeError("selector parsed zero answers; inspect SAMPLE SELECTOR RESPONSE above")
 json.dump({"selected": selected}, open(outp, "w"))
 ''')
-        _wb2 = [globals().get(n) for n in ["hyp_A", "hyp_B", "hyp_Z", "hyp_C", "hyp_VV", "hyp_CW"]]
-        _wb2 = [h for h in _wb2 if h and any(h)]
+        _wb2 = [values for _name, values in _word_branch_pairs]
         payload = {"branch_transcripts": [[h[k] for h in _wb2] for k in range(len(interviews))]}
         json.dump(payload, open(os.path.join(SEL_WORK, "in.json"), "w"))
         subprocess.run([SEL_VENV_PY, SEL_WORKER, SELECTOR_MODEL,
-                        os.path.join(SEL_WORK, "in.json"), os.path.join(SEL_WORK, "out.json")], check=True)
+                        os.path.join(SEL_WORK, "in.json"), os.path.join(SEL_WORK, "out.json"),
+                        str(SELECTOR_MAX_LLM_CALLS)], check=True)
         llm_sel = json.load(open(os.path.join(SEL_WORK, "out.json")))["selected"]
         sel_wer = wer_of(llm_sel)
-        print(f"[LLM SELECTED   ] final WER={sel_wer:.3f}"
+        _sel_label = "SELECTOR SMOKE" if SELECTOR_SMOKE_TEST else "LLM SELECTED"
+        print(f"[{_sel_label:15s}] final WER={sel_wer:.3f}"
               f"   vs fused(ROVER)={fused_wer:.3f}  vs baseline A={wer_of(hyp_A):.3f}"
               f"  vs realizable oracle={r_oracle:.3f}")
         gap = wer_of(hyp_A) - r_oracle
-        print(f"captured {100*(wer_of(hyp_A)-sel_wer)/max(gap,1e-9):.0f}% of the baseline->realizable-oracle gap"
-              f"   (delta vs ROVER: {sel_wer-fused_wer:+.3f})")
+        if SELECTOR_SMOKE_TEST:
+            print("SMOKE ONLY: one contested batch judged; remaining decisions fell back to ROVER")
+        else:
+            print(f"captured {100*(wer_of(hyp_A)-sel_wer)/max(gap,1e-9):.0f}% of the "
+                  f"baseline->realizable-oracle gap   (delta vs ROVER: {sel_wer-fused_wer:+.3f})")
     except Exception as e:
         print("LLM selector failed -> keeping ROVER fusion:", repr(e)[:200])
     rec("+LLMSelector", time.time() - _sel_t0)
@@ -925,6 +1037,8 @@ for name, h in [("A_whisper", hyp_A), ("B_ctc", hyp_B), ("Z_qwen3", hyp_Z), ("C_
     if h and any(h): res[name] = round(wer_of(h), 4)
 summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": round(total/60, 1),
            "scoring": "whole-recording; numbers+spelling folded; fillers kept",
+           "run_mode": "selector_only" if SELECTOR_ONLY else "full_acoustic",
+           "selector_mode": "smoke" if SELECTOR_SMOKE_TEST else "full",
            "branch_wer": res, "baseline_wer": res.get("A_whisper"),
            # honest metrics: recall_floor = fraction of ref words no branch produced (a recall
            # LOWER BOUND, ignores insertions); realizable_oracle = best full-WER a selector over
@@ -932,7 +1046,10 @@ summary = {"component": COMPONENT, "interviews": len(interviews), "minutes": rou
            "candidate_recall_floor": round(recall_floor(pool), 4),
            "realizable_oracle_wer": round(r_oracle, 4) if "r_oracle" in dir() else None,
            "fused_rover_wer": round(fused_wer, 4) if "fused_wer" in dir() else None,
-           "llm_selected_wer": round(sel_wer, 4) if "sel_wer" in dir() else None,
+           "llm_selected_wer": (round(sel_wer, 4)
+                                if "sel_wer" in dir() and not SELECTOR_SMOKE_TEST else None),
+           "selector_smoke_wer": (round(sel_wer, 4)
+                                  if "sel_wer" in dir() and SELECTOR_SMOKE_TEST else None),
            "timings_s": {name: round(dt, 1) for name, dt in TIMINGS}}
 try:   # recall-floor breakdown from §11.5 (defined only if the pool had branches)
     summary["recall_floor_by_category"] = dict(bycat.most_common())
