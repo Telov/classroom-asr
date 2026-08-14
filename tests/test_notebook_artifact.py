@@ -320,13 +320,71 @@ def test_no_vad_whisper_shadow_reuses_baseline_models_and_stays_a_separate_branc
 def test_window_batches_emit_progress_and_fail_independently():
     source = _notebook_source()
 
-    assert 'progress = tqdm(total=len(shard), desc=f"{desc}:{pos}"' in source
+    assert 'worker_progress = tqdm(total=len(shard), desc=f"{desc}:{pos}"' in source
     assert "for offset in range(0, len(shard), batch_size):" in source
     assert "backend returned {len(texts)} texts for {len(batch_tasks)} windows" in source
     assert 'texts = [""] * len(batch_tasks)' in source
     assert "progress.update(len(batch_tasks))" in source
     assert '[Voxtral shared] FAILED:' in source
     assert "if vmodels is not None: _free_models(vmodels)" in source
+
+
+def test_single_window_branches_use_dynamic_multi_gpu_scheduling_without_rebatching():
+    source = _notebook_source()
+
+    assert "dynamic_singletons = batch_size == 1 and len(models) > 1" in source
+    assert "task_queue = queue.Queue()" in source
+    assert "[task_queue.get_nowait()]" in source
+    assert "[batch_tasks[0][4]], batch_size=1" in source
+    assert 'f"{desc} dynamic window counts: {worker_counts}"' in source
+
+
+def test_dynamic_single_window_scheduler_runs_and_reassembles_in_source_order():
+    source = next(s for s in _code_sources(PAYLOAD_NOTEBOOK) if "def window_pass" in s)
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "window_pass"
+    )
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+
+    class Progress:
+        def update(self, _count):
+            pass
+
+        def close(self):
+            pass
+
+    class Model:
+        def __init__(self, name):
+            self.name = name
+
+        def transcribe_chunk_list(self, chunks, *, batch_size):
+            assert batch_size == 1
+            return [f"{self.name}:{chunk}" for chunk in chunks]
+
+    records = {
+        0: [(0.0, 1.0, "a"), (1.0, 2.0, "b"), (2.0, 3.0, "c")],
+        1: [(0.0, 1.0, "d"), (1.0, 2.0, "e")],
+    }
+    namespace = {
+        "_window_records_of": lambda k, _chunk_s: records[k],
+        "interviews": [object(), object()],
+        "threading": __import__("threading"),
+        "tqdm": lambda **_kwargs: Progress(),
+        "WINDOW_PARTS": {},
+    }
+    exec(compile(module, "window_pass.py", "exec"), namespace)
+    output = namespace["window_pass"](
+        [Model("gpu0"), Model("gpu1")], "test", chunk_s=900, batch_size=1
+    )
+
+    assert [[token.split(":", 1)[1] for token in text.split()] for text in output] == [
+        ["a", "b", "c"], ["d", "e"]
+    ]
+    final_part = namespace["WINDOW_PARTS"]["test"][1][1]
+    assert (final_part["start_s"], final_part["end_s"]) == (1.0, 2.0)
+    assert final_part["text"].endswith(":e")
 
 
 def test_partial_multi_gpu_loads_are_released_and_crisper_emits_heartbeats():

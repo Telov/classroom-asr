@@ -97,6 +97,9 @@ class Wav2Vec2Phone(PhoneEncoder):
         # newly-initialized warning at its source (see Wav2Vec2CTC).
         self.model = load_pretrained(
             AutoModelForCTC, model_id, dtype=self.dtype,
+            # This checkpoint also publishes duplicate legacy PyTorch and safetensors
+            # weights.  The latter is the prefetched/runtime format; pin it explicitly.
+            use_safetensors=True,
             apply_spec_augment=False, mask_time_prob=0.0, mask_feature_prob=0.0,
         ).to(self.device).eval()
 

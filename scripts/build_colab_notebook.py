@@ -601,14 +601,51 @@ def window_pass(models, desc, *, chunk_s, batch_size):
     iv_records = [_window_records_of(k, chunk_s) for k in range(len(interviews))]
     tasks = [(k, wi, start, end, c) for k, rows in enumerate(iv_records)
              for wi, (start, end, c) in enumerate(rows)]
-    shards = [tasks[i::len(models)] for i in range(len(models))]
     results = {}
+    # Whisper/CT2 decodes one window at a time.  A static round-robin assignment left one T4
+    # idle for ~100 s in the measured large-v3 shadow because the seven 15-minute pieces were
+    # uneven (four long pieces landed on GPU0, three shorter ones on GPU1).  Let either identical
+    # model replica claim the next untouched window when it becomes free.  Window boundaries,
+    # per-window model calls, precision and decoding parameters stay exactly the same.
+    dynamic_singletons = batch_size == 1 and len(models) > 1
+    if dynamic_singletons:
+        import queue
+        task_queue = queue.Queue()
+        for task in tasks:
+            task_queue.put(task)
+        dynamic_progress = tqdm(total=len(tasks), desc=desc, position=0, leave=True)
+        progress_lock = threading.Lock()
+        worker_counts = [0] * len(models)
+    else:
+        shards = [tasks[i::len(models)] for i in range(len(models))]
+
     def worker(model, shard, pos):
         # Feed exactly the same mini-batches the backend used to construct internally, but keep
         # the loop here so every completed batch emits a heartbeat. A malformed/failed batch now
         # loses only its own windows instead of blanking this GPU's entire interview shard.
+        if dynamic_singletons:
+            while True:
+                try:
+                    batch_tasks = [task_queue.get_nowait()]
+                except queue.Empty:
+                    break
+                try:
+                    texts = list(model.transcribe_chunk_list(
+                        [batch_tasks[0][4]], batch_size=1))
+                    if len(texts) != 1:
+                        raise RuntimeError(f"backend returned {len(texts)} texts for 1 window")
+                except Exception as e:
+                    print(desc, f"window failed: {repr(e)[:160]}", flush=True)
+                    texts = [""]
+                k, wi, _start, _end, _ = batch_tasks[0]
+                results[(k, wi)] = texts[0]
+                worker_counts[pos] += 1
+                with progress_lock:
+                    dynamic_progress.update(1)
+                task_queue.task_done()
+            return
         if not shard: return
-        progress = tqdm(total=len(shard), desc=f"{desc}:{pos}", position=pos, leave=True)
+        worker_progress = tqdm(total=len(shard), desc=f"{desc}:{pos}", position=pos, leave=True)
         for offset in range(0, len(shard), batch_size):
             batch_tasks = shard[offset:offset + batch_size]
             cks = [t[4] for t in batch_tasks]
@@ -622,11 +659,17 @@ def window_pass(models, desc, *, chunk_s, batch_size):
                 texts = [""] * len(batch_tasks)
             for (k, wi, _start, _end, _), txt in zip(batch_tasks, texts):
                 results[(k, wi)] = txt
-            progress.update(len(batch_tasks))
-        progress.close()
-    ts = [threading.Thread(target=worker, args=(models[i], shards[i], i)) for i in range(len(models))]
+            worker_progress.update(len(batch_tasks))
+        worker_progress.close()
+    ts = [threading.Thread(
+        target=worker,
+        args=(models[i], None if dynamic_singletons else shards[i], i),
+    ) for i in range(len(models))]
     for t in ts: t.start()
     for t in ts: t.join()
+    if dynamic_singletons:
+        dynamic_progress.close()
+        print(f"{desc} dynamic window counts: {worker_counts}", flush=True)
     out = []
     timed_parts = []
     for k, rows in enumerate(iv_records):

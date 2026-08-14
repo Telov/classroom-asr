@@ -53,6 +53,27 @@
   whole interview: its documented input is at most 30 seconds. Score this conditioned output
   separately from independent Crisper transcription before choosing either path.
 
+## Current benchmark evidence
+
+- The completed 2026-08-14 CORAAL LES run at source commit `4edee42` covered three interviews,
+  91.1 minutes, and 20,229 scored reference words. It completed in 2,233.6 seconds wall time.
+  Its nine-branch candidate recall floor was 0.0670 and its exact Qwen-anchored realizable-oracle
+  WER was 0.0804; Qwen's backbone WER was 0.1569.
+- Turbo Whisper without VAD beat the VAD baseline on this sample (WER 0.1856 vs 0.1945) and cut
+  deletions from 2,451 to 2,315, while adding 400 rather than 381 insertions. Keep it as a distinct
+  candidate until a selector-enabled run tests whether that trade is useful in the final output.
+- Full Whisper large-v3 beam 5 did not beat turbo no-VAD (WER 0.1888 vs 0.1856) and cost 573.9
+  seconds. It nevertheless raised the exact candidate oracle by 0.0026 when removed, so disabling
+  it is a real speed/ceiling tradeoff and requires the user's decision rather than a silent edit.
+- CrisperWhisper's independent transcript had weak standalone WER (0.2293) but the largest unique
+  contribution: 141 reference hits and a 0.0075 oracle increase when removed for 229.0 marginal
+  seconds. Its Qwen-conditioned Verbatimize transcript was much stronger standalone (0.1607) but
+  added only 17 unique hits and 0.0013 oracle WER for 226.4 marginal seconds. Do not substitute one
+  for the other based on standalone WER alone.
+- Every optional word branch had a nonzero exact leave-one-out oracle contribution in that run.
+  Do not claim that any branch can be removed with literally unchanged measured candidate accuracy;
+  present the measured time/ceiling tradeoff before changing the default branch set.
+
 ## Document reading and project notes
 
 - Prefer the globally installed Docling CLI for extracting structured content from DOCX, PDF,

@@ -67,6 +67,10 @@ class Wav2Vec2CTC(AcousticModel):
         # not muted. (apply_spec_augment=False is the intent; the mask probs are the trigger.)
         self.model = load_pretrained(
             AutoModelForCTC, model_id, dtype=self.dtype,
+            # The repository publishes both a legacy pytorch_model.bin and equivalent
+            # safetensors weights.  Be explicit so a cold Kaggle run does not download
+            # both formats while the background prefetch is already fetching safetensors.
+            use_safetensors=True,
             apply_spec_augment=False, mask_time_prob=0.0, mask_feature_prob=0.0,
         ).to(self.device).eval()
 
