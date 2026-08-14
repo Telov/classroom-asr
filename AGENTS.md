@@ -93,35 +93,12 @@
   derive temporary mono 16-kHz model inputs. A 16-kHz FLAC source remains usable but contains less
   high-frequency pronunciation evidence.
 - Keep raw mic paths free of AGC, denoising, echo cancellation, and conferencing DSP where the
-  recorder permits it. Do not mix the three OBS tracks: track 1 is the teacher microphone, track 2
-  is the student's conferencing audio, and track 3 is program/media playback for the student.
+  recorder permits it. Do not mix the three tracks. The semantic meaning of the third track is
+  unresolved and must be confirmed with the user before role/source routing is implemented.
 - Use Kaggle file persistence for immutable model weights, dependency environments, and bounded
   conversion caches that save repeat setup time. Do not persist transcripts, hypotheses,
   timestamps, IPA/phone paths, or selector inputs. Prefer production models actually used on
   lessons over retaining every historical CORAAL shadow within the storage budget.
-
-## Future lesson-client direction
-
-- The intended product is not website-only. Students must have an installed endpoint client that
-  records their microphone locally before conferencing processing. A website/PWA may provide
-  shared learning features, but it cannot replace the recording client.
-- Headphones must not be required. The client therefore needs client-side acoustic echo
-  cancellation using the exact far-end render signal, plus noise suppression/gain handling for
-  the real-time call. Preserve a separate raw microphone branch for lossless local recording.
-- Split captured PCM locally: write raw, recoverable FLAC chunks to local storage while sending a
-  separately processed, low-latency Opus/WebRTC stream to the other participant. Upload raw FLAC
-  asynchronously during or after the lesson. Do not put FLAC upload, server-side conversion, or
-  an extra server round trip in the live media path.
-- Target Discord-level perceived audio/video quality and graceful degradation rather than merely
-  making a call connect. Keep audio intelligible when bandwidth degrades; adapt or pause video
-  before sacrificing the call audio. Use congestion control, jitter buffering, packet-loss
-  resilience, adaptive bitrate, and simulcast/SVC through a mature WebRTC stack rather than
-  implementing real-time transport from scratch.
-- Teacher-triggered program audio should remain a distinct media source and timeline event, not be
-  mixed into teacher or student raw microphone recordings.
-- Framework, real-time provider/self-hosting choice, supported first platforms, and deployment
-  order remain unresolved development choices and require the user's decision before scaffolding
-  a new application.
 
 ## Document reading and project notes
 
