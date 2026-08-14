@@ -8,6 +8,9 @@ concrete backend class is constructed.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 
 def tune_generation_config(model):
     """Fix at the source the two benign generate-time warnings, on whatever nested module
@@ -117,6 +120,90 @@ def iter_silence_chunks(waveform, sampling_rate, chunk_s, *, search_s=1.5):
             end = min(i + ceil, n)
         yield i, waveform[i:end]
         i = end
+
+
+def iter_overlapping_silence_chunks(
+    waveform,
+    sampling_rate,
+    core_s=20.0,
+    *,
+    overlap_s=2.0,
+    search_s=0.9,
+):
+    """Yield context-overlapped windows without leaving an acoustic boundary gap.
+
+    Each yielded tuple is ``(context_start, context_end, core_start, core_end, chunk)``.
+    The contiguous *core* intervals own the full waveform exactly once, while each model
+    input also includes ``overlap_s`` seconds on both sides where available. Boundaries
+    are silence-snapped. With the defaults a window is at most about 24.9 seconds, which
+    stays below GigaAM-v3's 25-second short-form limit.
+
+    A timestamp-aware decoder can use the core bounds for ownership. A 1-best text-only
+    decoder should merge adjacent results with :func:`merge_overlapping_text`.
+    """
+    if sampling_rate <= 0:
+        raise ValueError("sampling_rate must be positive")
+    if core_s <= 0 or overlap_s < 0 or search_s < 0:
+        raise ValueError("core_s must be positive; overlap_s/search_s must be non-negative")
+
+    n = len(waveform)
+    core = int(core_s * sampling_rate)
+    margin = int(overlap_s * sampling_rate)
+    core_start = 0
+    while core_start < n:
+        target = core_start + core
+        core_end = n if target >= n else snap_to_silence(
+            waveform, target, sampling_rate, search_s=search_s
+        )
+        if core_end <= core_start:
+            core_end = min(target, n)
+        context_start = max(0, core_start - margin)
+        context_end = min(n, core_end + margin)
+        yield (
+            context_start,
+            context_end,
+            core_start,
+            core_end,
+            waveform[context_start:context_end],
+        )
+        core_start = core_end
+
+
+_BOUNDARY_PUNCTUATION = re.compile(r"(^[^\w]+|[^\w]+$)", flags=re.UNICODE)
+
+
+def _normalized_boundary_token(token: str) -> str:
+    token = unicodedata.normalize("NFKC", token).casefold()
+    return _BOUNDARY_PUNCTUATION.sub("", token)
+
+
+def merge_overlapping_text(parts, *, min_overlap_tokens=2, max_overlap_tokens=64):
+    """Join overlapping-window transcripts using only an exact normalized overlap.
+
+    The longest normalized suffix/prefix match is emitted once. If two decodes disagree
+    throughout their shared audio, both are retained: that may leave a duplicate phrase,
+    but it never invents confidence by deleting acoustically supported nonmatching words.
+    This conservative policy is appropriate for the project's verbatim transcript.
+    """
+    merged: list[str] = []
+    for part in parts:
+        incoming = str(part or "").split()
+        if not incoming:
+            continue
+        if not merged:
+            merged.extend(incoming)
+            continue
+        limit = min(len(merged), len(incoming), max(0, int(max_overlap_tokens)))
+        matched = 0
+        floor = max(1, int(min_overlap_tokens))
+        for width in range(limit, floor - 1, -1):
+            left = [_normalized_boundary_token(t) for t in merged[-width:]]
+            right = [_normalized_boundary_token(t) for t in incoming[:width]]
+            if left == right and all(left):
+                matched = width
+                break
+        merged.extend(incoming[matched:])
+    return " ".join(merged).strip()
 
 
 def best_dtype(torch_mod, device):

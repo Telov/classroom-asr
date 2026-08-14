@@ -22,6 +22,17 @@ data = ["numpy>=1.24", "pandas>=2.0", "pyarrow>=14", "soundfile>=0.12"]
 # Acoustic + LLM backends (§7, §14). Versions are placeholders; the design doc
 # names 2026-era models that are pinned at integration time.
 ml = ["torch>=2.2", "transformers>=4.44", "librosa>=0.10"]
+# Official imports required by the pinned GigaAM-v3 RNNT remote code. Long-form pyannote and
+# torchcodec are intentionally omitted: our own short overlapping windows avoid that gated path.
+gigaam = [
+    "torch>=2.8",
+    "torchaudio>=2.8",
+    "transformers>=4.57.1,<5",
+    "hydra-core>=1.3",
+    "omegaconf>=2.3",
+    "sentencepiece>=0.2",
+    "numpy>=1.24",
+]
 # Reference scoring parity (§29): cross-check our WER against jiwer.
 eval = ["jiwer>=3.0"]
 dev = ["pytest>=8.0", "ruff>=0.5"]

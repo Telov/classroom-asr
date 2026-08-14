@@ -35,16 +35,17 @@ What runs now:
 - candidate-graph builder incl. MBR/consensus candidate (§12);
 - pluggable pipeline stages with reference **stub** backends;
 - whole-lesson global→local→global orchestrator (§15) end-to-end on synthetic data;
-- real Qwen3-ASR, faster-whisper, wav2vec2 CTC/phone, Voxtral, CrisperWhisper,
-  and PhoneticXEUS backend adapters;
+- real Qwen3-ASR, Russian-specialized GigaAM-v3 RNNT, faster-whisper, wav2vec2 CTC/phone,
+  Voxtral, CrisperWhisper, and PhoneticXEUS backend adapters;
+- Matroska audio-track probing plus exact-stream extraction to temporary mono 16-kHz FLAC;
 - a reproducible Kaggle CORAAL benchmark with exact branch error counts,
   Qwen-anchored candidate graphs, exact lattice realizable-oracle WER, architecture-aware
   leave-one-out overlap, per-interview error shapes, and marginal runtime attribution.
 
 What remains research/integration work: robust lattice-aware P2G, calibrated
 confidence, the production whole-lesson constrained selector, learned multi-encoder
-fusion/adapters, and training on the actual RU↔EN classroom distribution. GigaAM is
-intentionally excluded from the current English benchmark.
+fusion/adapters, and training on the actual RU↔EN classroom distribution. The old English
+CORAAL result is frozen; future decisions should use actual lesson recordings.
 
 ## Layout → design-doc section map
 
@@ -59,7 +60,9 @@ intentionally excluded from the current English benchmark.
 | `src/classroom_asr/metrics.py` | WER, deletion slices, candidate-oracle WER (§18) |
 | `src/classroom_asr/config.py` | frozen model/param choices as config (§26) |
 | `src/classroom_asr/io.py` | lesson-package on-disk layout (§22.1) |
+| `src/classroom_asr/media.py` | Matroska track discovery and lossless model-input extraction (§5) |
 | `src/classroom_asr/pipeline/base.py` | stage interfaces: VAD, acoustic, phone, P2G, selector |
+| `src/classroom_asr/backends/gigaam_v3.py` | pinned GigaAM-v3 RNNT Russian word branch (§7.2) |
 | `src/classroom_asr/pipeline/stubs.py` | dependency-free reference backends |
 | `src/classroom_asr/pipeline/orchestrator.py` | whole-lesson inference workflow (§15.1) |
 | `scripts/run_demo.py` | end-to-end run on synthetic two-channel data |
@@ -77,10 +80,14 @@ python -m pytest                      # run the full test suite
 (The `classroom-asr` console script is also installed; it needs your Python
 `Scripts/` directory on `PATH`. `python -m classroom_asr` always works.)
 
-To wire real models later: `python -m pip install -e ".[ml,data]"` and implement
-the `pipeline/base.py` interfaces against the chosen checkpoints.
+Real model adapters remain opt-in; the Russian branch's explicit dependency set is installed with
+`python -m pip install -e ".[gigaam]"`. GigaAM's
+official remote implementation is loaded only at its immutable RNNT commit. Its whole-recording
+adapter uses silence-snapped ~20-second cores with two seconds of shared audio on each side,
+then removes only an exact normalized text overlap. This avoids a hard-cut loss while preserving
+disagreements in the strict verbatim transcript.
 
-## Real-data oracle run (Kaggle, CORAAL)
+## Frozen oracle run (Kaggle, CORAAL)
 
 Import [`colab/CORAAL_candidate_oracle.ipynb`](colab/CORAAL_candidate_oracle.ipynb)
 into Kaggle once and keep using that same notebook. It is a small persistent launcher:
@@ -94,7 +101,7 @@ Recommended Kaggle settings are **GPU T4 ×2**, Internet **On**, and file persis
 and the bounded Crisper CT2 conversion; transcripts, timestamps, IPA/phone evidence,
 selector inputs, and other inference products are regenerated every run.
 
-The benchmark evaluates roughly one hour of professionally transcribed, spontaneous
+This historical benchmark evaluated roughly one hour of professionally transcribed, spontaneous
 English conversation from [CORAAL](https://oraal.uoregon.edu/coraal). Active branches
 are:
 
@@ -113,6 +120,22 @@ unique recovered-word categories, pairwise overlap, exact optional-branch leave-
 deltas, and the marginal runtime each removal would actually save after shared loads are accounted
 for. Qwen remains the required graph pivot rather than being presented as a removable peer. Read
 the Qwen→realizable-oracle gap and deletion slices, not just absolute WER (§18).
+
+Do not rerun it for routine development. It contains spontaneous-conversation phenomena—most
+notably speaker overlap—that do not match the intended lesson capture. Future branch removal,
+quality, and timing decisions belong on corrected samples from the real three-track recordings.
+
+## Lesson recording format
+
+Use one Matroska container with three independent, synchronized mono FLAC tracks and explicit,
+stable track titles. Audio-only `.mka` is clearer than `.mkv`, though both are supported. FLAC
+does not have a meaningful fixed 160-kbps target; choose a compression level and retain lossless
+samples. Prefer 48-kHz canonical capture when available for pronunciation analysis, then derive
+temporary 16-kHz mono ASR inputs. Never mix tracks or infer their meaning from order.
+
+The exact semantic mapping of the third track is intentionally not hard-coded yet. Once the three
+track meanings are confirmed, `probe_audio_tracks`, `track_by_title`, and `extract_model_audio`
+provide a deterministic, zero-guess ingestion path. Raw lesson containers are ignored by Git.
 
 ## Non-goals (§2)
 

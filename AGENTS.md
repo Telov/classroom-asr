@@ -24,13 +24,18 @@
 - Feed the selector compact candidate-local phonetic evidence: expected pronunciation in local
   context, accent-aware match scores, and localized realized-phone excerpts. Do not place entire
   multi-second IPA windows in the LLM prompt.
-- Current benchmark mode pauses the LLM selector while measuring word-branch overlap. Because the
-  phone branches currently feed only that selector, skip them as well in this mode. Use exact
-  leave-one-branch-out reference coverage before proposing removal of any word branch; do not
-  equate high overlap alone with unchanged realizable-oracle WER.
-- The current recordings and CORAAL benchmark are English; do not add or substitute GigaAM for
-  now. Qwen3-ASR should auto-detect language rather than being forced to English, so the same
-  backbone remains suitable when later recordings contain code-switching.
+- The 2026-08-14 CORAAL benchmark is now frozen historical evidence, not the active acceptance
+  dataset. Do not spend more Kaggle time optimizing or rerunning it unless the user explicitly
+  reopens that benchmark. Actual lesson recordings supersede it for future development; unlike
+  CORAAL, they are not expected to contain overlapping speakers.
+- Qwen3-ASR should auto-detect language rather than being forced to English. Use the official
+  Russian-specialized GigaAM v3 RNNT branch as a complementary 1-best word candidate for actual
+  lessons. Keep the design's GigaAM-v3-SSL acoustic stream as separate future fusion work; the
+  RNNT transcript adapter does not replace it.
+- GigaAM's short-form windows use roughly 20-second silence-snapped cores with two seconds of
+  shared acoustic context on both sides. Deduplicate only exact normalized text overlap at a
+  boundary until the pinned model exposes trustworthy word timestamps. Preserve disagreements
+  rather than silently deleting them.
 - Compare Whisper large-v3-turbo with full Whisper large-v3 as measured branches; do not assume
   either is universally more accurate. Keep the turbo result as the baseline until the local
   benchmark demonstrates otherwise.
@@ -73,6 +78,27 @@
 - Every optional word branch had a nonzero exact leave-one-out oracle contribution in that run.
   Do not claim that any branch can be removed with literally unchanged measured candidate accuracy;
   present the measured time/ceiling tradeoff before changing the default branch set.
+- Leave-one-out already answers whether the union of every other measured branch contains a
+  branch's entire reference contribution. Because every delta was nonzero, none was exactly
+  redundant on that run. Revisit practical branch removal as a measured speed/quality Pareto
+  decision on corrected real-lesson data, not by rerunning CORAAL.
+
+## Recording and persistent-storage policy
+
+- Preserve each lesson's original Matroska container and its independent lossless tracks. Prefer
+  audio-only `.mka`; `.mkv` is also accepted. Track titles are semantic identifiers and must be
+  stable—never infer teacher/student provenance from stream order alone.
+- FLAC is variable-rate lossless audio, so configure a FLAC compression level rather than a
+  nominal `160 kbps` target. When capture allows it, preserve canonical tracks at 48 kHz and
+  derive temporary mono 16-kHz model inputs. A 16-kHz FLAC source remains usable but contains less
+  high-frequency pronunciation evidence.
+- Keep raw mic paths free of AGC, denoising, echo cancellation, and conferencing DSP where the
+  recorder permits it. Do not mix the three tracks. The semantic meaning of the third track is
+  unresolved and must be confirmed with the user before role/source routing is implemented.
+- Use Kaggle file persistence for immutable model weights, dependency environments, and bounded
+  conversion caches that save repeat setup time. Do not persist transcripts, hypotheses,
+  timestamps, IPA/phone paths, or selector inputs. Prefer production models actually used on
+  lessons over retaining every historical CORAAL shadow within the storage budget.
 
 ## Document reading and project notes
 

@@ -21,6 +21,8 @@ class ModelChoices:
 
     asr_backbone: str = "Qwen3-ASR-1.7B"                 # §7.1, frozen
     russian_specialist: str = "GigaAM-v3-SSL"            # §7.2, frozen; A/B multilingual SSL
+    russian_word_branch: str = "GigaAM-v3-RNNT"          # production 1-best Russian transcript
+    russian_word_revision: str = "c7f128b8accdd9624df905e5c2d7b7a48c27c0d8"
     phone_encoder: str = "PhoneticXEUS"                  # §7.3, default; A/B ZIPA/POWSM
     phone_encoder_challengers: tuple[str, ...] = ("ZIPA-CTC-NS", "POWSM-CTC")
     selector: str = "Qwen3.5-9B"                         # §14.2, default judge
@@ -49,7 +51,7 @@ class CandidateConfig:
     """N-best breadth and expansion policy (§12)."""
 
     qwen_nbest: int = 12             # §12.1: 8–16, tune by oracle-WER gain
-    gigaam_nbest: int = 4
+    gigaam_nbest: int = 1            # official v3 RNNT public API is 1-best
     phone_topk: int = 4              # §10.2 top-K phone paths
     p2g_nbest: int = 4
     rag_top_k: int = 5

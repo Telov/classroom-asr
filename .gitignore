@@ -18,6 +18,8 @@ colab/_cells_dump.txt
 coraal/
 *.wav
 *.flac
+*.mka
+*.mkv
 *.tar.gz
 *.safetensors
 *.bin
